@@ -720,7 +720,7 @@ impl App {
             let _ = KillTimer(Some(self.hwnd), TIMER_TIP);
             if matches!(
                 self.bar.hovered,
-                Some(HoverTarget::PrimaryApp(_) | HoverTarget::OpenApp(_))
+                Some(HoverTarget::PrimaryApp(_) | HoverTarget::OpenApp(_) | HoverTarget::Overflow)
             ) && self.bar.pressed.is_none()
             {
                 let _ = SetTimer(Some(self.hwnd), TIMER_TIP, TIP_MS, None);
@@ -732,6 +732,10 @@ impl App {
         let Some(target) = self.bar.hovered else {
             return;
         };
+        // El nombre de la flecha taparía el panel que ella misma abre.
+        if target == HoverTarget::Overflow && shell::overflow_window().is_some() {
+            return;
+        }
         let Some((name, cx)) = self.bar.item_label(target, self.scale) else {
             return;
         };
@@ -977,6 +981,20 @@ unsafe extern "system" fn wndproc(hwnd: HWND, msg: u32, wparam: WPARAM, lparam: 
                                     apps::focus_window(hwnd);
                                 }
                             }
+                        }
+                        HoverTarget::Overflow => {
+                            if let Some(menu) = &mut app.launcher {
+                                menu.hide();
+                            }
+                            if let Some(tip) = &mut app.tooltip {
+                                tip.hide();
+                            }
+                            shell::toggle_overflow(
+                                app.pos.x + app.bar.overflow_center(app.scale).round() as i32,
+                                app.y_shown,
+                                app.screen_left,
+                                app.screen_right,
+                            );
                         }
                         HoverTarget::Clock => {
                             let _ = std::process::Command::new("explorer.exe")
