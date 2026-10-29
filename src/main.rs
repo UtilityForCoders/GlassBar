@@ -37,14 +37,16 @@ use windows::Win32::System::Threading::CreateMutexW;
 use windows::Win32::UI::HiDpi::{
     SetProcessDpiAwarenessContext, DPI_AWARENESS_CONTEXT_PER_MONITOR_AWARE_V2,
 };
-use windows::Win32::UI::Input::KeyboardAndMouse::{TrackMouseEvent, TME_LEAVE, TRACKMOUSEEVENT};
+use windows::Win32::UI::Input::KeyboardAndMouse::{
+    ReleaseCapture, SetCapture, TrackMouseEvent, TME_LEAVE, TRACKMOUSEEVENT,
+};
 use windows::Win32::UI::WindowsAndMessaging::{
     CreateWindowExW, DefWindowProcW, DispatchMessageW, GetCursorPos, GetMessageW, KillTimer,
     LoadCursorW, PostQuitMessage, RegisterClassExW, SetTimer, ShowWindow, TranslateMessage,
-    UpdateLayeredWindow, IDC_ARROW, MA_NOACTIVATE, MSG, SW_SHOWNOACTIVATE, ULW_ALPHA, WM_DESTROY,
-    WM_DROPFILES, WM_LBUTTONDOWN, WM_LBUTTONUP, WM_MOUSEACTIVATE, WM_MOUSEMOVE, WM_RBUTTONUP,
-    WM_TIMER, WNDCLASSEXW, WS_EX_LAYERED, WS_EX_NOACTIVATE, WS_EX_TOOLWINDOW, WS_EX_TOPMOST,
-    WS_POPUP,
+    UpdateLayeredWindow, IDC_ARROW, MA_NOACTIVATE, MSG, SW_HIDE, SW_SHOWNOACTIVATE, ULW_ALPHA,
+    WM_DESTROY, WM_DROPFILES, WM_LBUTTONDOWN, WM_LBUTTONUP, WM_MOUSEACTIVATE, WM_MOUSEMOVE,
+    WM_RBUTTONUP, WM_TIMER, WNDCLASSEXW, WS_EX_LAYERED, WS_EX_NOACTIVATE, WS_EX_TOOLWINDOW,
+    WS_EX_TOPMOST, WS_EX_TRANSPARENT, WS_POPUP,
 };
 
 use crate::autohide::AutoHide;
@@ -58,6 +60,7 @@ const WM_SHOW_LAUNCHER: u32 = windows::Win32::UI::WindowsAndMessaging::WM_APP + 
 const TIMER_ANIM: usize = 1;
 const TIMER_TICK: usize = 2;
 const TIMER_EDGE: usize = 3;
+const TIMER_TIP: usize = 4;
 
 /// ~60 FPS durante animaciones físicas (16 ms). En reposo el timer se apaga (0% CPU).
 const FRAME_MS: u32 = 16;
@@ -65,6 +68,8 @@ const FRAME_MS: u32 = 16;
 const TICK_MS: u32 = 1000;
 /// Verificación de proximidad del cursor al borde inferior para auto-hide inmediato (60 ms).
 const EDGE_MS: u32 = 40;
+/// Tiempo con el cursor quieto sobre un icono antes de mostrar su nombre.
+const TIP_MS: u32 = 600;
 
 thread_local! {
     static APP: RefCell<Option<App>> = const { RefCell::new(None) };
@@ -148,6 +153,120 @@ impl Drop for Surface {
             SelectObject(self.dc, self.old);
             let _ = DeleteObject(self.bitmap.into());
             let _ = DeleteDC(self.dc);
+        }
+    }
+}
+
+/// Globo con el nombre del programa bajo el cursor; no recibe clics ni foco.
+struct Tooltip {
+    hwnd: HWND,
+    surface: Option<Surface>,
+    visible: bool,
+}
+impl Tooltip {
+    fn new(owner: HWND) -> Result<Self> {
+        let hwnd = unsafe {
+            CreateWindowExW(
+                WS_EX_LAYERED
+                    | WS_EX_TOPMOST
+                    | WS_EX_TOOLWINDOW
+                    | WS_EX_NOACTIVATE
+                    | WS_EX_TRANSPARENT,
+                w!("GlassBarTooltip"),
+                w!("GlassBar — Nombre"),
+                WS_POPUP,
+                0,
+                0,
+                1,
+                1,
+                Some(owner),
+                None,
+                Some(GetModuleHandleW(None)?.into()),
+                None,
+            )?
+        };
+        Ok(Self {
+            hwnd,
+            surface: None,
+            visible: false,
+        })
+    }
+    /// Muestra `text` centrado en `cx` con su borde inferior en `bottom` (coordenadas de pantalla).
+    fn show(&mut self, text: &str, cx: i32, bottom: i32, left: i32, right: i32, scale: f32) {
+        let size = 12.0 * scale;
+        let text = clock::fit_text(text, size, 320.0 * scale);
+        let width = (clock::text_width(&text, size) + 22.0 * scale).ceil() as u32;
+        let height = (28.0 * scale).ceil() as u32;
+        let Ok(mut surface) = Surface::new(width, height) else {
+            return;
+        };
+        let (w, h) = (width as f32, height as f32);
+        surface.pixmap.fill(tiny_skia::Color::TRANSPARENT);
+        apps::fill_rounded(
+            &mut surface.pixmap,
+            [32, 32, 32, 235],
+            0.5,
+            0.5,
+            w - 1.0,
+            h - 1.0,
+            7.0 * scale,
+        );
+        apps::stroke_rounded(
+            &mut surface.pixmap,
+            [255, 255, 255, 40],
+            0.5,
+            0.5,
+            w - 1.0,
+            h - 1.0,
+            7.0 * scale,
+            1.0,
+        );
+        clock::draw_text(
+            &mut surface.pixmap,
+            &text,
+            11.0 * scale,
+            h / 2.0 - size * 0.38,
+            size,
+            1.0,
+        );
+        surface.copy_to_dib();
+        let pos = POINT {
+            x: (cx - width as i32 / 2).clamp(left + 4, (right - width as i32 - 4).max(left + 4)),
+            y: bottom - height as i32,
+        };
+        let size = SIZE {
+            cx: width as i32,
+            cy: height as i32,
+        };
+        let blend = BLENDFUNCTION {
+            BlendOp: AC_SRC_OVER as u8,
+            SourceConstantAlpha: 255,
+            AlphaFormat: AC_SRC_ALPHA as u8,
+            ..Default::default()
+        };
+        unsafe {
+            let _ = UpdateLayeredWindow(
+                self.hwnd,
+                None,
+                Some(&pos),
+                Some(&size),
+                Some(surface.dc),
+                Some(&POINT { x: 0, y: 0 }),
+                COLORREF(0),
+                Some(&blend),
+                ULW_ALPHA,
+            );
+            let _ = ShowWindow(self.hwnd, SW_SHOWNOACTIVATE);
+        }
+        self.surface = Some(surface);
+        self.visible = true;
+    }
+    fn hide(&mut self) {
+        if self.visible {
+            unsafe {
+                let _ = ShowWindow(self.hwnd, SW_HIDE);
+            }
+            self.visible = false;
         }
     }
 }
@@ -468,6 +587,7 @@ struct App {
     shell: TaskbarReplacer,
     tray: Tray,
     launcher: Option<LauncherWindow>,
+    tooltip: Option<Tooltip>,
     animating: bool,
     last_tick: Instant,
     mouse_tracked: bool,
@@ -478,7 +598,8 @@ impl App {
         let monitor = monitors::primary();
         let (rc, scale) = monitors::get_info(monitor);
 
-        let bar = BarState::new();
+        let mut bar = BarState::new();
+        apps::update_running_apps(&mut bar.primary_apps, &mut bar.open_apps);
         let scale = scale.min((rc.right - rc.left) as f32 / (bar.dock_width() + 40.0));
         let (width, height) = bar.window_size(scale);
         let surface = Surface::new(width, height)?;
@@ -516,6 +637,7 @@ impl App {
             shell,
             tray,
             launcher: None,
+            tooltip: Tooltip::new(hwnd).ok(),
             animating: false,
             last_tick: Instant::now(),
             mouse_tracked: false,
@@ -550,6 +672,15 @@ impl App {
     }
 
     fn pins_changed(&mut self) {
+        self.save_pins();
+        self.relayout();
+        self.visibility.reveal();
+        self.visibility
+            .defer_hide(Instant::now(), Duration::from_millis(1200));
+        self.start_animating();
+    }
+
+    fn save_pins(&self) {
         if pins::save(&self.bar.primary_apps).is_err() {
             unsafe {
                 windows::Win32::UI::WindowsAndMessaging::MessageBoxW(Some(self.hwnd),
@@ -557,6 +688,10 @@ impl App {
                         w!("GlassBar"), windows::Win32::UI::WindowsAndMessaging::MB_ICONWARNING);
             }
         }
+    }
+
+    /// Ajusta tamaño y posición del dock al número de iconos.
+    fn relayout(&mut self) {
         let (rc, dpi) = monitors::get_info(monitors::primary());
         self.scale = dpi.min((rc.right - rc.left) as f32 / (self.bar.dock_width() + 40.0));
         let (width, height) = self.bar.window_size(self.scale);
@@ -568,14 +703,48 @@ impl App {
                 + (self.y_shown - self.y_hidden) as f32 * self.visibility.motion.value)
                 .round() as i32;
             self.bar.pressed = None;
+            self.bar.drag = None;
             self.bar.update_hover(None);
-            self.expand();
+            self.restart_tooltip();
+            self.start_animating();
             self.render();
         }
-        self.visibility.reveal();
-        self.visibility
-            .defer_hide(Instant::now(), Duration::from_millis(1200));
-        self.start_animating();
+    }
+
+    /// Oculta el nombre y, si el cursor quedó sobre un programa, lo vuelve a programar.
+    fn restart_tooltip(&mut self) {
+        if let Some(tip) = &mut self.tooltip {
+            tip.hide();
+        }
+        unsafe {
+            let _ = KillTimer(Some(self.hwnd), TIMER_TIP);
+            if matches!(
+                self.bar.hovered,
+                Some(HoverTarget::PrimaryApp(_) | HoverTarget::OpenApp(_))
+            ) && self.bar.pressed.is_none()
+            {
+                let _ = SetTimer(Some(self.hwnd), TIMER_TIP, TIP_MS, None);
+            }
+        }
+    }
+
+    fn show_tooltip(&mut self) {
+        let Some(target) = self.bar.hovered else {
+            return;
+        };
+        let Some((name, cx)) = self.bar.item_label(target, self.scale) else {
+            return;
+        };
+        if let Some(tip) = &mut self.tooltip {
+            tip.show(
+                &name,
+                self.pos.x + cx.round() as i32,
+                self.pos.y - (6.0 * self.scale).round() as i32,
+                self.screen_left,
+                self.screen_right,
+                self.scale,
+            );
+        }
     }
 
     fn expand(&mut self) {
@@ -700,9 +869,17 @@ unsafe extern "system" fn wndproc(hwnd: HWND, msg: u32, wparam: WPARAM, lparam: 
                     app.mouse_tracked = true;
                 }
 
+                if app.bar.drag_to(x, app.scale) {
+                    app.restart_tooltip();
+                    app.start_animating();
+                    app.render();
+                    return;
+                }
+
                 let target = app.bar.hit_test(x, y, app.scale);
                 if target != app.bar.hovered {
                     app.bar.update_hover(target);
+                    app.restart_tooltip();
                     app.start_animating();
                     app.render();
                 }
@@ -718,6 +895,7 @@ unsafe extern "system" fn wndproc(hwnd: HWND, msg: u32, wparam: WPARAM, lparam: 
                     app.bar.update_hover(None);
                     app.render();
                 }
+                app.restart_tooltip();
 
                 app.start_animating();
             });
@@ -728,10 +906,16 @@ unsafe extern "system" fn wndproc(hwnd: HWND, msg: u32, wparam: WPARAM, lparam: 
             with_app(|app| {
                 if let Some(target) = app.bar.hovered {
                     app.bar.pressed = Some(target);
+                    app.restart_tooltip();
+                    let x = (lparam.0 & 0xffff) as i16 as f32;
+                    app.bar.begin_drag(target, x, app.scale);
+                    if app.bar.drag.is_some() {
+                        let _ = SetCapture(hwnd);
+                    }
                     match target {
                         HoverTarget::Launcher => app.bar.launcher_press.set_target(0.90),
-                        HoverTarget::PrimaryApp(i) => {
-                            if let Some(a) = app.bar.primary_apps.get_mut(i) {
+                        HoverTarget::PrimaryApp(_) | HoverTarget::OpenApp(_) => {
+                            if let Some(a) = app.bar.item_mut(target) {
                                 a.press_spring.set_target(0.90);
                             }
                         }
@@ -745,21 +929,52 @@ unsafe extern "system" fn wndproc(hwnd: HWND, msg: u32, wparam: WPARAM, lparam: 
         }
 
         WM_LBUTTONUP => {
+            let _ = ReleaseCapture();
             with_app(|app| {
+                if let Some(pinned_moved) = app.bar.end_drag() {
+                    // Soltar tras arrastrar solo coloca el icono; no abre el programa.
+                    app.bar.pressed = None;
+                    for a in app
+                        .bar
+                        .primary_apps
+                        .iter_mut()
+                        .chain(&mut app.bar.open_apps)
+                    {
+                        a.press_spring.set_target(1.0);
+                    }
+                    if pinned_moved {
+                        app.save_pins();
+                    }
+                    app.bar.update_hover(None);
+                    app.start_animating();
+                    app.render();
+                    return;
+                }
                 if let Some(target) = app.bar.pressed.take() {
                     match target {
                         HoverTarget::Launcher => {
                             app.bar.launcher_press.set_target(1.0);
                             app.toggle_launcher();
                         }
-                        HoverTarget::PrimaryApp(i) => {
+                        HoverTarget::PrimaryApp(_) => {
                             if let Some(menu) = &mut app.launcher {
                                 menu.hide();
                             }
-                            if let Some(a) = app.bar.primary_apps.get_mut(i) {
+                            if let Some(a) = app.bar.item_mut(target) {
                                 a.press_spring.set_target(1.0);
-                                if a.launch() {
+                                if a.activate() {
                                     let _ = catalog::record(&a.entry);
+                                }
+                            }
+                        }
+                        HoverTarget::OpenApp(_) => {
+                            if let Some(menu) = &mut app.launcher {
+                                menu.hide();
+                            }
+                            if let Some(a) = app.bar.item_mut(target) {
+                                a.press_spring.set_target(1.0);
+                                if let Some(hwnd) = a.window {
+                                    apps::focus_window(hwnd);
                                 }
                             }
                         }
@@ -825,8 +1040,19 @@ unsafe extern "system" fn wndproc(hwnd: HWND, msg: u32, wparam: WPARAM, lparam: 
             } else if id == TIMER_TICK {
                 with_app(|app| {
                     app.shell.maintain();
-                    apps::update_running_apps(&mut app.bar.primary_apps);
-                    app.render();
+                    if apps::update_running_apps(&mut app.bar.primary_apps, &mut app.bar.open_apps)
+                    {
+                        app.relayout();
+                    } else {
+                        app.render();
+                    }
+                });
+            } else if id == TIMER_TIP {
+                with_app(|app| {
+                    let _ = KillTimer(Some(app.hwnd), TIMER_TIP);
+                    if app.bar.pressed.is_none() && app.visibility.expanded {
+                        app.show_tooltip();
+                    }
                 });
             } else if id == TIMER_EDGE {
                 with_app(|app| {
@@ -848,7 +1074,10 @@ unsafe extern "system" fn wndproc(hwnd: HWND, msg: u32, wparam: WPARAM, lparam: 
                         && pt.y >= app.y_shown
                         && pt.y < app.screen_bottom;
                     app.visibility.sample(
-                        at_edge || inside || app.launcher.as_ref().is_some_and(|l| l.visible),
+                        at_edge
+                            || inside
+                            || app.bar.drag.is_some()
+                            || app.launcher.as_ref().is_some_and(|l| l.visible),
                         Instant::now(),
                     );
                     if app.visibility.active() {
@@ -887,6 +1116,15 @@ unsafe extern "system" fn wndproc(hwnd: HWND, msg: u32, wparam: WPARAM, lparam: 
 
         _ => DefWindowProcW(hwnd, msg, wparam, lparam),
     }
+}
+
+unsafe extern "system" fn tooltip_wndproc(
+    hwnd: HWND,
+    msg: u32,
+    wparam: WPARAM,
+    lparam: LPARAM,
+) -> LRESULT {
+    DefWindowProcW(hwnd, msg, wparam, lparam)
 }
 
 fn handle_menu_command(app: &mut App, cmd: u32) {
@@ -1040,6 +1278,17 @@ fn main() -> Result<()> {
             ..Default::default()
         };
         if RegisterClassExW(&launcher_class) == 0 {
+            return Err(windows::core::Error::from_thread());
+        }
+
+        let tooltip_class = WNDCLASSEXW {
+            cbSize: std::mem::size_of::<WNDCLASSEXW>() as u32,
+            lpfnWndProc: Some(tooltip_wndproc),
+            hInstance: instance.into(),
+            lpszClassName: w!("GlassBarTooltip"),
+            ..Default::default()
+        };
+        if RegisterClassExW(&tooltip_class) == 0 {
             return Err(windows::core::Error::from_thread());
         }
 
