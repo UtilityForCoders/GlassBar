@@ -11,10 +11,12 @@ mod bar;
 mod catalog;
 mod clock;
 mod glass;
+mod guard;
 mod icons;
 mod launcher;
 mod monitors;
 mod pins;
+mod priority;
 mod shell;
 mod spring;
 mod tray;
@@ -58,6 +60,8 @@ use crate::tray::{Tray, CMD_AUTOSTART, CMD_EXIT, CMD_REMOVE, WM_TRAY};
 
 const WM_MOUSELEAVE: u32 = 0x02A3;
 const WM_SHOW_LAUNCHER: u32 = windows::Win32::UI::WindowsAndMessaging::WM_APP + 2;
+/// Cambió la ventana activa: el dock comprueba si debe ponerse encima o apartarse.
+const WM_FOREGROUND: u32 = windows::Win32::UI::WindowsAndMessaging::WM_APP + 3;
 
 const TIMER_ANIM: usize = 1;
 const TIMER_TICK: usize = 2;
@@ -655,9 +659,12 @@ struct App {
     scale: f32,
     y_shown: i32,
     y_hidden: i32,
+    screen_top: i32,
     screen_bottom: i32,
     screen_left: i32,
     screen_right: i32,
+    /// Hay una app a pantalla completa en el monitor del dock: no aparece al llegar al borde.
+    fullscreen: bool,
     visibility: AutoHide,
     bar: BarState,
     shell: TaskbarReplacer,
@@ -709,9 +716,11 @@ impl App {
             scale,
             y_shown,
             y_hidden,
+            screen_top: rc.top,
             screen_bottom: rc.bottom,
             screen_left: rc.left,
             screen_right: rc.right,
+            fullscreen: false,
             visibility: AutoHide::new(Instant::now()),
             bar,
             shell,
@@ -759,6 +768,21 @@ impl App {
             menu.show();
         }
         self.expand();
+    }
+
+    /// Con una app a pantalla completa el dock se aparta; si no, al cambiar de ventana
+    /// (`raise`) vuelve a ponerse por encima de las demás, incluida la barra nativa.
+    fn check_priority(&mut self, raise: bool) {
+        let monitor = windows::Win32::Foundation::RECT {
+            left: self.screen_left,
+            top: self.screen_top,
+            right: self.screen_right,
+            bottom: self.screen_bottom,
+        };
+        self.fullscreen = priority::fullscreen_app(monitor);
+        if raise && !self.fullscreen {
+            priority::raise(self.hwnd);
+        }
     }
 
     fn pins_changed(&mut self) {
@@ -906,6 +930,10 @@ impl App {
 
 unsafe extern "system" fn wndproc(hwnd: HWND, msg: u32, wparam: WPARAM, lparam: LPARAM) -> LRESULT {
     match msg {
+        WM_FOREGROUND => {
+            with_app(|app| app.check_priority(true));
+            LRESULT(0)
+        }
         WM_SHOW_LAUNCHER => {
             with_app(|app| app.toggle_launcher());
             LRESULT(0)
@@ -1148,6 +1176,8 @@ unsafe extern "system" fn wndproc(hwnd: HWND, msg: u32, wparam: WPARAM, lparam: 
             } else if id == TIMER_TICK {
                 with_app(|app| {
                     app.shell.maintain();
+                    // Pasar a pantalla completa (F11) no cambia la ventana activa.
+                    app.check_priority(false);
                     if apps::update_running_apps(&mut app.bar.primary_apps, &mut app.bar.open_apps)
                     {
                         app.relayout();
@@ -1182,7 +1212,7 @@ unsafe extern "system" fn wndproc(hwnd: HWND, msg: u32, wparam: WPARAM, lparam: 
                         && pt.y >= app.y_shown
                         && pt.y < app.screen_bottom;
                     app.visibility.sample(
-                        at_edge
+                        (at_edge && !app.fullscreen)
                             || inside
                             || app.bar.drag.is_some()
                             || app.launcher.as_ref().is_some_and(|l| l.visible),
@@ -1310,6 +1340,9 @@ mod autohide_tests {
 }
 
 fn main() -> Result<()> {
+    if guard::run(&std::env::args().collect::<Vec<_>>()) {
+        return Ok(());
+    }
     unsafe {
         if std::env::args().any(|arg| arg == "--replace") {
             if let Ok(old) =
@@ -1359,6 +1392,9 @@ fn main() -> Result<()> {
             }
             return Ok(());
         }
+
+        // Antes de ocultar la barra nativa: si este proceso muere, el vigilante la devuelve.
+        guard::spawn();
 
         // Modo Per-Monitor DPI Aware v2
         let _ = SetProcessDpiAwarenessContext(DPI_AWARENESS_CONTEXT_PER_MONITOR_AWARE_V2);
@@ -1435,6 +1471,7 @@ fn main() -> Result<()> {
 
         // La tecla Windows abre el lanzador propio; se quita al salir del bucle.
         let _winkey = winkey::WinKey::install(hwnd, WM_SHOW_LAUNCHER);
+        let _foreground = priority::ForegroundWatch::install(hwnd, WM_FOREGROUND);
 
         let mut msg = MSG::default();
         while GetMessageW(&mut msg, None, 0, 0).as_bool() {

@@ -106,6 +106,23 @@ impl TaskbarReplacer {
         }
     }
 }
+/// Vuelve a mostrar las barras nativas desde otro proceso (el vigilante), cuando
+/// GlassBar ya no está. Si murió a mitad de abrir el panel de iconos ocultos, también
+/// quita la transparencia que dejó en la barra principal.
+pub fn restore_native() {
+    for hwnd in taskbars() {
+        unsafe {
+            let style = GetWindowLongPtrW(hwnd, GWL_EXSTYLE);
+            let transparent = WS_EX_TRANSPARENT.0 as isize;
+            if style & transparent != 0 {
+                SetWindowLongPtrW(hwnd, GWL_EXSTYLE, style & !transparent);
+                let _ = SetLayeredWindowAttributes(hwnd, COLORREF(0), 255, LWA_ALPHA);
+            }
+            let _ = ShowWindowAsync(hwnd, SW_SHOW);
+        }
+    }
+}
+
 /// Abre (o cierra) el panel nativo de iconos ocultos y lo coloca sobre `anchor_x`,
 /// con su borde inferior en `anchor_top`. Se ejecuta en otro hilo para no bloquear el dock.
 pub fn toggle_overflow(anchor_x: i32, anchor_top: i32, screen_left: i32, screen_right: i32) {
