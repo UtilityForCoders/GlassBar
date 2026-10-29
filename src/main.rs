@@ -280,6 +280,7 @@ struct LauncherWindow {
     scale: f32,
     model: launcher::LauncherState,
     visible: bool,
+    transition: launcher::Transition,
 }
 impl LauncherWindow {
     fn new(
@@ -325,22 +326,47 @@ impl LauncherWindow {
             scale,
             model,
             visible: false,
+            transition: launcher::Transition::hidden(),
         })
     }
     fn render(&mut self) {
         self.model.draw(&mut self.surface.pixmap, self.scale);
-        // Mientras el menú de energía entra, un temporizador pide el siguiente fotograma.
+        self.surface.copy_to_dib();
+        self.present();
+    }
+    /// Siguiente fotograma: solo se redibuja si el menú de energía está entrando;
+    /// la apertura y el cierre del panel solo mueven y desvanecen la ventana.
+    fn tick(&mut self) {
+        if self.model.animating() {
+            self.render();
+        } else {
+            self.present();
+        }
+    }
+    /// Pone el contenido ya dibujado en pantalla con la opacidad y la posición de la
+    /// transición. Mientras algo se mueve, un temporizador pide el siguiente fotograma.
+    fn present(&mut self) {
+        let now = Instant::now();
+        let shown = self.transition.shown(now);
+        let running = self.transition.running(now);
         unsafe {
-            if self.model.animating() {
+            if running || (self.visible && self.model.animating()) {
                 let _ = SetTimer(Some(self.hwnd), TIMER_ANIM, FRAME_MS, None);
             } else {
                 let _ = KillTimer(Some(self.hwnd), TIMER_ANIM);
             }
+            if !self.visible && !running {
+                let _ = ShowWindow(self.hwnd, windows::Win32::UI::WindowsAndMessaging::SW_HIDE);
+                return;
+            }
         }
-        self.surface.copy_to_dib();
+        let pos = POINT {
+            x: self.pos.x,
+            y: self.pos.y + (self.transition.offset(now) * self.scale).round() as i32,
+        };
         let blend = BLENDFUNCTION {
             BlendOp: AC_SRC_OVER as u8,
-            SourceConstantAlpha: 255,
+            SourceConstantAlpha: (shown * 255.0).round() as u8,
             AlphaFormat: AC_SRC_ALPHA as u8,
             ..Default::default()
         };
@@ -348,7 +374,7 @@ impl LauncherWindow {
             let _ = UpdateLayeredWindow(
                 self.hwnd,
                 None,
-                Some(&self.pos),
+                Some(&pos),
                 Some(&SIZE {
                     cx: self.surface.width as i32,
                     cy: self.surface.height as i32,
@@ -363,6 +389,7 @@ impl LauncherWindow {
     }
     fn show(&mut self) {
         self.visible = true;
+        self.transition.open(Instant::now());
         self.render();
         unsafe {
             use windows::Win32::System::Threading::{AttachThreadInput, GetCurrentThreadId};
@@ -384,11 +411,14 @@ impl LauncherWindow {
             }
         }
     }
+    /// Empieza el cierre; la ventana se oculta cuando termina de desvanecerse.
     fn hide(&mut self) {
-        self.visible = false;
-        unsafe {
-            let _ = ShowWindow(self.hwnd, windows::Win32::UI::WindowsAndMessaging::SW_HIDE);
+        if !self.visible {
+            return;
         }
+        self.visible = false;
+        self.transition.close(Instant::now());
+        self.present();
     }
 }
 impl Drop for LauncherWindow {
@@ -488,13 +518,14 @@ unsafe extern "system" fn launcher_wndproc(
         WM_TIMER if wparam.0 == TIMER_ANIM => {
             with_app(|app| {
                 if let Some(menu) = &mut app.launcher {
-                    menu.render();
+                    menu.tick();
                 }
             });
         }
+        // Mientras se cierra, el panel ya no responde al ratón ni al teclado.
         WM_MOUSEMOVE | WM_LBUTTONUP => {
             with_app(|app| {
-                if let Some(menu) = &mut app.launcher {
+                if let Some(menu) = app.launcher.as_mut().filter(|menu| menu.visible) {
                     let x = (lparam.0 & 0xffff) as i16 as f32 / menu.scale;
                     let y = ((lparam.0 >> 16) & 0xffff) as i16 as f32 / menu.scale;
                     let hit = menu.model.hit_test(x, y);
@@ -519,7 +550,7 @@ unsafe extern "system" fn launcher_wndproc(
         }
         WM_MOUSEWHEEL => {
             with_app(|app| {
-                if let Some(menu) = &mut app.launcher {
+                if let Some(menu) = app.launcher.as_mut().filter(|menu| menu.visible) {
                     if !menu.model.power_menu {
                         // 120 unidades por muesca de la rueda: algo más de una fila.
                         let delta = ((wparam.0 >> 16) & 0xffff) as i16 as f32;
@@ -531,7 +562,7 @@ unsafe extern "system" fn launcher_wndproc(
         }
         WM_CHAR => {
             with_app(|app| {
-                if let Some(menu) = &mut app.launcher {
+                if let Some(menu) = app.launcher.as_mut().filter(|menu| menu.visible) {
                     if let Some(ch) = char::from_u32(wparam.0 as u32) {
                         menu.model.type_char(ch);
                         menu.render();
@@ -541,7 +572,7 @@ unsafe extern "system" fn launcher_wndproc(
         }
         WM_KEYDOWN => {
             with_app(|app| {
-                if let Some(menu) = &mut app.launcher {
+                if let Some(menu) = app.launcher.as_mut().filter(|menu| menu.visible) {
                     let ctrl = windows::Win32::UI::Input::KeyboardAndMouse::GetKeyState(0x11) < 0;
                     match wparam.0 {
                         0x1B => {

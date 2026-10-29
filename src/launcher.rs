@@ -42,6 +42,11 @@ const MENU_PAD: f32 = 6.0;
 /// Entrada del menú de energía: duración y desplazamiento inicial hacia abajo.
 const MENU_ANIM: Duration = Duration::from_millis(200);
 const MENU_RISE: f32 = 12.0;
+/// Apertura y cierre del panel: el cierre es algo más corto, como en Windows 11.
+const OPEN_ANIM: Duration = Duration::from_millis(240);
+const CLOSE_ANIM: Duration = Duration::from_millis(160);
+/// Píxeles lógicos que el panel sube al abrirse (y baja al cerrarse).
+pub const PANEL_RISE: f32 = 36.0;
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum Hit {
@@ -1124,13 +1129,73 @@ fn draw_power_glyph(image: &mut Pixmap, cx: f32, cy: f32, scale: f32) {
     }
 }
 
+/// Apertura y cierre del panel completo: entra subiendo y apareciendo, y sale
+/// bajando y desvaneciéndose. Si se invierte a medias, sigue desde donde estaba.
+pub struct Transition {
+    opening: bool,
+    /// Avance lineal (0 oculto, 1 abierto) al empezar el tramo actual.
+    from: f32,
+    since: Instant,
+    animate: bool,
+}
+impl Transition {
+    pub fn hidden() -> Self {
+        Self {
+            opening: false,
+            from: 0.0,
+            since: Instant::now(),
+            animate: true,
+        }
+    }
+    fn level(&self, now: Instant) -> f32 {
+        if !self.animate {
+            return if self.opening { 1.0 } else { 0.0 };
+        }
+        let elapsed = now.saturating_duration_since(self.since).as_secs_f32();
+        if self.opening {
+            (self.from + elapsed / OPEN_ANIM.as_secs_f32()).min(1.0)
+        } else {
+            (self.from - elapsed / CLOSE_ANIM.as_secs_f32()).max(0.0)
+        }
+    }
+    fn turn(&mut self, opening: bool, now: Instant, animate: bool) {
+        self.from = self.level(now);
+        self.opening = opening;
+        self.since = now;
+        self.animate = animate;
+    }
+    pub fn open(&mut self, now: Instant) {
+        self.turn(true, now, animations_enabled());
+    }
+    pub fn close(&mut self, now: Instant) {
+        self.turn(false, now, animations_enabled());
+    }
+    /// Cuánto se ve el panel, de 0 a 1. Con la misma curva en ambos sentidos, al
+    /// abrir frena al llegar y al cerrar arranca suave y acelera al irse.
+    pub fn shown(&self, now: Instant) -> f32 {
+        ease_out(self.level(now))
+    }
+    /// Desplazamiento hacia abajo, en píxeles lógicos, para ese momento.
+    pub fn offset(&self, now: Instant) -> f32 {
+        (1.0 - self.shown(now)) * PANEL_RISE
+    }
+    pub fn running(&self, now: Instant) -> bool {
+        let level = self.level(now);
+        if self.opening {
+            level < 1.0
+        } else {
+            level > 0.0
+        }
+    }
+}
+
 /// Curva de salida cúbica: arranca rápido y frena al llegar, como Fluent.
 fn ease_out(linear: f32) -> f32 {
     1.0 - (1.0 - linear.clamp(0.0, 1.0)).powi(3)
 }
 
 /// Respeta "Efectos de animación" de Windows (Accesibilidad): si están desactivados,
-/// el menú aparece sin transición.
+/// el panel y el menú aparecen sin transición.
 fn animations_enabled() -> bool {
     use windows::core::BOOL;
     use windows::Win32::UI::WindowsAndMessaging::{
@@ -1455,6 +1520,52 @@ mod tests {
         assert!(menu.animating());
         menu.power_opened = Instant::now().checked_sub(MENU_ANIM * 2);
         assert!(!menu.animating());
+    }
+
+    #[test]
+    fn panel_rises_in_and_sinks_out_reversing_midway() {
+        let start = Instant::now();
+        let at = |ms: u64| start + Duration::from_millis(ms);
+        let mut panel = Transition::hidden();
+        assert_eq!(panel.shown(start), 0.0);
+        assert!(!panel.running(start));
+
+        panel.turn(true, start, true);
+        assert_eq!(panel.shown(start), 0.0);
+        assert_eq!(panel.offset(start), PANEL_RISE);
+        let half = at(OPEN_ANIM.as_millis() as u64 / 2);
+        assert!(panel.shown(half) > 0.5 && panel.shown(half) < 1.0);
+        assert!(panel.offset(half) > 0.0 && panel.offset(half) < PANEL_RISE / 2.0);
+        assert!(panel.running(half));
+        let open = at(OPEN_ANIM.as_millis() as u64);
+        assert_eq!(panel.shown(open), 1.0);
+        assert_eq!(panel.offset(open), 0.0);
+        assert!(!panel.running(open));
+
+        // Cerrar a mitad de la apertura sigue desde lo que ya se veía, sin saltos.
+        let mut reversed = Transition::hidden();
+        reversed.turn(true, start, true);
+        let seen = reversed.shown(half);
+        reversed.turn(false, half, true);
+        assert_eq!(reversed.shown(half), seen);
+        assert!(reversed.shown(half + Duration::from_millis(40)) < seen);
+        assert!(reversed.running(half));
+
+        // El cierre es más corto que la apertura y termina oculto.
+        panel.turn(false, open, true);
+        assert!(panel.running(open));
+        let closed = open + CLOSE_ANIM;
+        assert_eq!(panel.shown(closed), 0.0);
+        assert!(!panel.running(closed));
+        assert!(CLOSE_ANIM < OPEN_ANIM);
+
+        // Sin efectos de animación, abre y cierra al instante.
+        panel.turn(true, closed, false);
+        assert_eq!(panel.shown(closed), 1.0);
+        assert!(!panel.running(closed));
+        panel.turn(false, closed, false);
+        assert_eq!(panel.shown(closed), 0.0);
+        assert!(!panel.running(closed));
     }
 
     #[test]
