@@ -13,6 +13,7 @@ const APP_START: f32 = 48.0;
 const APP_STEP: f32 = 46.0;
 const CLOCK_W: f32 = 78.0;
 const ICON_SIZE: f32 = 28.0;
+const OVERFLOW_W: f32 = 30.0;
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum HoverTarget {
@@ -20,6 +21,8 @@ pub enum HoverTarget {
     PrimaryApp(usize),
     /// Programa abierto que no está anclado.
     OpenApp(usize),
+    /// Flecha que abre los iconos ocultos de la bandeja.
+    Overflow,
     Clock,
 }
 
@@ -60,7 +63,11 @@ impl BarState {
         }
     }
     pub fn dock_width(&self) -> f32 {
-        APP_START + self.item_count() as f32 * APP_STEP + CLOCK_W
+        APP_START + self.item_count() as f32 * APP_STEP + OVERFLOW_W + CLOCK_W
+    }
+    /// Centro horizontal de la flecha, en píxeles de la ventana.
+    pub fn overflow_center(&self, scale: f32) -> f32 {
+        (SHADOW_PAD_X + APP_START + self.item_count() as f32 * APP_STEP + OVERFLOW_W / 2.0) * scale
     }
     fn item_count(&self) -> usize {
         self.primary_apps.len() + self.open_apps.len()
@@ -75,20 +82,27 @@ impl BarState {
     }
     /// Nombre y centro horizontal (en píxeles de la ventana) del icono indicado.
     pub fn item_label(&self, target: HoverTarget, scale: f32) -> Option<(String, f32)> {
+        if target == HoverTarget::Overflow {
+            return Some(("Mostrar iconos ocultos".into(), self.overflow_center(scale)));
+        }
         let (i, (_, app)) = self.items().enumerate().find(|(_, (t, _))| *t == target)?;
         let cx = (SHADOW_PAD_X + APP_START + (i as f32 + 0.5) * APP_STEP) * scale;
         Some((app.entry.name.clone(), cx))
     }
     /// Empieza un posible arrastre; `x` en píxeles de la ventana.
     pub fn begin_drag(&mut self, target: HoverTarget, x: f32, scale: f32) {
-        self.drag = self.item_label(target, scale).map(|(_, center)| Drag {
-            target,
-            start_x: x,
-            x,
-            grab: x - center,
-            active: false,
-            moved: false,
-        });
+        let movable = matches!(target, HoverTarget::PrimaryApp(_) | HoverTarget::OpenApp(_));
+        self.drag = self
+            .item_label(target, scale)
+            .filter(|_| movable)
+            .map(|(_, center)| Drag {
+                target,
+                start_x: x,
+                x,
+                grab: x - center,
+                active: false,
+                moved: false,
+            });
     }
 
     /// Primera y última posición global del grupo al que pertenece `target`.
@@ -210,6 +224,8 @@ impl BarState {
             Some(HoverTarget::PrimaryApp(index))
         } else if index < self.item_count() {
             Some(HoverTarget::OpenApp(index - self.primary_apps.len()))
+        } else if x < APP_START + self.item_count() as f32 * APP_STEP + OVERFLOW_W {
+            Some(HoverTarget::Overflow)
         } else {
             Some(HoverTarget::Clock)
         }
@@ -271,6 +287,11 @@ impl BarState {
             draw_hover(pixmap, cx, cy, scale);
             draw_app_icon(pixmap, app, cx, cy, ICON_SIZE, ICON_SIZE * 1.1, scale);
         }
+        let arrow_x = self.overflow_center(scale);
+        if self.hovered == Some(HoverTarget::Overflow) {
+            draw_hover(pixmap, arrow_x, cy, scale);
+        }
+        draw_chevron(pixmap, arrow_x, cy, scale);
         self.clock.draw(
             pixmap,
             x + (self.dock_width() - CLOCK_W / 2.0) * scale,
@@ -278,6 +299,36 @@ impl BarState {
             scale,
         );
     }
+}
+
+/// Flecha hacia arriba ("^") de la bandeja, con trazo redondeado.
+fn draw_chevron(pixmap: &mut Pixmap, cx: f32, cy: f32, scale: f32) {
+    let (half, rise) = (5.0 * scale, 2.75 * scale);
+    let mut pb = tiny_skia::PathBuilder::new();
+    pb.move_to(cx - half, cy + rise);
+    pb.line_to(cx, cy - rise);
+    pb.line_to(cx + half, cy + rise);
+    let Some(path) = pb.finish() else {
+        return;
+    };
+    let mut paint = tiny_skia::Paint {
+        anti_alias: true,
+        ..Default::default()
+    };
+    paint.set_color_rgba8(255, 255, 255, 225);
+    let stroke = tiny_skia::Stroke {
+        width: 1.5 * scale,
+        line_cap: tiny_skia::LineCap::Round,
+        line_join: tiny_skia::LineJoin::Round,
+        ..Default::default()
+    };
+    pixmap.stroke_path(
+        &path,
+        &paint,
+        &stroke,
+        tiny_skia::Transform::identity(),
+        None,
+    );
 }
 
 #[cfg(test)]
@@ -353,6 +404,10 @@ mod tests {
                         scale
                     ),
                     Some(HoverTarget::Clock)
+                );
+                assert_eq!(
+                    bar.hit_test(bar.overflow_center(scale), cy, scale),
+                    Some(HoverTarget::Overflow)
                 );
                 assert_eq!(bar.hit_test(-1.0, cy, scale), None);
             }
