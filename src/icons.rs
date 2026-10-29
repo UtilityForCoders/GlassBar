@@ -26,6 +26,29 @@ pub fn load(path: &str) -> Option<Pixmap> {
     }
 }
 
+/// Nombre que el Shell muestra para una ruta o elemento (`shell:AppsFolder\...`).
+pub fn display_name(path: &str) -> Option<String> {
+    use windows::Win32::System::Com::{
+        CoInitializeEx, CoTaskMemFree, CoUninitialize, COINIT_APARTMENTTHREADED,
+    };
+    use windows::Win32::UI::Shell::{IShellItem, SHCreateItemFromParsingName, SIGDN_NORMALDISPLAY};
+    let wide: Vec<u16> = path.encode_utf16().chain(Some(0)).collect();
+    unsafe {
+        let initialized = CoInitializeEx(None, COINIT_APARTMENTTHREADED).is_ok();
+        let result = (|| {
+            let item: IShellItem = SHCreateItemFromParsingName(PCWSTR(wide.as_ptr()), None).ok()?;
+            let name = item.GetDisplayName(SIGDN_NORMALDISPLAY).ok()?;
+            let text = name.to_string().ok();
+            CoTaskMemFree(Some(name.0 as *const _));
+            text.filter(|t| !t.is_empty())
+        })();
+        if initialized {
+            CoUninitialize();
+        }
+        result
+    }
+}
+
 fn load_inner(path: &str) -> Option<Pixmap> {
     let normalized = path.replace('/', "\\");
     let wide: Vec<u16> = normalized.encode_utf16().chain(Some(0)).collect();

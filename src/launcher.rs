@@ -491,14 +491,19 @@ impl LauncherState {
                 12.0 * scale,
             );
         }
+        let size = (32.0 * scale).round().max(1.0) as u32;
         let icon = self
             .icons
             .entry(entry.command.clone())
             .or_insert_with(|| crate::icons::load(&entry.command));
+        // Se guarda ya reducido: la escala del lanzador es fija durante su vida.
+        if icon.as_ref().is_some_and(|i| i.width() > size) {
+            *icon = icon.as_ref().map(|i| crate::apps::downscale(i, size));
+        }
         if let Some(icon) = icon {
-            let size = (32.0 * scale).round();
+            let side = size as f32;
             let transform =
-                Transform::from_scale(size / icon.width() as f32, size / icon.height() as f32)
+                Transform::from_scale(side / icon.width() as f32, side / icon.height() as f32)
                     .post_translate(((x + 40.0) * scale).round(), ((y + 6.0) * scale).round());
             image.draw_pixmap(
                 0,

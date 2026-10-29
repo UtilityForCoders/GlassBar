@@ -26,7 +26,7 @@ mod spring;
 use bar::BarState;
 
 fn main() {
-    let scale = 2.0;
+    let scale: f32 = std::env::var("SCALE").ok().and_then(|s| s.parse().ok()).unwrap_or(2.0);
     let mut state = BarState::new();
     for command in std::env::args().skip(1) {
         if let Some(item) = pins::from_drop(command) {
@@ -63,10 +63,26 @@ fn main() {
         );
         return;
     }
+    let open = std::env::args().any(|a| a == "--open");
+    if open {
+        apps::update_running_apps(&mut state.primary_apps, &mut state.open_apps);
+        for w in apps::open_windows() {
+            println!("Ventana: {} | {}", w.hwnd, w.exe);
+        }
+        for a in state.primary_apps.iter().chain(&state.open_apps) {
+            println!(
+                "Icono: {} | {} | abierto={} | icono={}",
+                a.entry.name,
+                a.entry.command,
+                a.is_running,
+                a.icon.is_some()
+            );
+        }
+    }
     let (w, h) = state.window_size(scale);
     let mut pixmap = Pixmap::new(w, h).expect("pixmap failed");
 
-    if let Some(app) = state.primary_apps.first_mut() {
+    if let Some(app) = state.primary_apps.first_mut().filter(|_| !open) {
         app.is_running = true;
         state.hovered = Some(bar::HoverTarget::PrimaryApp(0));
     }
