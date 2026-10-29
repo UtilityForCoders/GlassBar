@@ -1,0 +1,113 @@
+//! Genera una vista previa del dock en `dock_preview.bmp` para comprobar el renderizado exacto.
+
+use std::fs::File;
+use std::io::Write;
+use tiny_skia::Pixmap;
+
+#[path = "../src/apps.rs"]
+mod apps;
+#[path = "../src/bar.rs"]
+mod bar;
+#[path = "../src/catalog.rs"]
+mod catalog;
+#[path = "../src/clock.rs"]
+mod clock;
+#[path = "../src/glass.rs"]
+mod glass;
+#[path = "../src/icons.rs"]
+mod icons;
+#[path = "../src/launcher.rs"]
+mod launcher;
+#[path = "../src/pins.rs"]
+mod pins;
+#[path = "../src/spring.rs"]
+mod spring;
+
+use bar::BarState;
+
+fn main() {
+    let scale = 2.0;
+    let mut state = BarState::new();
+    for command in std::env::args().skip(1) {
+        if let Some(item) = pins::from_drop(command) {
+            state.primary_apps.push(item);
+        }
+    }
+    if std::env::args().any(|a| a == "--launcher" || a == "--launcher-power") {
+        let pinned: Vec<_> = state.primary_apps.iter().map(|a| a.entry.clone()).collect();
+        let mut menu = launcher::LauncherState::new(&pinned);
+        let arguments: Vec<String> = std::env::args().collect();
+        if let Some(index) = arguments.iter().position(|a| a == "--search") {
+            if let Some(query) = arguments.get(index + 1) {
+                menu.insert_text(query);
+                for i in catalog::search(&menu.apps, query) {
+                    println!(
+                        "Resultado: {} | {}",
+                        menu.apps[i].name, menu.apps[i].command
+                    );
+                }
+            }
+        }
+        menu.confirming_shutdown = std::env::args().any(|a| a == "--launcher-power");
+        let scale = 1.5;
+        let mut image = Pixmap::new(
+            (launcher::WIDTH * scale) as u32,
+            (launcher::HEIGHT * scale) as u32,
+        )
+        .unwrap();
+        menu.draw(&mut image, scale);
+        std::fs::write("target/launcher-preview.bmp", bmp_entry(&image)).unwrap();
+        println!(
+            "Lanzador: {} aplicaciones; vista previa en target/launcher-preview.bmp",
+            menu.apps.len()
+        );
+        return;
+    }
+    let (w, h) = state.window_size(scale);
+    let mut pixmap = Pixmap::new(w, h).expect("pixmap failed");
+
+    if let Some(app) = state.primary_apps.first_mut() {
+        app.is_running = true;
+        state.hovered = Some(bar::HoverTarget::PrimaryApp(0));
+    }
+
+    state.draw(&mut pixmap, scale);
+
+    let bmp = bmp_entry(&pixmap);
+    let mut file = File::create("dock_preview.bmp").expect("failed to create dock_preview.bmp");
+    file.write_all(&bmp).expect("failed to write bmp");
+    println!("Vista previa guardada en dock_preview.bmp ({}x{})", w, h);
+}
+
+fn bmp_entry(pixmap: &Pixmap) -> Vec<u8> {
+    let (w, h) = (pixmap.width(), pixmap.height());
+    let mut out = Vec::new();
+    // BMP Header (14 bytes)
+    out.extend_from_slice(b"BM");
+    let file_size = 14 + 40 + (w * h * 4);
+    out.extend_from_slice(&(file_size as u32).to_le_bytes());
+    out.extend_from_slice(&0u32.to_le_bytes());
+    out.extend_from_slice(&54u32.to_le_bytes()); // offset to pixel data
+
+    // BITMAPINFOHEADER (40 bytes)
+    let bi_height = -(h as i32); // negativo = top-down
+    out.extend_from_slice(&40u32.to_le_bytes());
+    out.extend_from_slice(&w.to_le_bytes());
+    out.extend_from_slice(&bi_height.to_le_bytes());
+    out.extend_from_slice(&1u16.to_le_bytes()); // planes
+    out.extend_from_slice(&32u16.to_le_bytes()); // bit count
+    out.extend_from_slice(&0u32.to_le_bytes()); // BI_RGB
+    out.extend_from_slice(&(w * h * 4).to_le_bytes());
+    out.extend_from_slice(&[0u8; 16]);
+
+    for row in 0..h {
+        for col in 0..w {
+            let c = pixmap
+                .pixel(col, row)
+                .expect("píxel fuera del lienzo")
+                .demultiply();
+            out.extend_from_slice(&[c.blue(), c.green(), c.red(), c.alpha()]);
+        }
+    }
+    out
+}

@@ -1,0 +1,41 @@
+name: Compilar
+
+on:
+  push:
+    branches: [main]
+    tags: ['v*']
+  pull_request:
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  build:
+    runs-on: windows-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Caché de Cargo
+        uses: actions/cache@v4
+        with:
+          path: |
+            ~/.cargo/registry
+            ~/.cargo/git
+            target
+          key: cargo-${{ runner.os }}-${{ hashFiles('Cargo.lock') }}
+
+      - name: Verificar formato
+        run: cargo fmt --check
+
+      - name: Ejecutar pruebas
+        run: cargo test --locked --bin glassbar
+
+      - name: Compilar la app
+        run: cargo build --locked --release
+
+      - name: Subir el .exe
+        uses: actions/upload-artifact@v4
+        with:
+          name: glassbar-exe
+          path: target/release/glassbar.exe
