@@ -163,28 +163,49 @@ fn history_path() -> Option<PathBuf> {
             .join("recent.json"),
     )
 }
-pub fn recent() -> Vec<AppEntry> {
+/// Programa abierto desde GlassBar y cuándo (segundos Unix; 0 en historiales antiguos).
+#[derive(Clone, serde::Serialize, serde::Deserialize)]
+pub struct Launch {
+    #[serde(flatten)]
+    pub entry: AppEntry,
+    #[serde(default)]
+    pub at: u64,
+}
+pub fn recent() -> Vec<Launch> {
     history_path()
         .and_then(|path| std::fs::read(path).ok())
-        .and_then(|data| serde_json::from_slice::<Vec<AppEntry>>(&data).ok())
+        .and_then(|data| serde_json::from_slice::<Vec<Launch>>(&data).ok())
         .unwrap_or_default()
         .into_iter()
-        .filter(|e| e.command.starts_with("shell:AppsFolder\\") || Path::new(&e.command).is_file())
+        .filter(|l| {
+            l.entry.command.starts_with("shell:AppsFolder\\")
+                || Path::new(&l.entry.command).is_file()
+        })
         .take(8)
         .collect()
 }
 pub fn record(entry: &AppEntry) -> std::io::Result<()> {
     let mut entries = recent();
-    promote(&mut entries, entry);
+    let now = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|d| d.as_secs())
+        .unwrap_or(0);
+    promote(&mut entries, entry, now);
     let path = history_path().ok_or_else(|| std::io::Error::other("LOCALAPPDATA no disponible"))?;
     std::fs::create_dir_all(path.parent().unwrap())?;
     let pending = path.with_extension("tmp");
     std::fs::write(&pending, serde_json::to_vec_pretty(&entries)?)?;
     std::fs::rename(pending, path)
 }
-fn promote(entries: &mut Vec<AppEntry>, entry: &AppEntry) {
-    entries.retain(|e| !e.command.eq_ignore_ascii_case(&entry.command));
-    entries.insert(0, entry.clone());
+fn promote(entries: &mut Vec<Launch>, entry: &AppEntry, at: u64) {
+    entries.retain(|l| !l.entry.command.eq_ignore_ascii_case(&entry.command));
+    entries.insert(
+        0,
+        Launch {
+            entry: entry.clone(),
+            at,
+        },
+    );
     entries.truncate(8);
 }
 #[cfg(test)]
@@ -220,19 +241,28 @@ mod tests {
                     name: format!("App {i}"),
                     command: format!("{i}.exe"),
                 },
+                i,
             );
         }
-        let oldest = entries.last().unwrap().clone();
-        promote(&mut entries, &oldest);
+        let oldest = entries.last().unwrap().entry.clone();
+        promote(&mut entries, &oldest, 99);
         assert_eq!(entries.len(), 8);
-        assert_eq!(entries[0].command, oldest.command);
+        assert_eq!(entries[0].entry.command, oldest.command);
+        assert_eq!(entries[0].at, 99);
         assert_eq!(
             entries
                 .iter()
-                .filter(|e| e.command == oldest.command)
+                .filter(|l| l.entry.command == oldest.command)
                 .count(),
             1
         );
+    }
+    #[test]
+    fn history_reads_the_old_format_without_times() {
+        let old = r#"[{"name":"Spotify","command":"spotify.exe"}]"#;
+        let entries: Vec<Launch> = serde_json::from_str(old).unwrap();
+        assert_eq!(entries[0].entry.name, "Spotify");
+        assert_eq!(entries[0].at, 0);
     }
     #[test]
     fn catalog_handles_unicode_and_duplicate_paths() {

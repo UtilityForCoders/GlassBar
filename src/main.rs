@@ -18,6 +18,8 @@ mod pins;
 mod shell;
 mod spring;
 mod tray;
+mod usage;
+mod winkey;
 
 use std::cell::RefCell;
 use std::time::{Duration, Instant};
@@ -280,7 +282,12 @@ struct LauncherWindow {
     visible: bool,
 }
 impl LauncherWindow {
-    fn new(owner: HWND, pinned: &[apps::AppEntry], dock_left: i32, dock_top: i32) -> Result<Self> {
+    fn new(
+        owner: HWND,
+        model: launcher::LauncherState,
+        dock_left: i32,
+        dock_top: i32,
+    ) -> Result<Self> {
         let (screen, dpi) = monitors::get_info(monitors::primary());
         let scale = dpi
             .min((screen.right - screen.left - 24) as f32 / launcher::WIDTH)
@@ -288,9 +295,11 @@ impl LauncherWindow {
             .max(0.3);
         let width = (launcher::WIDTH * scale).ceil() as u32;
         let height = (launcher::HEIGHT * scale).ceil() as u32;
+        // Centrado sobre el dock, como el Inicio de Windows 11.
+        let _ = dock_left;
         let pos = POINT {
-            x: dock_left.clamp(screen.left + 12, screen.right - width as i32 - 12),
-            y: dock_top - height as i32 - 8,
+            x: screen.left + (screen.right - screen.left - width as i32) / 2,
+            y: dock_top - height as i32 - 12,
         };
         let surface = Surface::new(width, height)?;
         let hwnd = unsafe {
@@ -314,12 +323,20 @@ impl LauncherWindow {
             surface,
             pos,
             scale,
-            model: launcher::LauncherState::new(pinned),
+            model,
             visible: false,
         })
     }
     fn render(&mut self) {
         self.model.draw(&mut self.surface.pixmap, self.scale);
+        // Mientras el menú de energía entra, un temporizador pide el siguiente fotograma.
+        unsafe {
+            if self.model.animating() {
+                let _ = SetTimer(Some(self.hwnd), TIMER_ANIM, FRAME_MS, None);
+            } else {
+                let _ = KillTimer(Some(self.hwnd), TIMER_ANIM);
+            }
+        }
         self.surface.copy_to_dib();
         let blend = BLENDFUNCTION {
             BlendOp: AC_SRC_OVER as u8,
@@ -348,9 +365,23 @@ impl LauncherWindow {
         self.visible = true;
         self.render();
         unsafe {
-            let _ = ShowWindow(self.hwnd, windows::Win32::UI::WindowsAndMessaging::SW_SHOW);
-            let _ = windows::Win32::UI::WindowsAndMessaging::SetForegroundWindow(self.hwnd);
+            use windows::Win32::System::Threading::{AttachThreadInput, GetCurrentThreadId};
+            use windows::Win32::UI::WindowsAndMessaging::{
+                GetForegroundWindow, GetWindowThreadProcessId, SetForegroundWindow, SW_SHOW,
+            };
+            let _ = ShowWindow(self.hwnd, SW_SHOW);
+            // Abierto con la tecla Windows no hubo clic en GlassBar y Windows puede
+            // negar el foco; compartir la entrada con la ventana activa lo permite.
+            let current = GetCurrentThreadId();
+            let foreground = GetWindowThreadProcessId(GetForegroundWindow(), None);
+            let attached = foreground != 0
+                && foreground != current
+                && AttachThreadInput(current, foreground, true).as_bool();
+            let _ = SetForegroundWindow(self.hwnd);
             let _ = windows::Win32::UI::Input::KeyboardAndMouse::SetFocus(Some(self.hwnd));
+            if attached {
+                let _ = AttachThreadInput(current, foreground, false);
+            }
         }
     }
     fn hide(&mut self) {
@@ -390,6 +421,45 @@ unsafe fn clipboard_text(hwnd: HWND) -> Option<String> {
     text
 }
 
+/// Bloquea, suspende, apaga o reinicia. Apagar y reiniciar piden a Windows el
+/// cierre normal, sin forzar el de las aplicaciones abiertas.
+fn run_power(option: launcher::Power) -> bool {
+    use launcher::Power;
+    let shutdown = |flag: &str| {
+        std::env::var_os("WINDIR")
+            .map(std::path::PathBuf::from)
+            .map(|root| {
+                std::process::Command::new(root.join("System32").join("shutdown.exe"))
+                    .args([flag, "/t", "0"])
+                    .spawn()
+                    .is_ok()
+            })
+            .unwrap_or(false)
+    };
+    match option {
+        Power::Lock => unsafe { windows::Win32::System::Shutdown::LockWorkStation().is_ok() },
+        Power::Sleep => unsafe {
+            windows::Win32::System::Power::SetSuspendState(false, false, false)
+        },
+        Power::Shutdown => shutdown("/s"),
+        Power::Restart => shutdown("/r"),
+    }
+}
+
+/// Lee el catálogo y los iconos de la vista inicial en otro hilo.
+fn prepare_launcher(
+    pinned: &[apps::AppEntry],
+) -> std::sync::mpsc::Receiver<launcher::LauncherState> {
+    let (sender, receiver) = std::sync::mpsc::channel();
+    let pinned = pinned.to_vec();
+    std::thread::spawn(move || {
+        let mut model = launcher::LauncherState::new(&pinned);
+        model.preload_icons();
+        let _ = sender.send(model);
+    });
+    receiver
+}
+
 unsafe extern "system" fn launcher_wndproc(
     hwnd: HWND,
     msg: u32,
@@ -415,14 +485,25 @@ unsafe extern "system" fn launcher_wndproc(
                 }
             });
         }
+        WM_TIMER if wparam.0 == TIMER_ANIM => {
+            with_app(|app| {
+                if let Some(menu) = &mut app.launcher {
+                    menu.render();
+                }
+            });
+        }
         WM_MOUSEMOVE | WM_LBUTTONUP => {
             with_app(|app| {
                 if let Some(menu) = &mut app.launcher {
                     let x = (lparam.0 & 0xffff) as i16 as f32 / menu.scale;
                     let y = ((lparam.0 >> 16) & 0xffff) as i16 as f32 / menu.scale;
                     let hit = menu.model.hit_test(x, y);
+                    // Mover el ratón dentro del mismo elemento no cambia nada visible.
+                    if msg == WM_MOUSEMOVE && hit == menu.model.hovered {
+                        return;
+                    }
                     if msg == WM_LBUTTONUP {
-                        if (24.0..68.0).contains(&y) && (24.0..462.0).contains(&x) {
+                        if menu.model.in_search(x, y) {
                             menu.model.caret = menu.model.query.chars().count();
                             menu.model.select_all = false;
                             menu.model.selection = None;
@@ -439,8 +520,10 @@ unsafe extern "system" fn launcher_wndproc(
         WM_MOUSEWHEEL => {
             with_app(|app| {
                 if let Some(menu) = &mut app.launcher {
-                    if !menu.model.confirming_shutdown {
-                        menu.model.change_page(((wparam.0 >> 16) as i16) < 0);
+                    if !menu.model.power_menu {
+                        // 120 unidades por muesca de la rueda: algo más de una fila.
+                        let delta = ((wparam.0 >> 16) & 0xffff) as i16 as f32;
+                        menu.model.scroll_by(-delta / 120.0 * 96.0);
                         menu.render();
                     }
                 }
@@ -462,72 +545,72 @@ unsafe extern "system" fn launcher_wndproc(
                     let ctrl = windows::Win32::UI::Input::KeyboardAndMouse::GetKeyState(0x11) < 0;
                     match wparam.0 {
                         0x1B => {
-                            if menu.model.confirming_shutdown {
-                                menu.model.confirming_shutdown = false;
+                            if menu.model.power_menu {
+                                menu.model.power_menu = false;
                                 menu.render();
                             } else {
                                 menu.hide();
                             }
                         }
-                        0x0D if !menu.model.confirming_shutdown => {
+                        0x0D if !menu.model.power_menu => {
                             if let Some(hit) = menu.model.first_match() {
                                 action = menu.model.activate(hit);
                             }
                         }
-                        0x41 if ctrl && !menu.model.confirming_shutdown => {
+                        0x41 if ctrl && !menu.model.power_menu => {
                             menu.model.select_all = true;
                             menu.render();
                         }
-                        0x56 if ctrl && !menu.model.confirming_shutdown => {
+                        0x56 if ctrl && !menu.model.power_menu => {
                             if let Some(text) = clipboard_text(hwnd) {
                                 menu.model.insert_text(&text);
                                 menu.render();
                             }
                         }
-                        0x25 if !menu.model.confirming_shutdown => {
+                        0x25 if !menu.model.power_menu => {
                             if menu.model.selection.is_some() {
-                                menu.model.move_selection(-1);
+                                menu.model.move_selection(-1, 0);
                             } else {
                                 menu.model.move_caret(-1);
                             }
                             menu.render();
                         }
-                        0x27 if !menu.model.confirming_shutdown => {
+                        0x27 if !menu.model.power_menu => {
                             if menu.model.selection.is_some() {
-                                menu.model.move_selection(1);
+                                menu.model.move_selection(1, 0);
                             } else {
                                 menu.model.move_caret(1);
                             }
                             menu.render();
                         }
-                        0x24 if !menu.model.confirming_shutdown => {
+                        0x24 if !menu.model.power_menu => {
                             menu.model.caret = 0;
                             menu.model.select_all = false;
                             menu.render();
                         }
-                        0x23 if !menu.model.confirming_shutdown => {
+                        0x23 if !menu.model.power_menu => {
                             menu.model.caret = menu.model.query.chars().count();
                             menu.model.select_all = false;
                             menu.render();
                         }
-                        0x2E if !menu.model.confirming_shutdown => {
+                        0x2E if !menu.model.power_menu => {
                             menu.model.delete_forward();
                             menu.render();
                         }
-                        0x28 if !menu.model.confirming_shutdown => {
-                            menu.model.move_selection(4);
+                        0x28 if !menu.model.power_menu => {
+                            menu.model.move_selection(0, 1);
                             menu.render();
                         }
-                        0x26 if !menu.model.confirming_shutdown => {
-                            menu.model.move_selection(-4);
+                        0x26 if !menu.model.power_menu => {
+                            menu.model.move_selection(0, -1);
                             menu.render();
                         }
-                        0x22 if !menu.model.confirming_shutdown => {
-                            menu.model.change_page(true);
+                        0x22 if !menu.model.power_menu => {
+                            menu.model.scroll_page(true);
                             menu.render();
                         }
-                        0x21 if !menu.model.confirming_shutdown => {
-                            menu.model.change_page(false);
+                        0x21 if !menu.model.power_menu => {
+                            menu.model.scroll_page(false);
                             menu.render();
                         }
                         _ => {}
@@ -550,18 +633,11 @@ unsafe extern "system" fn launcher_wndproc(
                     let _ = catalog::record(&entry);
                 }
             }
-            launcher::Action::Shutdown => {
-                let result = std::env::var_os("WINDIR")
-                    .map(std::path::PathBuf::from)
-                    .map(|root| {
-                        std::process::Command::new(root.join("System32").join("shutdown.exe"))
-                            .args(["/s", "/t", "0"])
-                            .spawn()
-                    });
-                if !matches!(result, Some(Ok(_))) {
+            launcher::Action::Power(option) => {
+                if !run_power(option) {
                     windows::Win32::UI::WindowsAndMessaging::MessageBoxW(
                         Some(hwnd),
-                        w!("No se pudo solicitar el apagado."),
+                        w!("Windows no aceptó la acción de energía."),
                         w!("GlassBar"),
                         windows::Win32::UI::WindowsAndMessaging::MB_ICONERROR,
                     );
@@ -587,6 +663,9 @@ struct App {
     shell: TaskbarReplacer,
     tray: Tray,
     launcher: Option<LauncherWindow>,
+    /// Lanzador preparado en segundo plano al iniciar (catálogo e iconos), para que
+    /// la primera apertura no tenga que esperar a leerlos.
+    prepared: Option<std::sync::mpsc::Receiver<launcher::LauncherState>>,
     tooltip: Option<Tooltip>,
     animating: bool,
     last_tick: Instant,
@@ -621,6 +700,7 @@ impl App {
         shell.hide();
 
         let tray = Tray::new(hwnd);
+        let pinned: Vec<_> = bar.primary_apps.iter().map(|a| a.entry.clone()).collect();
 
         Ok(Self {
             hwnd,
@@ -637,6 +717,7 @@ impl App {
             shell,
             tray,
             launcher: None,
+            prepared: Some(prepare_launcher(&pinned)),
             tooltip: Tooltip::new(hwnd).ok(),
             animating: false,
             last_tick: Instant::now(),
@@ -658,12 +739,21 @@ impl App {
             .map(|a| a.entry.clone())
             .collect();
         if self.launcher.is_none() {
-            match LauncherWindow::new(self.hwnd, &pinned, self.pos.x, self.y_shown) {
+            // Normalmente ya está listo; si no, se espera a ese mismo trabajo.
+            let model = match self.prepared.take().and_then(|ready| ready.recv().ok()) {
+                Some(mut model) => {
+                    model.refresh(&pinned);
+                    model
+                }
+                None => launcher::LauncherState::new(&pinned),
+            };
+            match LauncherWindow::new(self.hwnd, model, self.pos.x, self.y_shown) {
                 Ok(menu) => self.launcher = Some(menu),
                 Err(_) => return,
             }
         } else if let Some(menu) = &mut self.launcher {
-            menu.model = launcher::LauncherState::new(&pinned);
+            // Conserva el catálogo y los iconos ya cargados; solo pone al día el uso.
+            menu.model.refresh(&pinned);
         }
         if let Some(menu) = &mut self.launcher {
             menu.show();
@@ -1342,6 +1432,9 @@ fn main() -> Result<()> {
         let _ = SetTimer(Some(hwnd), TIMER_EDGE, EDGE_MS, None);
 
         APP.with(|cell| *cell.borrow_mut() = Some(app));
+
+        // La tecla Windows abre el lanzador propio; se quita al salir del bucle.
+        let _winkey = winkey::WinKey::install(hwnd, WM_SHOW_LAUNCHER);
 
         let mut msg = MSG::default();
         while GetMessageW(&mut msg, None, 0, 0).as_bool() {
