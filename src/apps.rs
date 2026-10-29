@@ -182,7 +182,8 @@ pub struct OpenWindow {
 
 impl OpenWindow {
     fn belongs_to(&self, app: &AppItem) -> bool {
-        (!app.process_name.is_empty() && file_name(&self.exe).eq_ignore_ascii_case(&app.process_name))
+        (!app.process_name.is_empty()
+            && file_name(&self.exe).eq_ignore_ascii_case(&app.process_name))
             || self.app_id.as_ref().is_some_and(|id| {
                 app.entry
                     .command
@@ -224,8 +225,13 @@ fn file_description(exe: &str) -> Option<String> {
             pair[0], pair[1]
         );
         let key: Vec<u16> = key.encode_utf16().chain(Some(0)).collect();
-        if !VerQueryValueW(data.as_ptr().cast(), PCWSTR(key.as_ptr()), &mut ptr, &mut len)
-            .as_bool()
+        if !VerQueryValueW(
+            data.as_ptr().cast(),
+            PCWSTR(key.as_ptr()),
+            &mut ptr,
+            &mut len,
+        )
+        .as_bool()
             || len == 0
         {
             return None;
@@ -390,13 +396,13 @@ fn process_info(pid: u32) -> Option<(String, Option<String>)> {
         .then(|| String::from_utf16_lossy(&buf[..len as usize]));
         let mut id = vec![0u16; 256];
         let mut id_len = id.len() as u32;
-        let app_id = (GetApplicationUserModelId(process, &mut id_len, Some(PWSTR(id.as_mut_ptr())))
-            .is_ok())
-        .then(|| {
-            let end = id.iter().position(|&c| c == 0).unwrap_or(id.len());
-            String::from_utf16_lossy(&id[..end])
-        })
-        .filter(|id| !id.is_empty());
+        let app_id =
+            (GetApplicationUserModelId(process, &mut id_len, Some(PWSTR(id.as_mut_ptr()))).is_ok())
+                .then(|| {
+                    let end = id.iter().position(|&c| c == 0).unwrap_or(id.len());
+                    String::from_utf16_lossy(&id[..end])
+                })
+                .filter(|id| !id.is_empty());
         let _ = CloseHandle(process);
         Some((exe?, app_id))
     }

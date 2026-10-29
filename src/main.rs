@@ -202,7 +202,15 @@ impl Tooltip {
         };
         let (w, h) = (width as f32, height as f32);
         surface.pixmap.fill(tiny_skia::Color::TRANSPARENT);
-        apps::fill_rounded(&mut surface.pixmap, [32, 32, 32, 235], 0.5, 0.5, w - 1.0, h - 1.0, 7.0 * scale);
+        apps::fill_rounded(
+            &mut surface.pixmap,
+            [32, 32, 32, 235],
+            0.5,
+            0.5,
+            w - 1.0,
+            h - 1.0,
+            7.0 * scale,
+        );
         apps::stroke_rounded(
             &mut surface.pixmap,
             [255, 255, 255, 40],
@@ -213,7 +221,14 @@ impl Tooltip {
             7.0 * scale,
             1.0,
         );
-        clock::draw_text(&mut surface.pixmap, &text, 11.0 * scale, h / 2.0 - size * 0.38, size, 1.0);
+        clock::draw_text(
+            &mut surface.pixmap,
+            &text,
+            11.0 * scale,
+            h / 2.0 - size * 0.38,
+            size,
+            1.0,
+        );
         surface.copy_to_dib();
         let pos = POINT {
             x: (cx - width as i32 / 2).clamp(left + 4, (right - width as i32 - 4).max(left + 4)),
@@ -919,7 +934,12 @@ unsafe extern "system" fn wndproc(hwnd: HWND, msg: u32, wparam: WPARAM, lparam: 
                 if let Some(pinned_moved) = app.bar.end_drag() {
                     // Soltar tras arrastrar solo coloca el icono; no abre el programa.
                     app.bar.pressed = None;
-                    for a in app.bar.primary_apps.iter_mut().chain(&mut app.bar.open_apps) {
+                    for a in app
+                        .bar
+                        .primary_apps
+                        .iter_mut()
+                        .chain(&mut app.bar.open_apps)
+                    {
                         a.press_spring.set_target(1.0);
                     }
                     if pinned_moved {
@@ -1020,7 +1040,8 @@ unsafe extern "system" fn wndproc(hwnd: HWND, msg: u32, wparam: WPARAM, lparam: 
             } else if id == TIMER_TICK {
                 with_app(|app| {
                     app.shell.maintain();
-                    if apps::update_running_apps(&mut app.bar.primary_apps, &mut app.bar.open_apps) {
+                    if apps::update_running_apps(&mut app.bar.primary_apps, &mut app.bar.open_apps)
+                    {
                         app.relayout();
                     } else {
                         app.render();

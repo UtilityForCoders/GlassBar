@@ -26,7 +26,10 @@ mod spring;
 use bar::BarState;
 
 fn main() {
-    let scale: f32 = std::env::var("SCALE").ok().and_then(|s| s.parse().ok()).unwrap_or(2.0);
+    let scale: f32 = std::env::var("SCALE")
+        .ok()
+        .and_then(|s| s.parse().ok())
+        .unwrap_or(2.0);
     let mut state = BarState::new();
     for command in std::env::args().skip(1) {
         if let Some(item) = pins::from_drop(command) {

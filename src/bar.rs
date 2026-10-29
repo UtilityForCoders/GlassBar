@@ -125,7 +125,11 @@ impl BarState {
             group.insert(to, item);
             // Los iconos que ceden su sitio parten de donde estaban y se deslizan.
             let shift = if to > from { APP_STEP } else { -APP_STEP };
-            let range = if to > from { from..to } else { to + 1..from + 1 };
+            let range = if to > from {
+                from..to
+            } else {
+                to + 1..from + 1
+            };
             for app in &mut group[range] {
                 app.slide.value += shift;
                 app.slide.set_target(0.0);
@@ -304,7 +308,11 @@ mod tests {
         bar.begin_drag(HoverTarget::PrimaryApp(0), center(0.0), scale);
         assert!(bar.drag_to(center(5.0), scale));
         assert_eq!(bar.end_drag(), Some(true));
-        let order: Vec<_> = bar.primary_apps.iter().map(|a| a.entry.command.as_str()).collect();
+        let order: Vec<_> = bar
+            .primary_apps
+            .iter()
+            .map(|a| a.entry.command.as_str())
+            .collect();
         assert_eq!(order, ["b.exe", "c.exe", "a.exe"]);
         assert_eq!(bar.open_apps[0].entry.command, "x.exe");
 
