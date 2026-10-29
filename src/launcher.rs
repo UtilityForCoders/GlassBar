@@ -1,64 +1,317 @@
-//! Lanzador transparente propio; ninguna interacción abre el menú Inicio nativo.
+//! Lanzador propio al estilo del Inicio de Windows 11: búsqueda, anclados,
+//! recientes y más usadas en una vista con desplazamiento. El resto del
+//! catálogo solo aparece al buscar.
 use crate::apps::{fill_rounded, stroke_rounded, AppEntry};
-use crate::clock::{draw_text, fit_text};
+use crate::catalog::Launch;
+use crate::clock::{draw_icon, draw_text, draw_text_semibold, fit_text, text_width};
+use crate::usage::Usage;
+use std::cell::RefCell;
 use std::collections::HashMap;
+use std::time::{Duration, Instant};
 use tiny_skia::{FilterQuality, Pixmap, PixmapPaint, Transform};
 
-pub const WIDTH: f32 = 520.0;
-pub const HEIGHT: f32 = 572.0;
-const PAGE_SIZE: usize = 12;
+pub const WIDTH: f32 = 640.0;
+pub const HEIGHT: f32 = 700.0;
+const PAD: f32 = 32.0;
+const SEARCH_Y: f32 = 24.0;
+const SEARCH_H: f32 = 38.0;
+/// Zona desplazable entre la búsqueda y el pie.
+const VIEW_TOP: f32 = 82.0;
+const FOOTER_Y: f32 = HEIGHT - 64.0;
+const VIEW_H: f32 = FOOTER_Y - 8.0 - VIEW_TOP;
+const CONTENT_W: f32 = WIDTH - PAD * 2.0;
+const COLS: usize = 6;
+const TILE_W: f32 = CONTENT_W / COLS as f32;
+const TILE_H: f32 = 88.0;
+const HEADER_H: f32 = 32.0;
+const SECTION_GAP: f32 = 14.0;
+/// Línea final que recuerda que el resto del catálogo está en la búsqueda.
+const HINT_H: f32 = 36.0;
+const ROW_H: f32 = 52.0;
+const ICON: f32 = 32.0;
+const MAX_PINNED: usize = COLS * 3;
+const MAX_RECENT: usize = 6;
+const MAX_FREQUENT: usize = COLS * 2;
+/// El catálogo completo (lento de leer) se reutiliza entre aperturas durante este tiempo.
+const CATALOG_TTL: Duration = Duration::from_secs(120);
+/// Fondo casi opaco, como el Inicio de Windows en modo oscuro.
+const BACKGROUND: [u8; 4] = [32, 32, 34, 246];
+const MENU_W: f32 = 196.0;
+const MENU_ROW: f32 = 36.0;
+const MENU_PAD: f32 = 6.0;
+/// Entrada del menú de energía: duración y desplazamiento inicial hacia abajo.
+const MENU_ANIM: Duration = Duration::from_millis(200);
+const MENU_RISE: f32 = 12.0;
+
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum Hit {
+    Pinned(usize),
     Recent(usize),
+    Frequent(usize),
     App(usize),
-    Previous,
-    Next,
     Power,
-    Cancel,
-    ConfirmShutdown,
+    PowerOption(Power),
+    /// Clic fuera del menú de energía abierto: solo lo cierra.
+    Outside,
     ClearSearch,
 }
 pub enum Action {
     Launch(AppEntry),
-    Shutdown,
+    Power(Power),
 }
+
+/// Opciones del menú de energía, en el orden en que se muestran.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum Power {
+    Lock,
+    Sleep,
+    Shutdown,
+    Restart,
+}
+impl Power {
+    pub const ALL: [Power; 4] = [Power::Lock, Power::Sleep, Power::Shutdown, Power::Restart];
+    fn label(self) -> &'static str {
+        match self {
+            Power::Lock => "Bloquear",
+            Power::Sleep => "Suspender",
+            Power::Shutdown => "Apagar",
+            Power::Restart => "Reiniciar",
+        }
+    }
+    /// Glifo de Segoe Fluent Icons / MDL2 Assets que usa Windows para cada opción.
+    fn glyph(self) -> char {
+        match self {
+            Power::Lock => '\u{E72E}',
+            Power::Sleep => '\u{E708}',
+            Power::Shutdown => '\u{E7E8}',
+            Power::Restart => '\u{E777}',
+        }
+    }
+}
+
+/// Elemento pulsable; coordenadas de contenido (x desde `PAD`, y sin desplazamiento).
+#[derive(Clone, Copy, Debug)]
+struct Slot {
+    hit: Hit,
+    x: f32,
+    y: f32,
+    w: f32,
+    h: f32,
+    row: bool,
+}
+impl Slot {
+    fn contains(&self, x: f32, y: f32) -> bool {
+        x >= self.x && x < self.x + self.w && y >= self.y && y < self.y + self.h
+    }
+    fn center(&self) -> (f32, f32) {
+        (self.x + self.w / 2.0, self.y + self.h / 2.0)
+    }
+}
+struct Layout {
+    headers: Vec<(String, f32)>,
+    slots: Vec<Slot>,
+    height: f32,
+}
+
 pub struct LauncherState {
     pub apps: Vec<AppEntry>,
     pub recent: Vec<AppEntry>,
+    pub frequent: Vec<AppEntry>,
+    pub pinned: Vec<AppEntry>,
     pub query: String,
-    pub page: usize,
+    pub scroll: f32,
     pub hovered: Option<Hit>,
-    pub confirming_shutdown: bool,
-    pub selection: Option<usize>,
+    pub power_menu: bool,
+    /// Cuándo se abrió el menú de energía, para su animación de entrada.
+    power_opened: Option<Instant>,
+    pub selection: Option<Hit>,
     pub caret: usize,
     pub select_all: bool,
+    user: String,
     icons: HashMap<String, Option<Pixmap>>,
+    loaded: Instant,
+    /// Última búsqueda y sus resultados: la vista se recalcula en cada movimiento del ratón.
+    search_cache: RefCell<Option<(String, Vec<usize>)>>,
 }
 impl LauncherState {
     pub fn new(pinned: &[AppEntry]) -> Self {
-        Self {
+        let mut state = Self {
             apps: crate::catalog::installed(pinned),
-            recent: crate::catalog::recent(),
+            recent: Vec::new(),
+            frequent: Vec::new(),
+            pinned: Vec::new(),
             query: String::new(),
-            page: 0,
+            scroll: 0.0,
             hovered: None,
-            confirming_shutdown: false,
+            power_menu: false,
+            power_opened: None,
             selection: None,
             caret: 0,
             select_all: false,
+            user: user_display_name(),
             icons: HashMap::new(),
+            loaded: Instant::now(),
+            search_cache: RefCell::new(None),
+        };
+        state.refresh(pinned);
+        state
+    }
+    /// Prepara una nueva apertura: anclados, recientes y más usadas al día, sin
+    /// volver a leer el catálogo ni los iconos si es reciente.
+    pub fn refresh(&mut self, pinned: &[AppEntry]) {
+        if self.loaded.elapsed() > CATALOG_TTL {
+            self.apps = crate::catalog::installed(pinned);
+            self.loaded = Instant::now();
+            self.search_cache.replace(None);
+        }
+        self.pinned = pinned.to_vec();
+        let (recent, frequent) = rank(
+            &self.apps,
+            &crate::usage::load(),
+            &crate::catalog::recent(),
+            pinned,
+        );
+        self.recent = recent;
+        self.frequent = frequent;
+        self.query.clear();
+        self.caret = 0;
+        self.select_all = false;
+        self.power_menu = false;
+        self.reset_results();
+    }
+    /// Carga de antemano los iconos de la vista inicial (anclados, recientes y más
+    /// usadas), que es lo que más tarda la primera vez que se abre el lanzador.
+    pub fn preload_icons(&mut self) {
+        let entries: Vec<String> = self
+            .pinned
+            .iter()
+            .take(MAX_PINNED)
+            .chain(self.recent.iter().take(MAX_RECENT))
+            .chain(self.frequent.iter().take(MAX_FREQUENT))
+            .map(|e| e.command.clone())
+            .collect();
+        for command in entries {
+            self.icons
+                .entry(command.clone())
+                .or_insert_with(|| crate::icons::load(&command));
         }
     }
     fn filtered(&self) -> Vec<usize> {
-        crate::catalog::search(&self.apps, &self.query)
+        let mut cache = self.search_cache.borrow_mut();
+        if let Some((query, hits)) = cache.as_ref() {
+            if *query == self.query {
+                return hits.clone();
+            }
+        }
+        let hits = crate::catalog::search(&self.apps, &self.query);
+        *cache = Some((self.query.clone(), hits.clone()));
+        hits
     }
-    fn grid_top(&self) -> f32 {
-        if self.query.trim().is_empty() {
-            248.0
-        } else {
-            116.0
+    fn searching(&self) -> bool {
+        !self.query.trim().is_empty()
+    }
+
+    fn layout(&self) -> Layout {
+        let mut headers = Vec::new();
+        let mut slots = Vec::new();
+        let mut y = 0.0;
+        let tiles = |slots: &mut Vec<Slot>, y: f32, hits: &mut dyn Iterator<Item = Hit>| {
+            let mut count: usize = 0;
+            for (i, hit) in hits.enumerate() {
+                slots.push(Slot {
+                    hit,
+                    x: (i % COLS) as f32 * TILE_W,
+                    y: y + (i / COLS) as f32 * TILE_H,
+                    w: TILE_W,
+                    h: TILE_H,
+                    row: false,
+                });
+                count += 1;
+            }
+            count.div_ceil(COLS) as f32 * TILE_H
+        };
+        if self.searching() {
+            let hits = self.filtered();
+            let title = match hits.len() {
+                0 => "Sin resultados".to_string(),
+                1 => "1 resultado".to_string(),
+                n => format!("{n} resultados"),
+            };
+            headers.push((title, y));
+            y += HEADER_H;
+            for (n, index) in hits.into_iter().enumerate() {
+                slots.push(Slot {
+                    hit: Hit::App(index),
+                    x: 0.0,
+                    y: y + n as f32 * ROW_H,
+                    w: CONTENT_W,
+                    h: ROW_H - 4.0,
+                    row: true,
+                });
+            }
+            y += slots.len() as f32 * ROW_H;
+            return Layout {
+                headers,
+                slots,
+                height: y,
+            };
+        }
+        if !self.pinned.is_empty() {
+            headers.push(("Anclado".to_string(), y));
+            y += HEADER_H;
+            let count = self.pinned.len().min(MAX_PINNED);
+            y += tiles(&mut slots, y, &mut (0..count).map(Hit::Pinned)) + SECTION_GAP;
+        }
+        if !self.recent.is_empty() {
+            headers.push(("Recientes".to_string(), y));
+            y += HEADER_H;
+            let count = self.recent.len().min(MAX_RECENT);
+            for i in 0..count {
+                slots.push(Slot {
+                    hit: Hit::Recent(i),
+                    x: (i % 2) as f32 * CONTENT_W / 2.0,
+                    y: y + (i / 2) as f32 * ROW_H,
+                    w: CONTENT_W / 2.0 - 4.0,
+                    h: ROW_H - 4.0,
+                    row: true,
+                });
+            }
+            y += count.div_ceil(2) as f32 * ROW_H + SECTION_GAP;
+        }
+        if !self.frequent.is_empty() {
+            headers.push(("Más usadas".to_string(), y));
+            y += HEADER_H;
+            let count = self.frequent.len().min(MAX_FREQUENT);
+            y += tiles(&mut slots, y, &mut (0..count).map(Hit::Frequent)) + SECTION_GAP;
+        }
+        Layout {
+            headers,
+            slots,
+            height: y + HINT_H,
         }
     }
+    fn max_scroll(&self) -> f32 {
+        (self.layout().height - VIEW_H).max(0.0)
+    }
+    pub fn scroll_by(&mut self, delta: f32) {
+        self.scroll = (self.scroll + delta).clamp(0.0, self.max_scroll());
+        self.hovered = None;
+    }
+    pub fn scroll_page(&mut self, forward: bool) {
+        self.scroll_by(if forward { VIEW_H } else { -VIEW_H } * 0.9);
+    }
+    fn ensure_visible(&mut self, hit: Hit) {
+        if let Some(slot) = self.layout().slots.into_iter().find(|s| s.hit == hit) {
+            // Al principio de la vista también se ve el encabezado de su sección.
+            if slot.y - HEADER_H < self.scroll {
+                self.scroll = (slot.y - HEADER_H).max(0.0);
+            } else if slot.y + slot.h > self.scroll + VIEW_H {
+                self.scroll = slot.y + slot.h - VIEW_H;
+            }
+            self.scroll = self.scroll.clamp(0.0, self.max_scroll());
+        }
+    }
+
     fn byte_at(&self, index: usize) -> usize {
         self.query
             .char_indices()
@@ -67,7 +320,7 @@ impl LauncherState {
             .unwrap_or(self.query.len())
     }
     pub fn insert_text(&mut self, text: &str) {
-        if self.confirming_shutdown {
+        if self.power_menu {
             return;
         }
         if self.select_all {
@@ -86,7 +339,7 @@ impl LauncherState {
         self.reset_results();
     }
     fn reset_results(&mut self) {
-        self.page = 0;
+        self.scroll = 0.0;
         self.hovered = None;
         self.selection = None;
     }
@@ -107,33 +360,65 @@ impl LauncherState {
         }
         self.reset_results();
     }
-    pub fn move_selection(&mut self, delta: isize) {
-        let hits = self.filtered();
-        if hits.is_empty() {
+    /// Mueve la selección con las flechas: izquierda/derecha siguen el orden de lectura;
+    /// arriba/abajo saltan al elemento más cercano en esa dirección, entre secciones.
+    pub fn move_selection(&mut self, dx: i32, dy: i32) {
+        if self.power_menu {
+            // En el menú de energía las flechas recorren sus opciones.
+            let current = match self.selection {
+                Some(Hit::PowerOption(p)) => Power::ALL.iter().position(|&o| o == p),
+                _ => None,
+            };
+            let step = if dy != 0 { dy } else { dx } as isize;
+            let next = match current {
+                None if step < 0 => Power::ALL.len() - 1,
+                None => 0,
+                Some(i) => (i as isize + step).clamp(0, Power::ALL.len() as isize - 1) as usize,
+            };
+            self.selection = Some(Hit::PowerOption(Power::ALL[next]));
             return;
         }
-        let index = self
-            .selection
-            .and_then(|id| hits.iter().position(|&i| i == id))
-            .map(|pos| pos.saturating_add_signed(delta).min(hits.len() - 1))
-            .unwrap_or(0);
-        self.selection = Some(hits[index]);
-        self.page = index / PAGE_SIZE;
-    }
-    pub fn page_count(&self) -> usize {
-        self.filtered().len().div_ceil(PAGE_SIZE).max(1)
-    }
-    pub fn change_page(&mut self, forward: bool) {
-        self.page = if forward {
-            (self.page + 1).min(self.page_count() - 1)
-        } else {
-            self.page.saturating_sub(1)
+        let slots = self.layout().slots;
+        let Some(first) = slots.first() else {
+            return;
         };
-        self.hovered = None;
-        self.selection = None;
+        let current = self
+            .selection
+            .and_then(|hit| slots.iter().position(|s| s.hit == hit));
+        let next = match current {
+            None => first.hit,
+            Some(i) if dy == 0 => {
+                let j = (i as isize + dx as isize).clamp(0, slots.len() as isize - 1);
+                slots[j as usize].hit
+            }
+            Some(i) => {
+                let (cx, cy) = slots[i].center();
+                slots
+                    .iter()
+                    .filter(|s| {
+                        let (_, sy) = s.center();
+                        if dy > 0 {
+                            sy > cy + 1.0
+                        } else {
+                            sy < cy - 1.0
+                        }
+                    })
+                    .min_by(|a, b| {
+                        let key = |s: &Slot| {
+                            let (sx, sy) = s.center();
+                            ((sy - cy).abs(), (sx - cx).abs())
+                        };
+                        key(a).partial_cmp(&key(b)).unwrap()
+                    })
+                    .map(|s| s.hit)
+                    .unwrap_or(slots[i].hit)
+            }
+        };
+        self.selection = Some(next);
+        self.ensure_visible(next);
     }
     pub fn type_char(&mut self, ch: char) {
-        if self.confirming_shutdown {
+        if self.power_menu {
             return;
         }
         if ch == '\u{8}' {
@@ -150,289 +435,542 @@ impl LauncherState {
             self.insert_text(&ch.to_string());
         }
     }
+    fn entry(&self, hit: Hit) -> Option<&AppEntry> {
+        match hit {
+            Hit::Pinned(i) => self.pinned.get(i),
+            Hit::Recent(i) => self.recent.get(i),
+            Hit::Frequent(i) => self.frequent.get(i),
+            Hit::App(i) => self.apps.get(i),
+            _ => None,
+        }
+    }
     pub fn activate(&mut self, hit: Hit) -> Option<Action> {
-        if self.confirming_shutdown {
-            match hit {
-                Hit::Cancel => self.confirming_shutdown = false,
-                Hit::ConfirmShutdown => {
-                    self.confirming_shutdown = false;
-                    return Some(Action::Shutdown);
-                }
-                _ => {}
+        if self.power_menu {
+            // Con el menú abierto, cualquier clic lo cierra; solo sus opciones actúan.
+            self.power_menu = false;
+            self.selection = None;
+            self.hovered = None;
+            if let Hit::PowerOption(option) = hit {
+                return Some(Action::Power(option));
             }
             return None;
         }
         match hit {
-            Hit::App(i) => return self.apps.get(i).cloned().map(Action::Launch),
-            Hit::Recent(i) => return self.recent.get(i).cloned().map(Action::Launch),
+            Hit::Pinned(_) | Hit::Recent(_) | Hit::Frequent(_) | Hit::App(_) => {
+                return self.entry(hit).cloned().map(Action::Launch)
+            }
             Hit::ClearSearch => {
                 self.query.clear();
                 self.caret = 0;
                 self.select_all = false;
                 self.reset_results();
             }
-            Hit::Previous => self.change_page(false),
-            Hit::Next => self.change_page(true),
             Hit::Power => {
-                self.confirming_shutdown = true;
+                self.power_menu = true;
+                self.power_opened = animations_enabled().then(Instant::now);
+                self.selection = None;
                 self.hovered = None;
             }
             _ => {}
         }
         None
     }
+    /// Elemento que abre Enter: el seleccionado o, al buscar, el primer resultado.
     pub fn first_match(&self) -> Option<Hit> {
+        if self.power_menu {
+            return self
+                .selection
+                .filter(|hit| matches!(hit, Hit::PowerOption(_)));
+        }
+        let slots = self.layout().slots;
         self.selection
-            .filter(|i| self.filtered().contains(i))
-            .map(Hit::App)
+            .filter(|hit| slots.iter().any(|s| s.hit == *hit))
             .or_else(|| {
-                self.filtered()
-                    .get(self.page * PAGE_SIZE)
-                    .copied()
-                    .map(Hit::App)
+                self.searching()
+                    .then(|| slots.first().map(|s| s.hit))
+                    .flatten()
             })
+    }
+    /// El clic cae sobre el campo de búsqueda (fuera del botón de limpiar).
+    pub fn in_search(&self, x: f32, y: f32) -> bool {
+        (SEARCH_Y..SEARCH_Y + SEARCH_H).contains(&y) && (PAD..WIDTH - PAD - 40.0).contains(&x)
+    }
+    fn power_button() -> (f32, f32, f32) {
+        (WIDTH - PAD - 36.0, FOOTER_Y + 14.0, 36.0)
+    }
+    /// Menú de energía: encima del botón y alineado con su borde derecho.
+    fn power_menu_rect() -> (f32, f32, f32, f32) {
+        let (px, py, ps) = Self::power_button();
+        let h = MENU_PAD * 2.0 + Power::ALL.len() as f32 * MENU_ROW;
+        (px + ps - MENU_W, py - 8.0 - h, MENU_W, h)
+    }
+    fn power_option_rect(index: usize) -> (f32, f32, f32, f32) {
+        let (x, y, w, _) = Self::power_menu_rect();
+        (
+            x + MENU_PAD,
+            y + MENU_PAD + index as f32 * MENU_ROW,
+            w - MENU_PAD * 2.0,
+            MENU_ROW,
+        )
     }
     pub fn hit_test(&self, x: f32, y: f32) -> Option<Hit> {
         let within = |left: f32, top: f32, width: f32, height: f32| {
             x >= left && x < left + width && y >= top && y < top + height
         };
-        if self.confirming_shutdown {
-            if within(128.0, 316.0, 120.0, 38.0) {
-                return Some(Hit::Cancel);
+        if self.power_menu {
+            let (px, py, ps) = Self::power_button();
+            if within(px, py, ps, ps) {
+                return Some(Hit::Power);
             }
-            if within(272.0, 316.0, 120.0, 38.0) {
-                return Some(Hit::ConfirmShutdown);
+            for (i, option) in Power::ALL.into_iter().enumerate() {
+                let (ox, oy, ow, oh) = Self::power_option_rect(i);
+                if within(ox, oy, ow, oh) {
+                    return Some(Hit::PowerOption(option));
+                }
             }
-            return None;
+            let (mx, my, mw, mh) = Self::power_menu_rect();
+            return (!within(mx, my, mw, mh)).then_some(Hit::Outside);
         }
-        if !self.query.is_empty() && within(462.0, 24.0, 34.0, 44.0) {
+        if !self.query.is_empty() && within(WIDTH - PAD - 40.0, SEARCH_Y, 40.0, SEARCH_H) {
             return Some(Hit::ClearSearch);
         }
-        for i in 0..if self.query.trim().is_empty() {
-            self.recent.len().min(4)
-        } else {
-            0
-        } {
-            if within(24.0 + i as f32 * 118.0, 116.0, 112.0, 78.0) {
-                return Some(Hit::Recent(i));
-            }
-        }
-        for (slot, &index) in self
-            .filtered()
-            .iter()
-            .skip(self.page * PAGE_SIZE)
-            .take(PAGE_SIZE)
-            .enumerate()
-        {
-            if within(
-                24.0 + (slot % 4) as f32 * 118.0,
-                self.grid_top() + (slot / 4) as f32 * 76.0,
-                112.0,
-                72.0,
-            ) {
-                return Some(Hit::App(index));
-            }
-        }
-        if within(24.0, 516.0, 36.0, 36.0) {
-            return Some(Hit::Previous);
-        }
-        if within(68.0, 516.0, 36.0, 36.0) {
-            return Some(Hit::Next);
-        }
-        if within(400.0, 516.0, 96.0, 36.0) {
+        let (px, py, ps) = Self::power_button();
+        if within(px, py, ps, ps) {
             return Some(Hit::Power);
         }
-        None
+        if !(VIEW_TOP..VIEW_TOP + VIEW_H).contains(&y) {
+            return None;
+        }
+        let (cx, cy) = (x - PAD, y - VIEW_TOP + self.scroll);
+        self.layout()
+            .slots
+            .into_iter()
+            .find(|s| s.contains(cx, cy))
+            .map(|s| s.hit)
     }
+
     pub fn draw(&mut self, image: &mut Pixmap, scale: f32) {
         image.fill(tiny_skia::Color::TRANSPARENT);
         fill_rounded(
             image,
-            [23, 28, 36, 224],
+            BACKGROUND,
             scale,
             scale,
             (WIDTH - 2.0) * scale,
             (HEIGHT - 2.0) * scale,
-            22.0 * scale,
+            12.0 * scale,
+        );
+        self.draw_footer(image, scale);
+        stroke_rounded(
+            image,
+            [255, 255, 255, 34],
+            scale,
+            scale,
+            (WIDTH - 2.0) * scale,
+            (HEIGHT - 2.0) * scale,
+            12.0 * scale,
+            scale * 0.75,
+        );
+        self.draw_search(image, scale);
+        self.draw_view(image, scale);
+        if self.power_menu {
+            self.draw_power_menu(image, scale, self.menu_progress());
+        }
+    }
+
+    fn draw_search(&self, image: &mut Pixmap, scale: f32) {
+        let (x, y, w, h) = (PAD, SEARCH_Y, CONTENT_W, SEARCH_H);
+        fill_rounded(
+            image,
+            [255, 255, 255, 14],
+            x * scale,
+            y * scale,
+            w * scale,
+            h * scale,
+            h / 2.0 * scale,
         );
         stroke_rounded(
             image,
-            [255, 255, 255, 42],
-            scale,
-            scale,
-            (WIDTH - 2.0) * scale,
-            (HEIGHT - 2.0) * scale,
-            22.0 * scale,
+            [255, 255, 255, 30],
+            x * scale,
+            y * scale,
+            w * scale,
+            h * scale,
+            h / 2.0 * scale,
             scale * 0.75,
         );
-        if self.confirming_shutdown {
-            self.text(image, "¿Apagar el equipo?", 142.0, 228.0, 21.0, scale, 1.0);
-            self.text(
-                image,
-                "Guarda tus cambios antes de continuar.",
-                128.0,
-                269.0,
-                13.0,
-                scale,
-                0.7,
-            );
-            self.button(image, Hit::Cancel, "Cancelar", 128.0, 316.0, 120.0, scale);
-            self.button(
-                image,
-                Hit::ConfirmShutdown,
-                "Apagar",
-                272.0,
-                316.0,
-                120.0,
-                scale,
-            );
-            return;
-        }
-        fill_rounded(
-            image,
-            [255, 255, 255, 19],
-            24.0 * scale,
-            24.0 * scale,
-            472.0 * scale,
-            44.0 * scale,
-            12.0 * scale,
-        );
+        draw_magnifier(image, (x + 22.0) * scale, (y + h / 2.0) * scale, scale);
+        let text_x = x + 44.0;
+        let text_w = w - 44.0 - 44.0;
         let search = if self.query.is_empty() {
-            "Buscar aplicaciones…".into()
+            "Buscar aplicaciones".into()
         } else {
-            fit_text(&self.query, 14.0 * scale, 410.0 * scale)
+            fit_text(&self.query, 14.0 * scale, text_w * scale)
         };
+        if self.select_all && !self.query.is_empty() {
+            fill_rounded(
+                image,
+                [90, 160, 245, 60],
+                text_x * scale,
+                (y + 9.0) * scale,
+                (text_width(&search, 14.0 * scale) / scale + 2.0) * scale,
+                20.0 * scale,
+                3.0 * scale,
+            );
+        }
         self.text(
             image,
             &search,
-            38.0,
-            38.0,
+            text_x,
+            y + 11.0,
             14.0,
             scale,
-            if self.query.is_empty() { 0.6 } else { 1.0 },
+            if self.query.is_empty() { 0.55 } else { 1.0 },
         );
-        if !self.select_all {
+        if !self.select_all && !self.power_menu {
             let prefix: String = self.query.chars().take(self.caret).collect();
             let cursor_x =
-                39.0 * scale + crate::clock::text_width(&prefix, 14.0 * scale).min(404.0 * scale);
+                text_x * scale + text_width(&prefix, 14.0 * scale).min(text_w * scale) + scale;
             fill_rounded(
                 image,
-                [235, 240, 250, 180],
+                [235, 240, 250, 200],
                 cursor_x,
-                36.0 * scale,
+                (y + 9.0) * scale,
                 scale.max(1.0),
-                19.0 * scale,
+                20.0 * scale,
                 0.0,
             );
         }
         if !self.query.is_empty() {
-            self.text(image, "×", 474.0, 38.0, 16.0, scale, 0.8);
-            if self.select_all {
+            let bx = WIDTH - PAD - 40.0;
+            if self.hovered == Some(Hit::ClearSearch) {
                 fill_rounded(
                     image,
-                    [90, 160, 245, 45],
-                    38.0 * scale,
-                    32.0 * scale,
-                    410.0 * scale,
+                    [255, 255, 255, 20],
+                    (bx + 6.0) * scale,
+                    (y + 5.0) * scale,
                     28.0 * scale,
-                    4.0 * scale,
+                    28.0 * scale,
+                    14.0 * scale,
+                );
+            }
+            self.text(image, "×", bx + 15.0, y + 8.0, 17.0, scale, 0.8);
+        }
+    }
+
+    /// Secciones desplazables, dibujadas aparte para recortarlas a su zona.
+    fn draw_view(&mut self, image: &mut Pixmap, scale: f32) {
+        let width = (WIDTH * scale).round() as u32;
+        let height = (VIEW_H * scale).round() as u32;
+        let Some(mut view) = Pixmap::new(width.max(1), height.max(1)) else {
+            return;
+        };
+        let layout = self.layout();
+        let scroll = self.scroll;
+        let top = move |y: f32| y - scroll;
+        let visible = move |y: f32, h: f32| top(y) + h > 0.0 && top(y) < VIEW_H;
+        for (title, y) in &layout.headers {
+            if visible(*y, HEADER_H) {
+                draw_text_semibold(
+                    &mut view,
+                    title,
+                    (PAD + 8.0) * scale,
+                    (top(*y) + 6.0) * scale,
+                    14.0 * scale,
+                    0.95,
                 );
             }
         }
-        if self.query.trim().is_empty() {
-            self.text(image, "Recientes", 24.0, 92.0, 13.0, scale, 0.65);
-            if self.recent.is_empty() {
-                self.text(
-                    image,
-                    "Aquí aparecerán las apps que abras con GlassBar.",
-                    24.0,
-                    142.0,
-                    13.0,
-                    scale,
-                    0.55,
-                );
-            }
-            for (i, entry) in self.recent.clone().into_iter().take(4).enumerate() {
-                self.item(
-                    image,
-                    &entry,
-                    Hit::Recent(i),
-                    24.0 + i as f32 * 118.0,
-                    116.0,
-                    scale,
-                );
-            }
-
-            self.text(image, "Aplicaciones", 24.0, 219.0, 13.0, scale, 0.65);
-        } else {
+        if !self.searching() && visible(layout.height - HINT_H, HINT_H) {
+            let hint = format!(
+                "Escribe para buscar entre las {} aplicaciones.",
+                self.apps.len()
+            );
             self.text(
-                image,
-                &format!(
-                    "{} {}",
-                    self.filtered().len(),
-                    if self.filtered().len() == 1 {
-                        "resultado"
-                    } else {
-                        "resultados"
-                    }
-                ),
-                24.0,
-                92.0,
+                &mut view,
+                &hint,
+                PAD + 8.0,
+                top(layout.height - HINT_H) + 8.0,
+                12.5,
+                scale,
+                0.5,
+            );
+        }
+        if layout.slots.is_empty() && self.searching() {
+            self.text(
+                &mut view,
+                "Prueba con otro nombre.",
+                PAD + 8.0,
+                HEADER_H + 4.0,
                 13.0,
                 scale,
-                0.7,
+                0.55,
             );
         }
-        let indices: Vec<usize> = self
-            .filtered()
-            .into_iter()
-            .skip(self.page * PAGE_SIZE)
-            .take(PAGE_SIZE)
-            .collect();
-        if indices.is_empty() {
-            self.text(
-                image,
-                "No se encontraron aplicaciones.",
-                24.0,
-                self.grid_top() + 28.0,
-                14.0,
-                scale,
-                0.6,
+        for slot in layout.slots.iter().filter(|s| visible(s.y, s.h)) {
+            let Some(entry) = self.entry(slot.hit).cloned() else {
+                continue;
+            };
+            let (x, y) = (PAD + slot.x, top(slot.y));
+            let marked = self.hovered == Some(slot.hit) || self.selection == Some(slot.hit);
+            if marked {
+                fill_rounded(
+                    &mut view,
+                    [
+                        255,
+                        255,
+                        255,
+                        if self.selection == Some(slot.hit) {
+                            26
+                        } else {
+                            18
+                        },
+                    ],
+                    (x + 2.0) * scale,
+                    y * scale,
+                    (slot.w - 4.0) * scale,
+                    slot.h * scale,
+                    6.0 * scale,
+                );
+            }
+            if slot.row {
+                self.icon(
+                    &mut view,
+                    &entry,
+                    x + 12.0,
+                    y + (slot.h - ICON) / 2.0,
+                    scale,
+                );
+                let name = fit_text(&entry.name, 13.0 * scale, (slot.w - 70.0) * scale);
+                let subtitle = match slot.hit {
+                    Hit::Recent(_) => "Abierta recientemente",
+                    _ => "Aplicación",
+                };
+                self.text(&mut view, &name, x + 56.0, y + 8.0, 13.0, scale, 0.95);
+                self.text(&mut view, subtitle, x + 56.0, y + 27.0, 11.5, scale, 0.55);
+            } else {
+                self.icon(
+                    &mut view,
+                    &entry,
+                    x + (slot.w - ICON) / 2.0,
+                    y + 14.0,
+                    scale,
+                );
+                let label = fit_text(&entry.name, 12.0 * scale, (slot.w - 8.0) * scale);
+                let label_x = x + (slot.w - text_width(&label, 12.0 * scale) / scale) / 2.0;
+                self.text(&mut view, &label, label_x, y + 56.0, 12.0, scale, 0.9);
+            }
+        }
+        let max = (layout.height - VIEW_H).max(0.0);
+        if max > 0.0 {
+            // Barra de desplazamiento fina, como la del Inicio.
+            let track = VIEW_H - 8.0;
+            let thumb = (track * VIEW_H / layout.height).max(32.0);
+            let thumb_y = 4.0 + (track - thumb) * self.scroll / max;
+            fill_rounded(
+                &mut view,
+                [255, 255, 255, 70],
+                (WIDTH - 12.0) * scale,
+                thumb_y * scale,
+                3.0 * scale,
+                thumb * scale,
+                1.5 * scale,
             );
         }
-        for (slot, i) in indices.into_iter().enumerate() {
-            let entry = self.apps[i].clone();
-            self.item(
-                image,
-                &entry,
-                Hit::App(i),
-                24.0 + (slot % 4) as f32 * 118.0,
-                self.grid_top() + (slot / 4) as f32 * 76.0,
-                scale,
+        image.draw_pixmap(
+            0,
+            (VIEW_TOP * scale).round() as i32,
+            view.as_ref(),
+            &PixmapPaint::default(),
+            Transform::identity(),
+            None,
+        );
+    }
+
+    fn draw_footer(&self, image: &mut Pixmap, scale: f32) {
+        // Pie algo más oscuro: solo redondeado abajo, siguiendo las esquinas del panel.
+        let (left, right) = (scale, (WIDTH - 1.0) * scale);
+        let (top, bottom, r) = (FOOTER_Y * scale, (HEIGHT - 1.0) * scale, 12.0 * scale);
+        let mut pb = tiny_skia::PathBuilder::new();
+        pb.move_to(left, top);
+        pb.line_to(right, top);
+        pb.line_to(right, bottom - r);
+        pb.quad_to(right, bottom, right - r, bottom);
+        pb.line_to(left + r, bottom);
+        pb.quad_to(left, bottom, left, bottom - r);
+        pb.close();
+        if let Some(path) = pb.finish() {
+            let mut paint = tiny_skia::Paint {
+                anti_alias: true,
+                ..Default::default()
+            };
+            paint.set_color_rgba8(0, 0, 0, 40);
+            image.fill_path(
+                &path,
+                &paint,
+                tiny_skia::FillRule::Winding,
+                Transform::identity(),
+                None,
             );
         }
         fill_rounded(
             image,
-            [255, 255, 255, 20],
-            24.0 * scale,
-            496.0 * scale,
-            472.0 * scale,
+            [255, 255, 255, 22],
             scale,
+            FOOTER_Y * scale,
+            (WIDTH - 2.0) * scale,
+            scale.max(1.0),
             0.0,
         );
-        self.button(image, Hit::Previous, "‹", 24.0, 516.0, 36.0, scale);
-        self.button(image, Hit::Next, "›", 68.0, 516.0, 36.0, scale);
-        self.text(
+        let (cx, cy) = (PAD + 30.0, FOOTER_Y + 32.0);
+        fill_rounded(
             image,
-            &format!("{} / {}", self.page + 1, self.page_count()),
-            118.0,
-            529.0,
-            12.0,
-            scale,
-            0.6,
+            [255, 255, 255, 34],
+            (cx - 16.0) * scale,
+            (cy - 16.0) * scale,
+            32.0 * scale,
+            32.0 * scale,
+            16.0 * scale,
         );
-        self.button(image, Hit::Power, "Apagar", 400.0, 516.0, 96.0, scale);
+        let initial: String = self
+            .user
+            .chars()
+            .next()
+            .map(|c| c.to_uppercase().collect())
+            .unwrap_or_default();
+        let w = text_width(&initial, 14.0 * scale) / scale;
+        draw_text_semibold(
+            image,
+            &initial,
+            (cx - w / 2.0) * scale,
+            (cy - 6.0) * scale,
+            14.0 * scale,
+            0.9,
+        );
+        let name = fit_text(&self.user, 13.0 * scale, 360.0 * scale);
+        self.text(image, &name, cx + 28.0, cy - 9.0, 13.0, scale, 0.9);
+        let (px, py, ps) = Self::power_button();
+        if self.hovered == Some(Hit::Power) || self.power_menu {
+            fill_rounded(
+                image,
+                [255, 255, 255, if self.power_menu { 30 } else { 22 }],
+                px * scale,
+                py * scale,
+                ps * scale,
+                ps * scale,
+                6.0 * scale,
+            );
+        }
+        draw_power_glyph(
+            image,
+            (px + ps / 2.0) * scale,
+            (py + ps / 2.0) * scale,
+            scale,
+        );
     }
+
+    /// Avance de la entrada del menú de energía, de 0 a 1 con frenado al final
+    /// (curva cúbica), como los menús flotantes de Windows 11.
+    fn menu_progress(&self) -> f32 {
+        ease_out(
+            self.power_opened
+                .map(|t| t.elapsed().as_secs_f32() / MENU_ANIM.as_secs_f32())
+                .unwrap_or(1.0),
+        )
+    }
+    /// El menú sigue entrando y hace falta redibujar el siguiente fotograma.
+    pub fn animating(&self) -> bool {
+        self.power_menu && self.menu_progress() < 1.0
+    }
+
+    /// Menú flotante de energía, como el del Inicio de Windows 11. Se dibuja en una
+    /// capa aparte para entrar desvaneciéndose y subiendo unos píxeles.
+    fn draw_power_menu(&self, image: &mut Pixmap, scale: f32, progress: f32) {
+        let (x, y, w, h) = Self::power_menu_rect();
+        let margin = 4.0;
+        let (gx, gy) = (x - margin, y - margin);
+        let Some(mut layer) = Pixmap::new(
+            ((w + margin * 2.0) * scale).ceil() as u32,
+            ((h + margin * 2.0) * scale).ceil() as u32,
+        ) else {
+            return;
+        };
+        // Coordenadas del panel pasadas a la capa, ya en píxeles.
+        let lx = |v: f32| (v - gx) * scale;
+        let ly = |v: f32| (v - gy) * scale;
+        // Sombra suave para separarlo del panel.
+        fill_rounded(
+            &mut layer,
+            [0, 0, 0, 60],
+            lx(x - 1.0),
+            ly(y + 2.0),
+            (w + 2.0) * scale,
+            (h + 2.0) * scale,
+            9.0 * scale,
+        );
+        fill_rounded(
+            &mut layer,
+            [44, 44, 46, 255],
+            lx(x),
+            ly(y),
+            w * scale,
+            h * scale,
+            8.0 * scale,
+        );
+        stroke_rounded(
+            &mut layer,
+            [255, 255, 255, 34],
+            lx(x),
+            ly(y),
+            w * scale,
+            h * scale,
+            8.0 * scale,
+            scale * 0.75,
+        );
+        for (i, option) in Power::ALL.into_iter().enumerate() {
+            let (ox, oy, ow, oh) = Self::power_option_rect(i);
+            let hit = Some(Hit::PowerOption(option));
+            if self.hovered == hit || self.selection == hit {
+                fill_rounded(
+                    &mut layer,
+                    [255, 255, 255, 22],
+                    lx(ox),
+                    ly(oy + 2.0),
+                    ow * scale,
+                    (oh - 4.0) * scale,
+                    5.0 * scale,
+                );
+            }
+            draw_icon(
+                &mut layer,
+                option.glyph(),
+                lx(ox + 22.0),
+                ly(oy + oh / 2.0),
+                16.0 * scale,
+                0.9,
+            );
+            draw_text(
+                &mut layer,
+                option.label(),
+                lx(ox + 46.0),
+                ly(oy + 10.0),
+                13.0 * scale,
+                0.95,
+            );
+        }
+        image.draw_pixmap(
+            (gx * scale).round() as i32,
+            ((gy + (1.0 - progress) * MENU_RISE) * scale).round() as i32,
+            layer.as_ref(),
+            &PixmapPaint {
+                opacity: progress,
+                ..Default::default()
+            },
+            Transform::identity(),
+            None,
+        );
+    }
+
     fn text(
         &self,
         image: &mut Pixmap,
@@ -445,53 +983,9 @@ impl LauncherState {
     ) {
         draw_text(image, value, x * scale, y * scale, size * scale, opacity);
     }
-    fn button(
-        &self,
-        image: &mut Pixmap,
-        hit: Hit,
-        label: &str,
-        x: f32,
-        y: f32,
-        width: f32,
-        scale: f32,
-    ) {
-        fill_rounded(
-            image,
-            [
-                255,
-                255,
-                255,
-                if self.hovered == Some(hit) { 32 } else { 13 },
-            ],
-            x * scale,
-            y * scale,
-            width * scale,
-            38.0 * scale,
-            10.0 * scale,
-        );
-        self.text(
-            image,
-            label,
-            x + if width > 40.0 { 26.0 } else { 12.0 },
-            y + 12.0,
-            13.0,
-            scale,
-            0.9,
-        );
-    }
-    fn item(&mut self, image: &mut Pixmap, entry: &AppEntry, hit: Hit, x: f32, y: f32, scale: f32) {
-        if self.hovered == Some(hit) || matches!(hit, Hit::App(i) if self.selection == Some(i)) {
-            fill_rounded(
-                image,
-                [255, 255, 255, 20],
-                x * scale,
-                y * scale,
-                112.0 * scale,
-                72.0 * scale,
-                12.0 * scale,
-            );
-        }
-        let size = (32.0 * scale).round().max(1.0) as u32;
+
+    fn icon(&mut self, image: &mut Pixmap, entry: &AppEntry, x: f32, y: f32, scale: f32) {
+        let size = (ICON * scale).round().max(1.0) as u32;
         let icon = self
             .icons
             .entry(entry.command.clone())
@@ -504,7 +998,7 @@ impl LauncherState {
             let side = size as f32;
             let transform =
                 Transform::from_scale(side / icon.width() as f32, side / icon.height() as f32)
-                    .post_translate(((x + 40.0) * scale).round(), ((y + 6.0) * scale).round());
+                    .post_translate((x * scale).round(), (y * scale).round());
             image.draw_pixmap(
                 0,
                 0,
@@ -517,46 +1011,314 @@ impl LauncherState {
                 None,
             );
         }
-        let label = fit_text(&entry.name, 11.5 * scale, 104.0 * scale);
-        let label_x = x + (112.0 - crate::clock::text_width(&label, 11.5 * scale) / scale) / 2.0;
-        self.text(image, &label, label_x, y + 49.0, 11.5, scale, 0.9);
     }
 }
+
+/// Recientes y más usadas a partir del uso que registra Windows y del historial de
+/// GlassBar. Solo entran apps del catálogo (accesos directos o apps instaladas),
+/// así no aparecen procesos sueltos ni desinstaladores.
+fn rank(
+    apps: &[AppEntry],
+    usage: &HashMap<String, Usage>,
+    history: &[Launch],
+    pinned: &[AppEntry],
+) -> (Vec<AppEntry>, Vec<AppEntry>) {
+    let usage_of = |entry: &AppEntry| {
+        let name = entry.command.strip_prefix("shell:AppsFolder\\")?;
+        usage.get(&name.to_lowercase()).copied()
+    };
+    let used: Vec<(&AppEntry, Usage)> = apps
+        .iter()
+        .filter_map(|e| Some((e, usage_of(e)?)))
+        .collect();
+
+    // Recientes: la apertura más reciente según Windows o GlassBar. Sin tiempo en
+    // primer plano son aperturas del sistema (p. ej. la barra de juegos), no del usuario.
+    let mut recent: Vec<(AppEntry, u64)> = used
+        .iter()
+        .filter(|(_, u)| u.last > 0 && u.focus_ms > 0)
+        .map(|(e, u)| ((*e).clone(), u.last))
+        .collect();
+    for launch in history {
+        match recent
+            .iter_mut()
+            .find(|(e, _)| e.command.eq_ignore_ascii_case(&launch.entry.command))
+        {
+            Some((_, at)) => *at = (*at).max(launch.at),
+            None => recent.push((launch.entry.clone(), launch.at)),
+        }
+    }
+    // Los historiales antiguos (sin hora) conservan su orden, detrás de los fechados.
+    recent.sort_by(|a, b| b.1.cmp(&a.1));
+    recent.truncate(MAX_RECENT);
+    let recent: Vec<AppEntry> = recent.into_iter().map(|(e, _)| e).collect();
+
+    // Más usadas: veces abiertas y, a igualdad, tiempo en primer plano.
+    let shown = |e: &AppEntry| {
+        pinned
+            .iter()
+            .chain(&recent)
+            .any(|p| p.command.eq_ignore_ascii_case(&e.command))
+    };
+    let mut frequent: Vec<(&AppEntry, Usage)> = used
+        .into_iter()
+        .filter(|(e, u)| u.runs > 0 && u.focus_ms > 0 && !shown(e))
+        .collect();
+    frequent.sort_by(|(_, a), (_, b)| (b.runs, b.focus_ms).cmp(&(a.runs, a.focus_ms)));
+    let frequent = frequent
+        .into_iter()
+        .take(MAX_FREQUENT)
+        .map(|(e, _)| e.clone())
+        .collect();
+    (recent, frequent)
+}
+
+fn stroke(image: &mut Pixmap, path: tiny_skia::Path, scale: f32) {
+    let mut paint = tiny_skia::Paint {
+        anti_alias: true,
+        ..Default::default()
+    };
+    paint.set_color_rgba8(255, 255, 255, 200);
+    let stroke = tiny_skia::Stroke {
+        width: 1.5 * scale,
+        line_cap: tiny_skia::LineCap::Round,
+        ..Default::default()
+    };
+    image.stroke_path(&path, &paint, &stroke, Transform::identity(), None);
+}
+
+/// Lupa: círculo con mango hacia abajo a la derecha.
+fn draw_magnifier(image: &mut Pixmap, cx: f32, cy: f32, scale: f32) {
+    let r = 5.5 * scale;
+    let (ox, oy) = (cx - 1.5 * scale, cy - 1.5 * scale);
+    let mut pb = tiny_skia::PathBuilder::new();
+    pb.push_circle(ox, oy, r);
+    let d = r * std::f32::consts::FRAC_1_SQRT_2;
+    pb.move_to(ox + d, oy + d);
+    pb.line_to(ox + d + 4.5 * scale, oy + d + 4.5 * scale);
+    if let Some(path) = pb.finish() {
+        stroke(image, path, scale);
+    }
+}
+
+/// Símbolo de encendido: arco abierto arriba y una línea vertical.
+fn draw_power_glyph(image: &mut Pixmap, cx: f32, cy: f32, scale: f32) {
+    let r = 7.0 * scale;
+    let mut pb = tiny_skia::PathBuilder::new();
+    let (start, end) = (-60f32.to_radians(), 240f32.to_radians());
+    let steps = 28;
+    for i in 0..=steps {
+        // Ángulos medidos desde arriba, en sentido horario.
+        let a = start + (end - start) * i as f32 / steps as f32;
+        let (x, y) = (cx + r * a.sin(), cy - r * a.cos());
+        if i == 0 {
+            pb.move_to(x, y);
+        } else {
+            pb.line_to(x, y);
+        }
+    }
+    pb.move_to(cx, cy - r - 1.5 * scale);
+    pb.line_to(cx, cy - 1.0 * scale);
+    if let Some(path) = pb.finish() {
+        stroke(image, path, scale);
+    }
+}
+
+/// Curva de salida cúbica: arranca rápido y frena al llegar, como Fluent.
+fn ease_out(linear: f32) -> f32 {
+    1.0 - (1.0 - linear.clamp(0.0, 1.0)).powi(3)
+}
+
+/// Respeta "Efectos de animación" de Windows (Accesibilidad): si están desactivados,
+/// el menú aparece sin transición.
+fn animations_enabled() -> bool {
+    use windows::core::BOOL;
+    use windows::Win32::UI::WindowsAndMessaging::{
+        SystemParametersInfoW, SPI_GETCLIENTAREAANIMATION, SYSTEM_PARAMETERS_INFO_UPDATE_FLAGS,
+    };
+    let mut enabled = BOOL(1);
+    unsafe {
+        let _ = SystemParametersInfoW(
+            SPI_GETCLIENTAREAANIMATION,
+            0,
+            Some(&mut enabled as *mut BOOL as *mut _),
+            SYSTEM_PARAMETERS_INFO_UPDATE_FLAGS(0),
+        );
+    }
+    enabled.as_bool()
+}
+
+/// Nombre completo de la cuenta (p. ej. "Gerson Portal Linares"); si Windows no
+/// lo da, el nombre de usuario.
+fn user_display_name() -> String {
+    use windows::core::PWSTR;
+    use windows::Win32::Security::Authentication::Identity::{GetUserNameExW, NameDisplay};
+    let mut buf = vec![0u16; 256];
+    let mut len = buf.len() as u32;
+    let name = unsafe { GetUserNameExW(NameDisplay, Some(PWSTR(buf.as_mut_ptr())), &mut len) }
+        .then(|| String::from_utf16_lossy(&buf[..len as usize]))
+        .filter(|n| !n.trim().is_empty());
+    name.or_else(|| std::env::var("USERNAME").ok())
+        .unwrap_or_else(|| "Usuario".into())
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+    fn entry(name: &str, command: &str) -> AppEntry {
+        AppEntry {
+            name: name.into(),
+            command: command.into(),
+        }
+    }
     fn state() -> LauncherState {
         LauncherState {
             apps: (0..25)
-                .map(|i| AppEntry {
-                    name: format!("Editor {i:02}"),
-                    command: format!("{i}.exe"),
-                })
+                .map(|i| entry(&format!("Editor {i:02}"), &format!("{i}.exe")))
                 .collect(),
             recent: vec![],
+            frequent: vec![],
+            pinned: vec![],
             query: String::new(),
-            page: 0,
+            scroll: 0.0,
             hovered: None,
-            confirming_shutdown: false,
+            power_menu: false,
+            power_opened: None,
             selection: None,
             caret: 0,
             select_all: false,
+            user: "Usuario de prueba".into(),
             icons: HashMap::new(),
+            loaded: Instant::now(),
+            search_cache: RefCell::new(None),
         }
     }
+    fn many(prefix: &str, count: usize) -> Vec<AppEntry> {
+        (0..count)
+            .map(|i| entry(&format!("{prefix} {i:02}"), &format!("{prefix}{i}.exe")))
+            .collect()
+    }
+    /// Punto de pantalla en el centro del elemento, con el desplazamiento actual.
+    fn point_of(menu: &LauncherState, hit: Hit) -> (f32, f32) {
+        let slot = menu
+            .layout()
+            .slots
+            .into_iter()
+            .find(|s| s.hit == hit)
+            .unwrap();
+        let (x, y) = slot.center();
+        (x + PAD, y + VIEW_TOP - menu.scroll)
+    }
+
     #[test]
-    fn search_and_paging_target_the_displayed_apps() {
+    fn browse_view_shows_pinned_recent_and_frequent_but_not_the_whole_catalog() {
         let mut menu = state();
-        assert_eq!(menu.page_count(), 3);
-        menu.change_page(true);
-        assert_eq!(menu.hit_test(60.0, 270.0), Some(Hit::App(12)));
-        for ch in "Editor 24".chars() {
-            menu.type_char(ch);
-        }
-        assert_eq!(menu.page, 0);
-        assert_eq!(menu.page_count(), 1);
-        assert_eq!(menu.first_match(), Some(Hit::App(24)));
+        menu.pinned = vec![entry("Explorador", "explorer.exe")];
+        menu.recent = vec![entry("Spotify", "spotify.exe")];
+        menu.frequent = vec![entry("Chrome", "chrome.exe")];
+        let layout = menu.layout();
+        let titles: Vec<_> = layout.headers.iter().map(|(t, _)| t.as_str()).collect();
+        assert_eq!(titles, ["Anclado", "Recientes", "Más usadas"]);
+        let hits: Vec<_> = layout.slots.iter().map(|s| s.hit).collect();
+        assert_eq!(hits, [Hit::Pinned(0), Hit::Recent(0), Hit::Frequent(0)]);
+        let (x, y) = point_of(&menu, Hit::Recent(0));
+        assert_eq!(menu.hit_test(x, y), Some(Hit::Recent(0)));
+        // El catálogo completo solo aparece al buscar.
+        menu.insert_text("editor 24");
+        assert!(menu
+            .layout()
+            .slots
+            .iter()
+            .all(|s| matches!(s.hit, Hit::App(_))));
+        assert_eq!(menu.layout().slots.len(), 1);
     }
+
+    #[test]
+    fn rank_uses_windows_usage_and_glassbar_history() {
+        let apps = vec![
+            entry("Google Chrome", "shell:AppsFolder\\Chrome"),
+            entry("Warp", "shell:AppsFolder\\dev.warp.Warp"),
+            entry("Barra de juegos", "shell:AppsFolder\\Xbox!App"),
+            entry("Desinstalar", "shell:AppsFolder\\uninstall.exe"),
+            entry("Notas", "shell:AppsFolder\\Notes!App"),
+        ];
+        let at = |runs, focus_ms, last| Usage {
+            runs,
+            focus_ms,
+            last,
+        };
+        let usage = HashMap::from([
+            ("chrome".to_string(), at(15, 1141, 300)),
+            ("dev.warp.warp".to_string(), at(6, 2_751_768, 200)),
+            // Abierta por el sistema, nunca en primer plano.
+            ("xbox!app".to_string(), at(50, 0, 100)),
+            ("notes!app".to_string(), at(3, 500, 50)),
+            // Usada pero fuera del catálogo: se ignora.
+            ("c:\\tools\\helper.exe".to_string(), at(99, 99, 999)),
+        ]);
+        let names = |list: &[AppEntry]| list.iter().map(|e| e.name.clone()).collect::<Vec<_>>();
+
+        // Recientes por hora; la apertura desde GlassBar (400) adelanta a Notas.
+        let history = vec![Launch {
+            entry: entry("Notas", "shell:AppsFolder\\Notes!App"),
+            at: 400,
+        }];
+        let (recent, frequent) = rank(&apps, &usage, &history, &[]);
+        assert_eq!(names(&recent), ["Notas", "Google Chrome", "Warp"]);
+        // Lo que ya está en recientes no se repite en más usadas.
+        assert!(frequent.is_empty());
+
+        // Sin fechas: más usadas por veces abiertas, sin los anclados ni la barra de juegos.
+        let undated: HashMap<_, _> = usage
+            .into_iter()
+            .map(|(k, u)| (k, Usage { last: 0, ..u }))
+            .collect();
+        let pinned = [entry("Warp", "shell:AppsFolder\\dev.warp.Warp")];
+        let (recent, frequent) = rank(&apps, &undated, &[], &pinned);
+        assert!(recent.is_empty());
+        assert_eq!(names(&frequent), ["Google Chrome", "Notas"]);
+    }
+
+    #[test]
+    fn hit_test_and_scroll_target_the_displayed_results() {
+        let mut menu = state();
+        menu.apps = many("App", 60);
+        menu.insert_text("app");
+        let (x, y) = point_of(&menu, Hit::App(7));
+        assert_eq!(menu.hit_test(x, y), Some(Hit::App(7)));
+        // Lo que queda fuera de la vista no se puede pulsar hasta desplazarse.
+        let (x, y) = point_of(&menu, Hit::App(59));
+        assert!(y > VIEW_TOP + VIEW_H);
+        assert_eq!(menu.hit_test(x, y), None);
+        menu.scroll_by(10_000.0);
+        assert_eq!(menu.scroll, menu.max_scroll());
+        let (x, y) = point_of(&menu, Hit::App(59));
+        assert_eq!(menu.hit_test(x, y), Some(Hit::App(59)));
+    }
+
+    #[test]
+    fn arrows_move_through_sections_and_scroll_into_view() {
+        let mut menu = state();
+        menu.pinned = many("Anclada", 8);
+        menu.frequent = many("Usada", 12);
+        menu.move_selection(0, 1);
+        assert_eq!(menu.selection, Some(Hit::Pinned(0)));
+        menu.move_selection(0, 1);
+        assert_eq!(menu.selection, Some(Hit::Pinned(COLS)));
+        menu.move_selection(1, 0);
+        assert_eq!(menu.selection, Some(Hit::Pinned(COLS + 1)));
+        // Bajar desde la última fila de anclados pasa a "Más usadas", misma columna.
+        menu.move_selection(0, 1);
+        assert_eq!(menu.selection, Some(Hit::Frequent(1)));
+        for _ in 0..10 {
+            menu.move_selection(0, 1);
+        }
+        assert_eq!(menu.selection, Some(Hit::Frequent(COLS + 1)));
+        let (_, y) = point_of(&menu, menu.selection.unwrap());
+        assert!((VIEW_TOP..VIEW_TOP + VIEW_H).contains(&y));
+        assert_eq!(menu.first_match(), menu.selection);
+    }
+
     #[test]
     fn search_edits_unicode_at_the_caret_and_replaces_selection() {
         let mut menu = state();
@@ -576,51 +1338,138 @@ mod tests {
         menu.type_char('\u{8}');
         assert!(menu.query.is_empty());
     }
+
     #[test]
     fn search_finds_and_launches_store_entry_without_a_shortcut() {
         let mut menu = state();
-        menu.apps.push(AppEntry {
-            name: "Spotify".into(),
-            command: "shell:AppsFolder\\SpotifyAB.Test!Spotify".into(),
-        });
+        menu.apps
+            .push(entry("Spotify", "shell:AppsFolder\\SpotifyAB.Test!Spotify"));
         menu.insert_text("  SPOTIFY ");
         let hit = menu.first_match().unwrap();
-        assert_eq!(menu.hit_test(60.0, 140.0), Some(hit));
+        let (x, y) = point_of(&menu, hit);
+        assert_eq!(menu.hit_test(x, y), Some(hit));
         assert!(
             matches!(menu.activate(hit), Some(Action::Launch(entry)) if entry.command.starts_with("shell:AppsFolder\\"))
         );
         menu.activate(Hit::ClearSearch);
         assert!(menu.query.is_empty());
+        assert_eq!(menu.first_match(), None);
     }
+
     #[test]
-    fn changing_page_does_not_launch_a_hidden_selection() {
-        let mut menu = state();
-        menu.move_selection(4);
-        menu.change_page(true);
-        assert_eq!(menu.first_match(), Some(Hit::App(12)));
-    }
-    #[test]
-    fn launcher_background_remains_mostly_opaque() {
+    fn launcher_background_is_nearly_opaque() {
         let mut menu = state();
         menu.apps.clear();
         let mut image = Pixmap::new(WIDTH as u32, HEIGHT as u32).unwrap();
         menu.draw(&mut image, 1.0);
-        assert_eq!(image.pixel(260, 480).unwrap().alpha(), 224);
+        assert_eq!(image.pixel(320, 500).unwrap().alpha(), BACKGROUND[3]);
         assert_eq!(image.pixel(0, 0).unwrap().alpha(), 0);
     }
+
+    fn center_of_option(index: usize) -> (f32, f32) {
+        let (x, y, w, h) = LauncherState::power_option_rect(index);
+        (x + w / 2.0, y + h / 2.0)
+    }
+
     #[test]
-    fn shutdown_requires_the_separate_confirmation() {
+    fn power_button_opens_a_menu_with_the_four_options() {
         let mut menu = state();
-        assert!(menu.activate(Hit::ConfirmShutdown).is_none());
+        let (px, py, ps) = LauncherState::power_button();
+        let button = (px + ps / 2.0, py + ps / 2.0);
+        // Cerrado: las opciones no existen y el botón solo abre el menú.
+        let (lx, ly) = center_of_option(0);
+        assert_ne!(menu.hit_test(lx, ly), Some(Hit::PowerOption(Power::Lock)));
+        assert_eq!(menu.hit_test(button.0, button.1), Some(Hit::Power));
         assert!(menu.activate(Hit::Power).is_none());
-        assert!(menu.confirming_shutdown);
-        assert!(menu.hit_test(450.0, 530.0).is_none());
-        menu.activate(Hit::Cancel);
-        assert!(!menu.confirming_shutdown);
+        assert!(menu.power_menu);
+
+        for (i, option) in Power::ALL.into_iter().enumerate() {
+            let (x, y) = center_of_option(i);
+            assert_eq!(menu.hit_test(x, y), Some(Hit::PowerOption(option)));
+        }
+        // El menú queda dentro del panel, encima del botón.
+        let (mx, my, mw, mh) = LauncherState::power_menu_rect();
+        assert!(mx >= PAD && mx + mw <= WIDTH && my + mh < py && my > VIEW_TOP);
+
+        // Clic fuera o en el botón: se cierra sin hacer nada.
+        assert_eq!(
+            menu.hit_test(PAD + 10.0, VIEW_TOP + 10.0),
+            Some(Hit::Outside)
+        );
+        assert!(menu.activate(Hit::Outside).is_none());
+        assert!(!menu.power_menu);
         menu.activate(Hit::Power);
+        assert!(menu.activate(Hit::Power).is_none());
+        assert!(!menu.power_menu);
+
+        // Una opción actúa y cierra el menú.
+        menu.activate(Hit::Power);
+        let (x, y) = center_of_option(3);
+        let hit = menu.hit_test(x, y).unwrap();
         assert!(matches!(
-            menu.activate(Hit::ConfirmShutdown),
-            Some(Action::Shutdown)
+            menu.activate(hit),
+            Some(Action::Power(Power::Restart))
         ));
+        assert!(!menu.power_menu);
+    }
+
+    #[test]
+    fn power_menu_fades_and_rises_into_place() {
+        let mut menu = state();
+        menu.apps.clear();
+        let mut panel = Pixmap::new(WIDTH as u32, HEIGHT as u32).unwrap();
+        menu.draw(&mut panel, 1.0);
+        let (x, y, w, h) = LauncherState::power_menu_rect();
+        // Puntos del menú cerca de su borde superior y del inferior, sin texto ni iconos.
+        let (px, top, bottom) = (
+            (x + w - 12.0) as u32,
+            (y + 3.0) as u32,
+            (y + h - 3.0) as u32,
+        );
+        let frame = |progress: f32| {
+            let mut image = panel.clone();
+            menu.draw_power_menu(&mut image, 1.0, progress);
+            image
+        };
+        let red = |image: &Pixmap, y: u32| image.pixel(px, y).unwrap().demultiply().red();
+
+        let start = frame(0.0);
+        let halfway = frame(0.5);
+        let done = frame(1.0);
+        // Al empezar no se ve: el panel queda igual.
+        assert_eq!(red(&start, bottom), red(&panel, bottom));
+        // A mitad, semitransparente y aún más abajo: su borde superior no ha llegado.
+        assert!(red(&panel, bottom) < red(&halfway, bottom));
+        assert!(red(&halfway, bottom) < red(&done, bottom));
+        assert_eq!(red(&halfway, top), red(&panel, top));
+        assert_ne!(red(&done, top), red(&panel, top));
+
+        // La curva frena al final y la animación termina sola.
+        assert_eq!(ease_out(0.0), 0.0);
+        assert!(ease_out(0.5) > 0.5);
+        assert_eq!(ease_out(2.0), 1.0);
+        menu.power_menu = true;
+        menu.power_opened = None;
+        assert!(!menu.animating());
+        menu.power_opened = Some(Instant::now());
+        assert!(menu.animating());
+        menu.power_opened = Instant::now().checked_sub(MENU_ANIM * 2);
+        assert!(!menu.animating());
+    }
+
+    #[test]
+    fn arrows_and_enter_choose_a_power_option() {
+        let mut menu = state();
+        menu.activate(Hit::Power);
+        assert_eq!(menu.first_match(), None);
+        menu.move_selection(0, 1);
+        assert_eq!(menu.first_match(), Some(Hit::PowerOption(Power::Lock)));
+        menu.move_selection(0, 1);
+        menu.move_selection(0, 1);
+        assert_eq!(menu.first_match(), Some(Hit::PowerOption(Power::Shutdown)));
+        menu.move_selection(0, 5);
+        assert_eq!(menu.first_match(), Some(Hit::PowerOption(Power::Restart)));
+        menu.move_selection(0, -1);
+        assert_eq!(menu.first_match(), Some(Hit::PowerOption(Power::Shutdown)));
     }
 }

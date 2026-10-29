@@ -4,16 +4,38 @@ use std::{cell::RefCell, sync::OnceLock};
 use tiny_skia::{Pixmap, PixmapPaint, Transform};
 use windows::Win32::System::SystemInformation::GetLocalTime;
 
+fn font_file(name: &str) -> Option<Font> {
+    let windows = std::env::var_os("WINDIR").unwrap_or_else(|| "C:\\Windows".into());
+    let path = std::path::PathBuf::from(windows).join("Fonts").join(name);
+    Font::from_bytes(std::fs::read(path).ok()?, FontSettings::default()).ok()
+}
+
 fn system_font() -> &'static Font {
     static FONT: OnceLock<Font> = OnceLock::new();
-    FONT.get_or_init(|| {
-        let windows = std::env::var_os("WINDIR").unwrap_or_else(|| "C:\\Windows".into());
-        let path = std::path::PathBuf::from(windows)
-            .join("Fonts")
-            .join("segoeui.ttf");
-        let bytes = std::fs::read(path).expect("Segoe UI, fuente del sistema Windows");
-        Font::from_bytes(bytes, FontSettings::default()).expect("Segoe UI válida")
-    })
+    FONT.get_or_init(|| font_file("segoeui.ttf").expect("Segoe UI, fuente del sistema Windows"))
+}
+
+/// Iconos del sistema: Segoe Fluent Icons (Windows 11) o Segoe MDL2 Assets (Windows 10).
+fn icon_font() -> Option<&'static Font> {
+    static FONT: OnceLock<Option<Font>> = OnceLock::new();
+    FONT.get_or_init(|| font_file("SegoeIcons.ttf").or_else(|| font_file("segmdl2.ttf")))
+        .as_ref()
+}
+
+/// Dibuja un icono de la fuente de iconos de Windows centrado en (`cx`, `cy`).
+pub fn draw_icon(target: &mut Pixmap, icon: char, cx: f32, cy: f32, size: f32, opacity: f32) {
+    let Some(font) = icon_font() else {
+        return;
+    };
+    let image = rasterize_with(font, &icon.to_string(), size);
+    let (w, h) = (image.width() as f32, image.height() as f32);
+    blit_text(target, image, cx - w / 2.0, cy - h / 2.0, opacity);
+}
+
+/// Segoe UI Semibold para encabezados; si falta, la normal.
+fn semibold_font() -> &'static Font {
+    static FONT: OnceLock<Font> = OnceLock::new();
+    FONT.get_or_init(|| font_file("seguisb.ttf").unwrap_or_else(|| system_font().clone()))
 }
 
 pub struct ClockRenderer {
@@ -50,23 +72,46 @@ impl ClockRenderer {
 }
 
 fn rasterize(text: &str, size: f32) -> Pixmap {
-    let font = system_font();
-    let glyphs: Vec<_> = text.chars().map(|c| font.rasterize(c, size)).collect();
-    let width = glyphs
-        .iter()
-        .map(|(m, _)| m.advance_width)
-        .sum::<f32>()
-        .ceil() as u32
-        + 2;
+    rasterize_with(system_font(), text, size)
+}
+
+type Glyph = std::rc::Rc<(fontdue::Metrics, Vec<u8>)>;
+
+/// Rasterizar un glifo es lo más caro de pintar texto; el lanzador redibuja
+/// decenas de nombres en cada cambio, así que cada glifo se rasteriza una vez.
+fn glyph(font: &Font, c: char, size: f32) -> Glyph {
+    thread_local! {
+        static CACHE: RefCell<std::collections::HashMap<(usize, char, u32), Glyph>> =
+            RefCell::new(std::collections::HashMap::new());
+    }
+    let key = (font as *const Font as usize, c, size.to_bits());
+    CACHE.with(|cache| {
+        let mut cache = cache.borrow_mut();
+        if let Some(glyph) = cache.get(&key) {
+            return glyph.clone();
+        }
+        if cache.len() > 8192 {
+            cache.clear();
+        }
+        let glyph = Glyph::new(font.rasterize(c, size));
+        cache.insert(key, glyph.clone());
+        glyph
+    })
+}
+
+fn rasterize_with(font: &Font, text: &str, size: f32) -> Pixmap {
+    let glyphs: Vec<Glyph> = text.chars().map(|c| glyph(font, c, size)).collect();
+    let width = glyphs.iter().map(|g| g.0.advance_width).sum::<f32>().ceil() as u32 + 2;
     let top = glyphs
         .iter()
-        .map(|(m, _)| m.ymin + m.height as i32)
+        .map(|g| g.0.ymin + g.0.height as i32)
         .max()
         .unwrap_or(1);
-    let bottom = glyphs.iter().map(|(m, _)| m.ymin).min().unwrap_or(0);
+    let bottom = glyphs.iter().map(|g| g.0.ymin).min().unwrap_or(0);
     let mut image = Pixmap::new(width, (top - bottom).max(1) as u32).unwrap();
     let mut pen: f32 = 1.0;
-    for (metrics, coverage) in glyphs {
+    for glyph in &glyphs {
+        let (metrics, coverage) = (&glyph.0, &glyph.1);
         for y in 0..metrics.height {
             for x in 0..metrics.width {
                 let px = pen.round() as i32 + metrics.xmin + x as i32;
@@ -85,10 +130,31 @@ fn rasterize(text: &str, size: f32) -> Pixmap {
 
 /// Texto de interfaz con la misma fuente que el reloj; `y` es el borde superior.
 pub fn draw_text(target: &mut Pixmap, text: &str, x: f32, y: f32, size: f32, opacity: f32) {
-    if text.is_empty() {
+    blit_text(target, rasterize(text, size), x, y, opacity);
+}
+
+/// Como `draw_text`, en Segoe UI Semibold.
+pub fn draw_text_semibold(
+    target: &mut Pixmap,
+    text: &str,
+    x: f32,
+    y: f32,
+    size: f32,
+    opacity: f32,
+) {
+    blit_text(
+        target,
+        rasterize_with(semibold_font(), text, size),
+        x,
+        y,
+        opacity,
+    );
+}
+
+fn blit_text(target: &mut Pixmap, image: Pixmap, x: f32, y: f32, opacity: f32) {
+    if image.width() <= 2 {
         return;
     }
-    let image = rasterize(text, size);
     target.draw_pixmap(
         x.round() as i32,
         y.round() as i32,

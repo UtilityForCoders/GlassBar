@@ -10,11 +10,23 @@ Clic derecho sobre un icono → **Quitar este programa**. La selección se conse
 
 ## Lanzador propio
 
-La cuadrícula abre un panel transparente de GlassBar: búsqueda con el teclado, programas del menú Inicio, aplicaciones de Microsoft Store y aplicaciones ancladas, paginación y recientes. Los recientes corresponden a programas abiertos desde GlassBar y se guardan en `%LOCALAPPDATA%\GlassBar\recent.json`.
+La cuadrícula, o la tecla Windows, abre el panel de GlassBar al estilo del Inicio de Windows 11, centrado sobre el dock. Tiene una barra de búsqueda y, debajo, una vista con desplazamiento:
 
-El panel tiene 88% de opacidad para mejorar la lectura. Los iconos se obtienen del recurso original o de la fábrica de imágenes del Shell a alta resolución; se reducen con filtrado bicúbico sin ampliar los iconos pequeños de los accesos directos.
+- **Anclado:** los programas del dock.
+- **Recientes:** los últimos programas abiertos, según el registro de uso de Windows (UserAssist) y el historial de GlassBar en `%LOCALAPPDATA%\GlassBar\recent.json`.
+- **Más usadas:** los que más veces se han abierto según ese mismo registro, sin repetir anclados ni recientes.
 
-Escribe para filtrar; la búsqueda ignora mayúsculas y tildes, admite varias palabras y prioriza las coincidencias exactas. Enter abre el resultado seleccionado o el primero. El campo admite cursor, Inicio/Fin, Retroceso/Supr, Ctrl+A, Ctrl+V y un botón para limpiar. Las flechas arriba/abajo seleccionan resultados; izquierda/derecha editan el texto o mueven la selección de resultados. Re Pág/Av Pág, la rueda y los botones inferiores cambian de página. Escape o un clic fuera cierran el panel. **Apagar** abre una confirmación propia antes de solicitar el apagado de Windows, sin forzar el cierre de aplicaciones. El lanzador no envía pulsaciones de la tecla Windows ni abre el Inicio nativo.
+Solo aparecen programas del catálogo (accesos directos del menú Inicio y aplicaciones instaladas). Los que Windows abre sin que lleguen a primer plano, como la barra de juegos, no cuentan. El resto del catálogo, también los programas de Microsoft Store, aparece al buscar. GlassBar solo lee el registro de uso, nunca lo modifica. El catálogo y los iconos de la vista inicial se preparan en segundo plano al iniciar GlassBar y se reutilizan en cada apertura.
+
+El pie muestra el nombre de la cuenta y el botón de apagado. El panel tiene 96% de opacidad. Los iconos se obtienen del recurso original o de la fábrica de imágenes del Shell a alta resolución, y se reducen con un filtro de área sin ampliar los iconos pequeños.
+
+Escribe para buscar; la búsqueda ignora mayúsculas y tildes, admite varias palabras y prioriza las coincidencias exactas. Enter abre el elemento seleccionado o el primer resultado. El campo admite cursor, Inicio/Fin, Retroceso/Supr, Ctrl+A, Ctrl+V y un botón para limpiar. Las flechas mueven la selección por la cuadrícula y entre secciones (izquierda/derecha editan el texto mientras no haya selección). La rueda y Re Pág/Av Pág desplazan la vista. Escape o un clic fuera cierran el panel.
+
+El botón de encendido del pie abre un menú como el del Inicio de Windows 11 con **Bloquear**, **Suspender**, **Apagar** y **Reiniciar**, con los iconos del sistema (Segoe Fluent Icons). Aparece en 200 ms, desvaneciéndose y subiendo unos píxeles; si los efectos de animación de Windows están desactivados, aparece directamente. También se recorre con las flechas y Enter; Escape o un clic fuera lo cierran sin hacer nada. Apagar y reiniciar piden a Windows el cierre normal, sin forzar el de las aplicaciones abiertas.
+
+## Tecla Windows
+
+Mientras GlassBar está abierto, pulsar y soltar la tecla Windows sola muestra u oculta este lanzador en lugar del Inicio nativo. Las combinaciones (Win+E, Win+D, Win+L, etc.) siguen funcionando. Para impedir el Inicio nativo, GlassBar intercala una tecla sin asignar (`0xE8`) antes de soltar Win, de modo que Windows lo trata como una combinación. Al salir, se retira el gancho de teclado y la tecla vuelve a su comportamiento normal.
 
 Volver a ejecutar GlassBar mientras ya está abierto muestra u oculta este lanzador sin crear otra instancia. `--replace` cierra la instancia anterior de forma normal antes de iniciar la nueva.
 

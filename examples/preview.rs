@@ -22,6 +22,8 @@ mod launcher;
 mod pins;
 #[path = "../src/spring.rs"]
 mod spring;
+#[path = "../src/usage.rs"]
+mod usage;
 
 use bar::BarState;
 
@@ -38,7 +40,12 @@ fn main() {
     }
     if std::env::args().any(|a| a == "--launcher" || a == "--launcher-power") {
         let pinned: Vec<_> = state.primary_apps.iter().map(|a| a.entry.clone()).collect();
+        let started = std::time::Instant::now();
         let mut menu = launcher::LauncherState::new(&pinned);
+        let opened = started.elapsed();
+        let started = std::time::Instant::now();
+        menu.preload_icons();
+        let preloaded = started.elapsed();
         let arguments: Vec<String> = std::env::args().collect();
         if let Some(index) = arguments.iter().position(|a| a == "--search") {
             if let Some(query) = arguments.get(index + 1) {
@@ -51,19 +58,28 @@ fn main() {
                 }
             }
         }
-        menu.confirming_shutdown = std::env::args().any(|a| a == "--launcher-power");
-        let scale = 1.5;
+        menu.power_menu = std::env::args().any(|a| a == "--launcher-power");
+        if menu.power_menu {
+            menu.hovered = Some(launcher::Hit::PowerOption(launcher::Power::Shutdown));
+        }
         let mut image = Pixmap::new(
             (launcher::WIDTH * scale) as u32,
             (launcher::HEIGHT * scale) as u32,
         )
         .unwrap();
+        let started = std::time::Instant::now();
         menu.draw(&mut image, scale);
+        let first = started.elapsed();
+        // Lo que cuesta cada cambio de hover: iconos y glifos ya en caché.
+        let started = std::time::Instant::now();
+        menu.draw(&mut image, scale);
+        let redraw = started.elapsed();
         std::fs::write("target/launcher-preview.bmp", bmp_entry(&image)).unwrap();
         println!(
             "Lanzador: {} aplicaciones; vista previa en target/launcher-preview.bmp",
             menu.apps.len()
         );
+        println!("Tiempos: catálogo {opened:?}, precarga de iconos {preloaded:?}, primer dibujo {first:?}, redibujo {redraw:?}");
         return;
     }
     let open = std::env::args().any(|a| a == "--open");
