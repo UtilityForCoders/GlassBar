@@ -107,9 +107,3 @@ impl Drop for TaskbarReplacer {
         self.restore();
     }
 }
-
-/// Inicio nativo mientras se incorpora el lanzador de GlassBar.
-pub fn trigger_start_menu() {
-    use windows::Win32::UI::Input::KeyboardAndMouse::{keybd_event, KEYBD_EVENT_FLAGS, KEYEVENTF_KEYUP, VK_LWIN};
-    unsafe { keybd_event(VK_LWIN.0 as u8, 0, KEYBD_EVENT_FLAGS(0), 0); keybd_event(VK_LWIN.0 as u8, 0, KEYEVENTF_KEYUP, 0); }
-}

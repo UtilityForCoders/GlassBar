@@ -8,9 +8,11 @@ mod apps;
 mod autohide;
 mod autostart;
 mod bar;
+mod catalog;
 mod clock;
 mod glass;
 mod icons;
+mod launcher;
 mod monitors;
 mod pins;
 mod shell;
@@ -150,6 +152,307 @@ impl Drop for Surface {
     }
 }
 
+struct LauncherWindow {
+    hwnd: HWND,
+    surface: Surface,
+    pos: POINT,
+    scale: f32,
+    model: launcher::LauncherState,
+    visible: bool,
+}
+impl LauncherWindow {
+    fn new(owner: HWND, pinned: &[apps::AppEntry], dock_left: i32, dock_top: i32) -> Result<Self> {
+        let (screen, dpi) = monitors::get_info(monitors::primary());
+        let scale = dpi
+            .min((screen.right - screen.left - 24) as f32 / launcher::WIDTH)
+            .min((dock_top - screen.top - 24) as f32 / launcher::HEIGHT)
+            .max(0.3);
+        let width = (launcher::WIDTH * scale).ceil() as u32;
+        let height = (launcher::HEIGHT * scale).ceil() as u32;
+        let pos = POINT {
+            x: dock_left.clamp(screen.left + 12, screen.right - width as i32 - 12),
+            y: dock_top - height as i32 - 8,
+        };
+        let surface = Surface::new(width, height)?;
+        let hwnd = unsafe {
+            CreateWindowExW(
+                WS_EX_LAYERED | WS_EX_TOPMOST | WS_EX_TOOLWINDOW,
+                w!("GlassBarLauncher"),
+                w!("GlassBar — Aplicaciones"),
+                WS_POPUP,
+                pos.x,
+                pos.y,
+                width as i32,
+                height as i32,
+                Some(owner),
+                None,
+                Some(GetModuleHandleW(None)?.into()),
+                None,
+            )?
+        };
+        Ok(Self {
+            hwnd,
+            surface,
+            pos,
+            scale,
+            model: launcher::LauncherState::new(pinned),
+            visible: false,
+        })
+    }
+    fn render(&mut self) {
+        self.model.draw(&mut self.surface.pixmap, self.scale);
+        self.surface.copy_to_dib();
+        let blend = BLENDFUNCTION {
+            BlendOp: AC_SRC_OVER as u8,
+            SourceConstantAlpha: 255,
+            AlphaFormat: AC_SRC_ALPHA as u8,
+            ..Default::default()
+        };
+        unsafe {
+            let _ = UpdateLayeredWindow(
+                self.hwnd,
+                None,
+                Some(&self.pos),
+                Some(&SIZE {
+                    cx: self.surface.width as i32,
+                    cy: self.surface.height as i32,
+                }),
+                Some(self.surface.dc),
+                Some(&POINT { x: 0, y: 0 }),
+                COLORREF(0),
+                Some(&blend),
+                ULW_ALPHA,
+            );
+        }
+    }
+    fn show(&mut self) {
+        self.visible = true;
+        self.render();
+        unsafe {
+            let _ = ShowWindow(self.hwnd, windows::Win32::UI::WindowsAndMessaging::SW_SHOW);
+            let _ = windows::Win32::UI::WindowsAndMessaging::SetForegroundWindow(self.hwnd);
+            let _ = windows::Win32::UI::Input::KeyboardAndMouse::SetFocus(Some(self.hwnd));
+        }
+    }
+    fn hide(&mut self) {
+        self.visible = false;
+        unsafe {
+            let _ = ShowWindow(self.hwnd, windows::Win32::UI::WindowsAndMessaging::SW_HIDE);
+        }
+    }
+}
+impl Drop for LauncherWindow {
+    fn drop(&mut self) {
+        unsafe {
+            let _ = windows::Win32::UI::WindowsAndMessaging::DestroyWindow(self.hwnd);
+        }
+    }
+}
+
+unsafe fn clipboard_text(hwnd: HWND) -> Option<String> {
+    use windows::Win32::Foundation::HGLOBAL;
+    use windows::Win32::System::{DataExchange::*, Memory::*};
+    OpenClipboard(Some(hwnd)).ok()?;
+    let text = (|| {
+        let handle = GetClipboardData(13).ok()?;
+        let global = HGLOBAL(handle.0);
+        let len = (GlobalSize(global) / 2).min(16384);
+        let pointer = GlobalLock(global).cast::<u16>();
+        if pointer.is_null() {
+            return None;
+        }
+        let data = std::slice::from_raw_parts(pointer, len);
+        let end = data.iter().position(|&c| c == 0).unwrap_or(len);
+        let text = String::from_utf16_lossy(&data[..end]);
+        let _ = GlobalUnlock(global);
+        Some(text)
+    })();
+    let _ = CloseClipboard();
+    text
+}
+
+unsafe extern "system" fn launcher_wndproc(
+    hwnd: HWND,
+    msg: u32,
+    wparam: WPARAM,
+    lparam: LPARAM,
+) -> LRESULT {
+    use windows::Win32::UI::WindowsAndMessaging::{
+        WA_INACTIVE, WM_ACTIVATE, WM_CHAR, WM_CLOSE, WM_KEYDOWN, WM_MOUSEWHEEL,
+    };
+    let mut action = None;
+    match msg {
+        WM_ACTIVATE if (wparam.0 & 0xffff) as u32 == WA_INACTIVE => {
+            with_app(|app| {
+                if let Some(menu) = &mut app.launcher {
+                    menu.hide();
+                }
+            });
+        }
+        WM_CLOSE => {
+            with_app(|app| {
+                if let Some(menu) = &mut app.launcher {
+                    menu.hide();
+                }
+            });
+        }
+        WM_MOUSEMOVE | WM_LBUTTONUP => {
+            with_app(|app| {
+                if let Some(menu) = &mut app.launcher {
+                    let x = (lparam.0 & 0xffff) as i16 as f32 / menu.scale;
+                    let y = ((lparam.0 >> 16) & 0xffff) as i16 as f32 / menu.scale;
+                    let hit = menu.model.hit_test(x, y);
+                    if msg == WM_LBUTTONUP {
+                        if (24.0..68.0).contains(&y) && (24.0..462.0).contains(&x) {
+                            menu.model.caret = menu.model.query.chars().count();
+                            menu.model.select_all = false;
+                            menu.model.selection = None;
+                        }
+                        if let Some(hit) = hit {
+                            action = menu.model.activate(hit);
+                        }
+                    }
+                    menu.model.hovered = hit;
+                    menu.render();
+                }
+            });
+        }
+        WM_MOUSEWHEEL => {
+            with_app(|app| {
+                if let Some(menu) = &mut app.launcher {
+                    if !menu.model.confirming_shutdown {
+                        menu.model.change_page(((wparam.0 >> 16) as i16) < 0);
+                        menu.render();
+                    }
+                }
+            });
+        }
+        WM_CHAR => {
+            with_app(|app| {
+                if let Some(menu) = &mut app.launcher {
+                    if let Some(ch) = char::from_u32(wparam.0 as u32) {
+                        menu.model.type_char(ch);
+                        menu.render();
+                    }
+                }
+            });
+        }
+        WM_KEYDOWN => {
+            with_app(|app| {
+                if let Some(menu) = &mut app.launcher {
+                    let ctrl = windows::Win32::UI::Input::KeyboardAndMouse::GetKeyState(0x11) < 0;
+                    match wparam.0 {
+                        0x1B => {
+                            if menu.model.confirming_shutdown {
+                                menu.model.confirming_shutdown = false;
+                                menu.render();
+                            } else {
+                                menu.hide();
+                            }
+                        }
+                        0x0D if !menu.model.confirming_shutdown => {
+                            if let Some(hit) = menu.model.first_match() {
+                                action = menu.model.activate(hit);
+                            }
+                        }
+                        0x41 if ctrl && !menu.model.confirming_shutdown => {
+                            menu.model.select_all = true;
+                            menu.render();
+                        }
+                        0x56 if ctrl && !menu.model.confirming_shutdown => {
+                            if let Some(text) = clipboard_text(hwnd) {
+                                menu.model.insert_text(&text);
+                                menu.render();
+                            }
+                        }
+                        0x25 if !menu.model.confirming_shutdown => {
+                            if menu.model.selection.is_some() {
+                                menu.model.move_selection(-1);
+                            } else {
+                                menu.model.move_caret(-1);
+                            }
+                            menu.render();
+                        }
+                        0x27 if !menu.model.confirming_shutdown => {
+                            if menu.model.selection.is_some() {
+                                menu.model.move_selection(1);
+                            } else {
+                                menu.model.move_caret(1);
+                            }
+                            menu.render();
+                        }
+                        0x24 if !menu.model.confirming_shutdown => {
+                            menu.model.caret = 0;
+                            menu.model.select_all = false;
+                            menu.render();
+                        }
+                        0x23 if !menu.model.confirming_shutdown => {
+                            menu.model.caret = menu.model.query.chars().count();
+                            menu.model.select_all = false;
+                            menu.render();
+                        }
+                        0x2E if !menu.model.confirming_shutdown => {
+                            menu.model.delete_forward();
+                            menu.render();
+                        }
+                        0x28 if !menu.model.confirming_shutdown => {
+                            menu.model.move_selection(4);
+                            menu.render();
+                        }
+                        0x26 if !menu.model.confirming_shutdown => {
+                            menu.model.move_selection(-4);
+                            menu.render();
+                        }
+                        0x22 if !menu.model.confirming_shutdown => {
+                            menu.model.change_page(true);
+                            menu.render();
+                        }
+                        0x21 if !menu.model.confirming_shutdown => {
+                            menu.model.change_page(false);
+                            menu.render();
+                        }
+                        _ => {}
+                    }
+                }
+            });
+        }
+        _ => return DefWindowProcW(hwnd, msg, wparam, lparam),
+    }
+    // Ejecutar después de liberar el préstamo de APP: Shell puede reenviar eventos.
+    if let Some(action) = action {
+        with_app(|app| {
+            if let Some(menu) = &mut app.launcher {
+                menu.hide();
+            }
+        });
+        match action {
+            launcher::Action::Launch(entry) => {
+                if apps::launch_entry(&entry) {
+                    let _ = catalog::record(&entry);
+                }
+            }
+            launcher::Action::Shutdown => {
+                let result = std::env::var_os("WINDIR")
+                    .map(std::path::PathBuf::from)
+                    .map(|root| {
+                        std::process::Command::new(root.join("System32").join("shutdown.exe"))
+                            .args(["/s", "/t", "0"])
+                            .spawn()
+                    });
+                if !matches!(result, Some(Ok(_))) {
+                    windows::Win32::UI::WindowsAndMessaging::MessageBoxW(
+                        Some(hwnd),
+                        w!("No se pudo solicitar el apagado."),
+                        w!("GlassBar"),
+                        windows::Win32::UI::WindowsAndMessaging::MB_ICONERROR,
+                    );
+                }
+            }
+        }
+    }
+    LRESULT(0)
+}
+
 struct App {
     hwnd: HWND,
     surface: Surface,
@@ -164,6 +467,7 @@ struct App {
     bar: BarState,
     shell: TaskbarReplacer,
     tray: Tray,
+    launcher: Option<LauncherWindow>,
     animating: bool,
     last_tick: Instant,
     mouse_tracked: bool,
@@ -211,10 +515,38 @@ impl App {
             bar,
             shell,
             tray,
+            launcher: None,
             animating: false,
             last_tick: Instant::now(),
             mouse_tracked: false,
         })
+    }
+
+    fn toggle_launcher(&mut self) {
+        if self.launcher.as_ref().is_some_and(|menu| menu.visible) {
+            if let Some(menu) = &mut self.launcher {
+                menu.hide();
+            }
+            return;
+        }
+        let pinned: Vec<_> = self
+            .bar
+            .primary_apps
+            .iter()
+            .map(|a| a.entry.clone())
+            .collect();
+        if self.launcher.is_none() {
+            match LauncherWindow::new(self.hwnd, &pinned, self.pos.x, self.y_shown) {
+                Ok(menu) => self.launcher = Some(menu),
+                Err(_) => return,
+            }
+        } else if let Some(menu) = &mut self.launcher {
+            menu.model = launcher::LauncherState::new(&pinned);
+        }
+        if let Some(menu) = &mut self.launcher {
+            menu.show();
+        }
+        self.expand();
     }
 
     fn pins_changed(&mut self) {
@@ -312,7 +644,7 @@ impl App {
 unsafe extern "system" fn wndproc(hwnd: HWND, msg: u32, wparam: WPARAM, lparam: LPARAM) -> LRESULT {
     match msg {
         WM_SHOW_LAUNCHER => {
-            with_app(|_| shell::trigger_start_menu());
+            with_app(|app| app.toggle_launcher());
             LRESULT(0)
         }
         WM_DROPFILES => {
@@ -418,12 +750,17 @@ unsafe extern "system" fn wndproc(hwnd: HWND, msg: u32, wparam: WPARAM, lparam: 
                     match target {
                         HoverTarget::Launcher => {
                             app.bar.launcher_press.set_target(1.0);
-                            shell::trigger_start_menu();
+                            app.toggle_launcher();
                         }
                         HoverTarget::PrimaryApp(i) => {
+                            if let Some(menu) = &mut app.launcher {
+                                menu.hide();
+                            }
                             if let Some(a) = app.bar.primary_apps.get_mut(i) {
                                 a.press_spring.set_target(1.0);
-                                a.launch();
+                                if a.launch() {
+                                    let _ = catalog::record(&a.entry);
+                                }
                             }
                         }
                         HoverTarget::Clock => {
@@ -511,7 +848,7 @@ unsafe extern "system" fn wndproc(hwnd: HWND, msg: u32, wparam: WPARAM, lparam: 
                         && pt.y >= app.y_shown
                         && pt.y < app.screen_bottom;
                     app.visibility.sample(
-                        at_edge || inside,
+                        at_edge || inside || app.launcher.as_ref().is_some_and(|l| l.visible),
                         Instant::now(),
                     );
                     if app.visibility.active() {
@@ -691,6 +1028,18 @@ fn main() -> Result<()> {
             ..Default::default()
         };
         if RegisterClassExW(&wc) == 0 {
+            return Err(windows::core::Error::from_thread());
+        }
+
+        let launcher_class = WNDCLASSEXW {
+            cbSize: std::mem::size_of::<WNDCLASSEXW>() as u32,
+            lpfnWndProc: Some(launcher_wndproc),
+            hInstance: instance.into(),
+            hCursor: LoadCursorW(None, IDC_ARROW)?,
+            lpszClassName: w!("GlassBarLauncher"),
+            ..Default::default()
+        };
+        if RegisterClassExW(&launcher_class) == 0 {
             return Err(windows::core::Error::from_thread());
         }
 
