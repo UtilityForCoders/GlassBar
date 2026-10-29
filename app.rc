@@ -1,0 +1,4 @@
+// Recursos de GlassBar. El ícono se genera con `cargo run --example icon`.
+1 ICON "assets/icon.ico"
+// Manifiesto de Windows: controles modernos y DPI awareness v2.
+1 24 "app.manifest"

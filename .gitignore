@@ -1,0 +1,5 @@
+/target
+**/*.rs.bk
+*.pdb
+/dock_preview.bmp
+/dock_preview.png
