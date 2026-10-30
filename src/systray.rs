@@ -148,14 +148,16 @@ pub fn apply(
             let index = match index {
                 Some(index) => index,
                 // Un cambio de un icono desconocido (registrado antes de abrir
-                // GlassBar) cuenta como nuevo.
+                // GlassBar) cuenta como nuevo. Su versión no se sabe (la dio antes):
+                // los que no vuelven a registrarse son sobre todo de Windows y apps
+                // actuales, que usan la 4. Uno nuevo empieza en la 0, como en Windows.
                 None => {
                     icons.push(Icon {
                         owner: notify.owner,
                         id: notify.id,
                         guid: notify.guid,
                         callback: 0,
-                        version: 0,
+                        version: if message == NIM_ADD { 0 } else { 4 },
                         tip: String::new(),
                         hidden: false,
                         image: None,
@@ -254,9 +256,10 @@ fn process_name(window: HWND) -> String {
 }
 
 thread_local! {
-    /// Reenviando un mensaje a Explorer: si este volviera a llamar a la bandeja
-    /// propia mientras tanto, no se reenvía otra vez (sería un bucle sin fin).
-    static FORWARDING: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
+    /// Reenvíos a Explorer en curso. Mientras se espera su respuesta llegan los de
+    /// otros programas, que también se reenvían; solo un anidamiento muy profundo
+    /// sería un bucle (Explorer llamando a la bandeja propia una y otra vez).
+    static FORWARDING: std::cell::Cell<u32> = const { std::cell::Cell::new(0) };
     static ICONS: std::cell::RefCell<Vec<Icon>> = const { std::cell::RefCell::new(Vec::new()) };
     /// Ventana a la que se avisa cuando cambian los iconos, y con qué mensaje.
     static NOTIFY: std::cell::Cell<(isize, u32)> = const { std::cell::Cell::new((0, 0)) };
@@ -380,12 +383,13 @@ unsafe extern "system" fn host_wndproc(
     use windows::Win32::System::DataExchange::COPYDATASTRUCT;
     let forward = || {
         let mut result = 0usize;
-        if FORWARDING.with(|f| f.replace(true)) {
+        if FORWARDING.with(|f| f.get()) >= 8 {
             log(format!(
-                "Mensaje 0x{msg:X} de vuelta mientras se reenviaba: no se reenvía"
+                "Mensaje 0x{msg:X}: demasiados reenvíos anidados, no se reenvía"
             ));
             return LRESULT(0);
         }
+        FORWARDING.with(|f| f.set(f.get() + 1));
         if let Some(explorer) = crate::shell::explorer_tray() {
             let _ = SendMessageTimeoutW(
                 explorer,
@@ -397,7 +401,7 @@ unsafe extern "system" fn host_wndproc(
                 Some(&mut result),
             );
         }
-        FORWARDING.with(|f| f.set(false));
+        FORWARDING.with(|f| f.set(f.get() - 1));
         LRESULT(result as isize)
     };
     if msg == WM_COPYDATA {
@@ -437,6 +441,13 @@ unsafe extern "system" fn host_wndproc(
     DefWindowProcW(hwnd, msg, wparam, lparam)
 }
 
+/// Si el icono va en el panel: no oculto, y no uno de Explorer sin a quién avisar
+/// al pulsarlo (el volumen y la red de Windows, que el dock ya muestra).
+fn visible(icon: &Icon) -> bool {
+    !icon.hidden
+        && (icon.callback != 0 || !process_name(icon.window()).eq_ignore_ascii_case("explorer.exe"))
+}
+
 /// Icono que se muestra en el panel: su imagen y su nombre.
 pub struct Shown {
     pub image: Option<Pixmap>,
@@ -451,7 +462,7 @@ pub fn shown() -> Vec<Shown> {
         icons.retain(|i| unsafe { IsWindow(Some(i.window())).as_bool() });
         icons
             .iter()
-            .filter(|i| !i.hidden)
+            .filter(|i| visible(i))
             .map(|i| Shown {
                 image: i.image.clone(),
                 tip: i.tip.clone(),
@@ -468,7 +479,7 @@ pub fn click(index: usize, click: Click, at: POINT) {
         icons
             .borrow()
             .iter()
-            .filter(|i| !i.hidden)
+            .filter(|i| visible(i))
             .nth(index)
             .map(|i| (i.window(), i.callback, i.version, i.id))
     });
@@ -487,6 +498,10 @@ pub fn click(index: usize, click: Click, at: POINT) {
         let mut pid = 0;
         GetWindowThreadProcessId(window, Some(&mut pid));
         let allowed = AllowSetForegroundWindow(if pid != 0 { pid } else { ASFW_ANY });
+        // Y se pone ya delante su ventana (aunque esté oculta), como hacen los
+        // programas antes de abrir su menú: si no lo consiguen a tiempo, el menú no
+        // se cierra al hacer clic fuera y sus opciones no responden.
+        let focused = SetForegroundWindow(window).as_bool();
         let mut sent = Vec::new();
         for event in click_messages(click, version) {
             let (w, l) = callback_params(version, id, event, at);
@@ -497,9 +512,10 @@ pub fn click(index: usize, click: Click, at: POINT) {
             ));
         }
         log(format!(
-            "Clic {click:?} en {name} (ventana 0x{:X}, id {id}, versión {version}, mensaje 0x{callback:X}): primer plano {}, enviados {}",
+            "Clic {click:?} en {name} (ventana 0x{:X}, id {id}, versión {version}, mensaje 0x{callback:X}): primer plano {}, puesta delante {}, enviados {}",
             window.0 as usize,
             if allowed.is_ok() { "permitido" } else { "no permitido" },
+            if focused { "sí" } else { "no" },
             sent.join(" "),
         ));
     }
@@ -512,7 +528,7 @@ pub fn hover(index: usize, at: POINT) {
         icons
             .borrow()
             .iter()
-            .filter(|i| !i.hidden)
+            .filter(|i| visible(i))
             .nth(index)
             .map(|i| (i.window(), i.callback, i.version, i.id))
     });

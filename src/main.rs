@@ -2672,6 +2672,8 @@ unsafe extern "system" fn tray_wndproc(
                     tip.hide();
                 }
                 app.tray_clicked = Some(Instant::now());
+                // Se cierra antes de pasarle el foco al programa, como el de Windows.
+                panel.hide();
                 systray::click(index, click, cursor());
             }
         });
