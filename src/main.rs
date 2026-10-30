@@ -19,6 +19,7 @@ mod keyboard;
 mod launcher;
 mod monitors;
 mod pins;
+mod preview;
 mod priority;
 mod quick;
 mod shell;
@@ -1311,6 +1312,10 @@ struct App {
     /// la primera apertura no tenga que esperar a leerlos.
     prepared: Option<std::sync::mpsc::Receiver<launcher::LauncherState>>,
     tooltip: Option<Tooltip>,
+    /// Vista previa de ventanas; `preview_away` es desde cuándo el cursor no está ni
+    /// en ella ni en su programa (se cierra tras un momento, para poder llegar a ella).
+    preview: Option<PreviewWindow>,
+    preview_away: Option<Instant>,
     animating: bool,
     last_tick: Instant,
     mouse_tracked: bool,
@@ -1368,6 +1373,8 @@ impl App {
             quick: None,
             prepared: Some(prepare_launcher(&pinned)),
             tooltip: Tooltip::new(hwnd).ok(),
+            preview: PreviewWindow::new(hwnd).ok(),
+            preview_away: None,
             animating: false,
             last_tick: Instant::now(),
             mouse_tracked: false,
@@ -1567,6 +1574,20 @@ impl App {
         if let Some(tip) = &mut self.tooltip {
             tip.hide();
         }
+        // Con una vista previa abierta, pasar a otro programa con ventana la cambia al
+        // momento, como en Windows; si no la tiene, se cierra.
+        let previewing = self.preview.as_ref().is_some_and(|p| p.visible);
+        if previewing && self.bar.pressed.is_none() {
+            if let Some(target) = self.bar.hovered {
+                if !self.show_preview(target) {
+                    if let Some(preview) = &mut self.preview {
+                        preview.hide();
+                    }
+                } else {
+                    return;
+                }
+            }
+        }
         unsafe {
             let _ = KillTimer(Some(self.hwnd), TIMER_TIP);
             if matches!(
@@ -1599,6 +1620,10 @@ impl App {
         {
             return;
         }
+        // Programa con ventana abierta: vista previa en lugar del nombre.
+        if self.show_preview(target) {
+            return;
+        }
         let Some((name, cx)) = self.bar.item_label(target, self.scale) else {
             return;
         };
@@ -1611,6 +1636,53 @@ impl App {
                 self.screen_right,
                 self.scale,
             );
+        }
+    }
+
+    /// Muestra la vista previa de la ventana del programa `target`, si tiene una.
+    fn show_preview(&mut self, target: HoverTarget) -> bool {
+        if !matches!(target, HoverTarget::PrimaryApp(_) | HoverTarget::OpenApp(_)) {
+            return false;
+        }
+        let Some((name, cx)) = self.bar.item_label(target, self.scale) else {
+            return false;
+        };
+        let Some(window) = self.bar.item_mut(target).and_then(|a| a.window) else {
+            return false;
+        };
+        let title = Some(window_title(window))
+            .filter(|t| !t.trim().is_empty())
+            .unwrap_or(name);
+        let (anchor, top, scale) = (self.pos.x + cx.round() as i32, self.y_shown, self.scale);
+        let bounds = (self.screen_left, self.screen_right);
+        let Some(preview) = &mut self.preview else {
+            return false;
+        };
+        let shown = preview.show(window, title, target, anchor, top, bounds, scale);
+        if shown {
+            self.preview_away = None;
+            if let Some(tip) = &mut self.tooltip {
+                tip.hide();
+            }
+        }
+        shown
+    }
+
+    /// Cierra la vista previa si el cursor ya no está ni en ella ni en su programa
+    /// desde hace un momento (el justo para pasar del icono al panel).
+    fn check_preview(&mut self, cursor: POINT, now: Instant) {
+        let Some(preview) = self.preview.as_mut().filter(|p| p.visible) else {
+            return;
+        };
+        let over = preview.contains(cursor) || self.bar.hovered == preview.target;
+        if over || self.bar.pressed.is_some() && self.bar.pressed == preview.target {
+            self.preview_away = None;
+            return;
+        }
+        let since = *self.preview_away.get_or_insert(now);
+        if now.duration_since(since) > Duration::from_millis(250) {
+            preview.hide();
+            self.preview_away = None;
         }
     }
 
@@ -1780,6 +1852,9 @@ unsafe extern "system" fn wndproc(hwnd: HWND, msg: u32, wparam: WPARAM, lparam: 
             with_app(|app| {
                 if let Some(target) = app.bar.hovered {
                     app.bar.pressed = Some(target);
+                    if let Some(preview) = &mut app.preview {
+                        preview.hide();
+                    }
                     app.restart_tooltip();
                     let x = (lparam.0 & 0xffff) as i16 as f32;
                     app.bar.begin_drag(target, x, app.scale);
@@ -2005,6 +2080,7 @@ unsafe extern "system" fn wndproc(hwnd: HWND, msg: u32, wparam: WPARAM, lparam: 
                         app.screen_bottom,
                         app.scale,
                     );
+                    app.check_preview(pt, Instant::now());
                     let inside = app.visibility.expanded
                         && pt.x >= app.pos.x
                         && pt.x < app.pos.x + app.surface.width as i32
@@ -2016,6 +2092,7 @@ unsafe extern "system" fn wndproc(hwnd: HWND, msg: u32, wparam: WPARAM, lparam: 
                             || app.bar.drag.is_some()
                             || app.launcher.as_ref().is_some_and(|l| l.visible)
                             || app.quick.as_ref().is_some_and(|q| q.visible)
+                            || app.preview.as_ref().is_some_and(|p| p.visible)
                             // El panel de iconos ocultos abierto sobre la flecha; se mira
                             // al final porque recorre las ventanas, y solo con el dock fuera.
                             || (app.visibility.expanded && shell::overflow_window().is_some()),
@@ -2055,6 +2132,302 @@ unsafe extern "system" fn wndproc(hwnd: HWND, msg: u32, wparam: WPARAM, lparam: 
             LRESULT(0)
         }
 
+        _ => DefWindowProcW(hwnd, msg, wparam, lparam),
+    }
+}
+
+/// Vista previa de la ventana de un programa del dock. El marco y el título se
+/// dibujan como el resto de GlassBar; la miniatura en vivo la pone Windows (DWM)
+/// encima, en el hueco que se le indica.
+struct PreviewWindow {
+    hwnd: HWND,
+    surface: Option<Surface>,
+    pos: POINT,
+    scale: f32,
+    visible: bool,
+    /// Miniatura registrada en DWM (0 si no hay).
+    thumbnail: isize,
+    /// Ventana que se muestra.
+    source: isize,
+    /// Programa del dock al que pertenece.
+    target: Option<HoverTarget>,
+    geometry: preview::Geometry,
+    title: String,
+    close_hovered: bool,
+}
+impl PreviewWindow {
+    fn new(owner: HWND) -> Result<Self> {
+        let hwnd = unsafe {
+            CreateWindowExW(
+                WS_EX_LAYERED | WS_EX_TOPMOST | WS_EX_TOOLWINDOW | WS_EX_NOACTIVATE,
+                w!("GlassBarPreview"),
+                w!("GlassBar — Vista previa"),
+                WS_POPUP,
+                0,
+                0,
+                1,
+                1,
+                Some(owner),
+                None,
+                Some(GetModuleHandleW(None)?.into()),
+                None,
+            )?
+        };
+        Ok(Self {
+            hwnd,
+            surface: None,
+            pos: POINT::default(),
+            scale: 1.0,
+            visible: false,
+            thumbnail: 0,
+            source: 0,
+            target: None,
+            geometry: preview::geometry((1.0, 1.0), 1.0),
+            title: String::new(),
+            close_hovered: false,
+        })
+    }
+
+    /// Muestra la ventana `source` sobre `anchor_x`, encima del dock. Devuelve
+    /// `false` si Windows no da su miniatura (entonces se usa el globo con el nombre).
+    #[allow(clippy::too_many_arguments)]
+    fn show(
+        &mut self,
+        source: isize,
+        title: String,
+        target: HoverTarget,
+        anchor_x: i32,
+        dock_top: i32,
+        (left, right): (i32, i32),
+        scale: f32,
+    ) -> bool {
+        use windows::Win32::Graphics::Dwm::{
+            DwmQueryThumbnailSourceSize, DwmRegisterThumbnail, DwmUnregisterThumbnail,
+        };
+        if self.visible && self.source == source {
+            self.target = Some(target);
+            return true;
+        }
+        unsafe {
+            if self.thumbnail != 0 {
+                let _ = DwmUnregisterThumbnail(self.thumbnail);
+                self.thumbnail = 0;
+            }
+            let Ok(thumbnail) = DwmRegisterThumbnail(self.hwnd, HWND(source as *mut _)) else {
+                return false;
+            };
+            let Ok(size) = DwmQueryThumbnailSourceSize(thumbnail) else {
+                let _ = DwmUnregisterThumbnail(thumbnail);
+                return false;
+            };
+            self.thumbnail = thumbnail;
+            self.geometry = preview::geometry((size.cx as f32, size.cy as f32), scale);
+        }
+        self.scale = scale;
+        self.source = source;
+        self.target = Some(target);
+        self.title = title;
+        self.close_hovered = false;
+        let width = (self.geometry.width * scale).ceil() as u32;
+        let height = (self.geometry.height * scale).ceil() as u32;
+        let Ok(surface) = Surface::new(width, height) else {
+            self.hide();
+            return false;
+        };
+        self.surface = Some(surface);
+        let margin = (8.0 * scale).round() as i32;
+        self.pos = POINT {
+            x: (anchor_x - width as i32 / 2).clamp(
+                left + margin,
+                (right - width as i32 - margin).max(left + margin),
+            ),
+            y: dock_top - height as i32 - margin,
+        };
+        self.render();
+        unsafe {
+            let _ = ShowWindow(self.hwnd, SW_SHOWNOACTIVATE);
+        }
+        self.visible = true;
+        self.place_thumbnail();
+        true
+    }
+
+    /// Le dice a Windows dónde pintar la miniatura dentro del panel.
+    fn place_thumbnail(&self) {
+        use windows::Win32::Graphics::Dwm::{
+            DwmUpdateThumbnailProperties, DWM_THUMBNAIL_PROPERTIES,
+        };
+        // DWM_TNP_RECTDESTINATION | DWM_TNP_OPACITY | DWM_TNP_VISIBLE.
+        const FLAGS: u32 = 0x1 | 0x4 | 0x8;
+        let (x, y, w, h) = self.geometry.thumb;
+        let s = self.scale;
+        let properties = DWM_THUMBNAIL_PROPERTIES {
+            dwFlags: FLAGS,
+            rcDestination: windows::Win32::Foundation::RECT {
+                left: (x * s).round() as i32,
+                top: (y * s).round() as i32,
+                right: ((x + w) * s).round() as i32,
+                bottom: ((y + h) * s).round() as i32,
+            },
+            opacity: 255,
+            fVisible: true.into(),
+            ..Default::default()
+        };
+        unsafe {
+            let _ = DwmUpdateThumbnailProperties(self.thumbnail, &properties);
+        }
+    }
+
+    fn render(&mut self) {
+        let Some(surface) = &mut self.surface else {
+            return;
+        };
+        preview::draw(
+            &mut surface.pixmap,
+            &self.geometry,
+            &self.title,
+            self.close_hovered,
+            self.scale,
+        );
+        surface.copy_to_dib();
+        let blend = BLENDFUNCTION {
+            BlendOp: AC_SRC_OVER as u8,
+            SourceConstantAlpha: 255,
+            AlphaFormat: AC_SRC_ALPHA as u8,
+            ..Default::default()
+        };
+        unsafe {
+            let _ = UpdateLayeredWindow(
+                self.hwnd,
+                None,
+                Some(&self.pos),
+                Some(&SIZE {
+                    cx: surface.width as i32,
+                    cy: surface.height as i32,
+                }),
+                Some(surface.dc),
+                Some(&POINT { x: 0, y: 0 }),
+                COLORREF(0),
+                Some(&blend),
+                ULW_ALPHA,
+            );
+        }
+    }
+
+    fn hide(&mut self) {
+        if !self.visible && self.thumbnail == 0 {
+            return;
+        }
+        unsafe {
+            if self.thumbnail != 0 {
+                let _ = windows::Win32::Graphics::Dwm::DwmUnregisterThumbnail(self.thumbnail);
+                self.thumbnail = 0;
+            }
+            let _ = ShowWindow(self.hwnd, SW_HIDE);
+        }
+        self.visible = false;
+        self.target = None;
+        self.source = 0;
+    }
+
+    /// El cursor (en pantalla) está sobre el panel.
+    fn contains(&self, point: POINT) -> bool {
+        let Some(surface) = &self.surface else {
+            return false;
+        };
+        self.visible
+            && point.x >= self.pos.x
+            && point.x < self.pos.x + surface.width as i32
+            && point.y >= self.pos.y
+            && point.y < self.pos.y + surface.height as i32
+    }
+}
+impl Drop for PreviewWindow {
+    fn drop(&mut self) {
+        self.hide();
+        unsafe {
+            let _ = windows::Win32::UI::WindowsAndMessaging::DestroyWindow(self.hwnd);
+        }
+    }
+}
+
+/// Título de una ventana, para la vista previa.
+fn window_title(hwnd: isize) -> String {
+    use windows::Win32::UI::WindowsAndMessaging::GetWindowTextW;
+    let mut buffer = [0u16; 256];
+    let len = unsafe { GetWindowTextW(HWND(hwnd as *mut _), &mut buffer) };
+    String::from_utf16_lossy(&buffer[..len.max(0) as usize])
+}
+
+unsafe extern "system" fn preview_wndproc(
+    hwnd: HWND,
+    msg: u32,
+    wparam: WPARAM,
+    lparam: LPARAM,
+) -> LRESULT {
+    let point = |scale: f32| {
+        (
+            (lparam.0 & 0xffff) as i16 as f32 / scale,
+            ((lparam.0 >> 16) & 0xffff) as i16 as f32 / scale,
+        )
+    };
+    match msg {
+        // Pulsarla no quita el foco a la ventana activa.
+        WM_MOUSEACTIVATE => LRESULT(MA_NOACTIVATE as isize),
+        WM_MOUSEMOVE => {
+            with_app(|app| {
+                let Some(panel) = app.preview.as_mut().filter(|p| p.visible) else {
+                    return;
+                };
+                let mut track = TRACKMOUSEEVENT {
+                    cbSize: std::mem::size_of::<TRACKMOUSEEVENT>() as u32,
+                    dwFlags: TME_LEAVE,
+                    hwndTrack: hwnd,
+                    dwHoverTime: 0,
+                };
+                let _ = TrackMouseEvent(&mut track);
+                let (x, y) = point(panel.scale);
+                let close = panel.geometry.in_close(x, y);
+                if close != panel.close_hovered {
+                    panel.close_hovered = close;
+                    panel.render();
+                }
+            });
+            LRESULT(0)
+        }
+        WM_MOUSELEAVE => {
+            with_app(|app| {
+                if let Some(panel) = app.preview.as_mut().filter(|p| p.close_hovered) {
+                    panel.close_hovered = false;
+                    panel.render();
+                }
+            });
+            LRESULT(0)
+        }
+        // Clic: trae la ventana al frente; en la ✕, la cierra (como en Windows, le pide
+        // que se cierre, así que puede preguntar si guardar).
+        WM_LBUTTONUP => {
+            with_app(|app| {
+                let Some(panel) = app.preview.as_mut().filter(|p| p.visible) else {
+                    return;
+                };
+                let (x, y) = point(panel.scale);
+                let source = panel.source;
+                let close = panel.geometry.in_close(x, y);
+                panel.hide();
+                if close {
+                    let _ = windows::Win32::UI::WindowsAndMessaging::PostMessageW(
+                        Some(HWND(source as *mut _)),
+                        windows::Win32::UI::WindowsAndMessaging::WM_CLOSE,
+                        WPARAM(0),
+                        LPARAM(0),
+                    );
+                } else {
+                    apps::focus_window(source);
+                }
+            });
+            LRESULT(0)
+        }
         _ => DefWindowProcW(hwnd, msg, wparam, lparam),
     }
 }
@@ -2237,6 +2610,18 @@ fn main() -> Result<()> {
             ..Default::default()
         };
         if RegisterClassExW(&quick_class) == 0 {
+            return Err(windows::core::Error::from_thread());
+        }
+
+        let preview_class = WNDCLASSEXW {
+            cbSize: std::mem::size_of::<WNDCLASSEXW>() as u32,
+            lpfnWndProc: Some(preview_wndproc),
+            hInstance: instance.into(),
+            hCursor: LoadCursorW(None, IDC_ARROW)?,
+            lpszClassName: w!("GlassBarPreview"),
+            ..Default::default()
+        };
+        if RegisterClassExW(&preview_class) == 0 {
             return Err(windows::core::Error::from_thread());
         }
 
