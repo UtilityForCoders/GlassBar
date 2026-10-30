@@ -269,6 +269,8 @@ thread_local! {
 /// solo con Explorer.
 pub struct Host {
     hwnd: HWND,
+    /// Cuándo se pidieron los iconos a los programas por última vez.
+    announced: std::cell::Cell<std::time::Instant>,
 }
 
 impl Host {
@@ -306,7 +308,10 @@ impl Host {
                 None,
             )
             .ok()?;
-            let host = Self { hwnd };
+            let host = Self {
+                hwnd,
+                announced: std::cell::Cell::new(std::time::Instant::now()),
+            };
             host.keep_in_front();
             if FindWindowW(w!("Shell_TrayWnd"), None).ok() != Some(hwnd) {
                 log("No se pudo poner la bandeja propia delante de la de Explorer");
@@ -319,20 +324,34 @@ impl Host {
     }
 
     /// Vuelve a ponerse delante si Explorer pasó la suya por encima.
+    /// Mientras la de Explorer estuvo delante, los programas le mandaron a ella sus
+    /// iconos: se le vuelven a pedir (como mucho cada 5 s, por si Explorer insiste).
     pub fn keep_in_front(&self) {
         unsafe {
-            if FindWindowW(w!("Shell_TrayWnd"), None).ok() != Some(self.hwnd) {
-                let _ = SetWindowPos(
-                    self.hwnd,
-                    Some(HWND_TOPMOST),
-                    0,
-                    0,
-                    0,
-                    0,
-                    SWP_NOACTIVATE | SWP_NOMOVE | SWP_NOSIZE,
-                );
+            if FindWindowW(w!("Shell_TrayWnd"), None).ok() == Some(self.hwnd) {
+                return;
             }
+            let _ = SetWindowPos(
+                self.hwnd,
+                Some(HWND_TOPMOST),
+                0,
+                0,
+                0,
+                0,
+                SWP_NOACTIVATE | SWP_NOMOVE | SWP_NOSIZE,
+            );
         }
+        if self.announced.get().elapsed() >= std::time::Duration::from_secs(5) {
+            log("La bandeja de Explorer se puso delante: se vuelve a poner la propia y se piden los iconos");
+            self.announce_again();
+        }
+    }
+
+    /// Vuelve a pedir a los programas que registren sus iconos.
+    pub fn announce_again(&self) {
+        self.announced.set(std::time::Instant::now());
+        log("Se vuelven a pedir los iconos a los programas");
+        announce();
     }
 }
 
@@ -357,7 +376,9 @@ fn announce() {
     unsafe {
         let message = RegisterWindowMessageW(w!("TaskbarCreated"));
         if message != 0 {
-            let _ = SendNotifyMessageW(HWND_BROADCAST, message, WPARAM(0), LPARAM(0));
+            // En cola: las ventanas de GlassBar también lo reciben, y si se les
+            // entregase en el acto lo harían mientras GlassBar está ocupado avisando.
+            let _ = PostMessageW(Some(HWND_BROADCAST), message, WPARAM(0), LPARAM(0));
         }
     }
 }

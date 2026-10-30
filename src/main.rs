@@ -90,6 +90,8 @@ const TIMER_ANIM: usize = 1;
 const TIMER_TICK: usize = 2;
 const TIMER_EDGE: usize = 3;
 const TIMER_TIP: usize = 4;
+/// Una vez, poco después de arrancar: vuelve a pedir los iconos de la bandeja.
+const TIMER_ANNOUNCE: usize = 5;
 
 /// Refresco del reloj y verificación de apps activas.
 const TICK_MS: u32 = 1000;
@@ -1820,6 +1822,12 @@ impl App {
 }
 
 unsafe extern "system" fn wndproc(hwnd: HWND, msg: u32, wparam: WPARAM, lparam: LPARAM) -> LRESULT {
+    // La barra se volvió a crear (Explorer reiniciado, o la bandeja propia pidiendo
+    // los iconos): se registra otra vez el icono de GlassBar.
+    if msg != 0 && msg == taskbar_created() {
+        with_app(|app| app.tray.register());
+        return LRESULT(0);
+    }
     match msg {
         // Cambió el color de énfasis (Windows avisa con estos dos mensajes, también
         // por otros ajustes): se vuelve a leer y, si es otro, se redibuja lo abierto.
@@ -2185,6 +2193,13 @@ unsafe extern "system" fn wndproc(hwnd: HWND, msg: u32, wparam: WPARAM, lparam: 
                         app.render();
                     }
                 });
+            } else if id == TIMER_ANNOUNCE {
+                with_app(|app| {
+                    let _ = KillTimer(Some(app.hwnd), TIMER_ANNOUNCE);
+                    if let Some(host) = &app.systray {
+                        host.announce_again();
+                    }
+                });
             } else if id == TIMER_TIP {
                 with_app(|app| {
                     let _ = KillTimer(Some(app.hwnd), TIMER_TIP);
@@ -2508,6 +2523,14 @@ unsafe extern "system" fn language_wndproc(
         _ => return DefWindowProcW(hwnd, msg, wparam, lparam),
     }
     LRESULT(0)
+}
+
+/// Mensaje "TaskbarCreated" que se anuncia a todos al crearse la barra.
+fn taskbar_created() -> u32 {
+    static MESSAGE: std::sync::OnceLock<u32> = std::sync::OnceLock::new();
+    *MESSAGE.get_or_init(|| unsafe {
+        windows::Win32::UI::WindowsAndMessaging::RegisterWindowMessageW(w!("TaskbarCreated"))
+    })
 }
 
 /// Hay un menú emergente abierto (clase `#32768`), de cualquier programa.
@@ -3408,6 +3431,10 @@ fn main() -> Result<()> {
 
         // Inicia el temporizador de proximidad al borde de pantalla (cada 60ms)
         let _ = SetTimer(Some(hwnd), TIMER_EDGE, EDGE_MS, None);
+
+        // Al arrancar, los programas pueden registrar sus iconos antes de que todo
+        // esté listo; se les vuelven a pedir con el bucle de mensajes ya en marcha.
+        let _ = SetTimer(Some(hwnd), TIMER_ANNOUNCE, 2000, None);
 
         APP.with(|cell| *cell.borrow_mut() = Some(app));
 
