@@ -11,6 +11,7 @@ use windows::Win32::UI::WindowsAndMessaging::{
 };
 
 pub fn load(path: &str) -> Option<Pixmap> {
+    let _p = crate::profile::scope("icons.load");
     use windows::Win32::System::Com::{CoInitializeEx, CoUninitialize, COINIT_APARTMENTTHREADED};
     // El Shell puede usar extensiones COM con cachés compartidas; serializar la
     // extracción también mantiene deterministas las cargas desde varios hilos.

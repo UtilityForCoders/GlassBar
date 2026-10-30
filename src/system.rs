@@ -128,7 +128,8 @@ fn run(receiver: Receiver<Command>, shared: Arc<Mutex<Snapshot>>, target: isize,
     unsafe {
         let _ = CoInitializeEx(None, COINIT_MULTITHREADED);
     }
-    let wmi = Brightness::connect();
+    crate::profile::name_thread("sistema (Wi-Fi, BT, audio)");
+    let wmi = crate::profile::time("system.wmi_connect", Brightness::connect);
     // Qué pantalla y por qué vía se controla; se recalcula en cada lectura por si
     // cambió el monitor principal o se conectó otro.
     let mut display = Display::None;
@@ -222,8 +223,9 @@ fn run(receiver: Receiver<Command>, shared: Arc<Mutex<Snapshot>>, target: isize,
         // Al abrir el panel se vuelve a mirar qué pantalla controla el brillo.
         let opened = commands.iter().any(|c| matches!(c, Command::Refresh));
         if opened {
-            display = Display::find(wmi.as_ref());
+            display = crate::profile::time("system.display_find", || Display::find(wmi.as_ref()));
         }
+        let _read = crate::profile::scope("system.read_all");
         if let Some(value) = last_brightness {
             display.set(wmi.as_ref(), value);
         }
@@ -231,8 +233,10 @@ fn run(receiver: Receiver<Command>, shared: Arc<Mutex<Snapshot>>, target: isize,
         if !opened && !reread {
             continue;
         }
-        let (wifi, bluetooth) = radios();
-        let networks = wlan.as_ref().and_then(Wlan::networks);
+        let (wifi, bluetooth) = crate::profile::time("system.radios", radios);
+        let networks = crate::profile::time("system.wifi_networks", || {
+            wlan.as_ref().and_then(Wlan::networks)
+        });
         if let Some((ssid, deadline)) = &joining {
             let connected = networks
                 .iter()
@@ -250,8 +254,8 @@ fn run(receiver: Receiver<Command>, shared: Arc<Mutex<Snapshot>>, target: isize,
         let snapshot = Snapshot {
             wifi,
             bluetooth,
-            brightness: display.get(wmi.as_ref()),
-            network: unsafe { network_name() },
+            brightness: crate::profile::time("system.brightness_get", || display.get(wmi.as_ref())),
+            network: crate::profile::time("system.network_name", || unsafe { network_name() }),
             networks,
             devices: if bluetooth == Some(true) {
                 crate::bluetooth::devices()
@@ -261,6 +265,7 @@ fn run(receiver: Receiver<Command>, shared: Arc<Mutex<Snapshot>>, target: isize,
             join_failed: join_failed.clone(),
             audio: crate::audio::read(&mut icons),
         };
+        drop(_read);
         if let Ok(mut shared) = shared.lock() {
             *shared = snapshot;
         }
@@ -672,4 +677,47 @@ impl Brightness {
             );
         }
     }
+}
+
+/// Con `--bench`: mide cada lectura del hilo de sistema por separado, en un hilo
+/// con COM como el suyo.
+#[cfg(feature = "profile")]
+pub fn bench() {
+    use crate::profile::{repeat, time};
+    let _ = std::thread::spawn(|| {
+        use windows::Win32::System::Com::{CoInitializeEx, COINIT_MULTITHREADED};
+        unsafe {
+            let _ = CoInitializeEx(None, COINIT_MULTITHREADED);
+        }
+        crate::profile::name_thread("bench sistema");
+        let wmi = time("bench.system.wmi_connect", Brightness::connect);
+        let mut display = Display::None;
+        repeat("bench.system.display_find", 5, || {
+            display = Display::find(wmi.as_ref())
+        });
+        repeat("bench.system.brightness_get", 10, || {
+            display.get(wmi.as_ref());
+        });
+        repeat("bench.system.radios", 10, || {
+            radios();
+        });
+        let wlan = time("bench.system.wlan_open", Wlan::open);
+        repeat("bench.system.wifi_networks", 10, || {
+            wlan.as_ref().and_then(Wlan::networks);
+        });
+        repeat("bench.system.network_name", 20, || unsafe {
+            network_name();
+        });
+        repeat("bench.system.bluetooth_devices", 3, || {
+            crate::bluetooth::devices();
+        });
+        let mut icons = std::collections::HashMap::new();
+        time("bench.system.audio_read (primera, sin iconos)", || {
+            crate::audio::read(&mut icons)
+        });
+        repeat("bench.system.audio_read", 10, || {
+            crate::audio::read(&mut icons);
+        });
+    })
+    .join();
 }

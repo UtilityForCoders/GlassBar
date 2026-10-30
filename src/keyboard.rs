@@ -198,6 +198,7 @@ pub fn describe(hkl: isize) -> Layout {
 }
 
 fn read_layout(hkl: isize) -> Layout {
+    let _p = crate::profile::scope("keyboard.read_layout (registro)");
     let language_id = (hkl as usize & 0xffff) as u32;
     let device = ((hkl as usize >> 16) & 0xffff) as u16;
     let mut buffer = [0u16; 85];
@@ -233,6 +234,7 @@ fn read_layout(hkl: isize) -> Layout {
 
 /// Teclados instalados.
 pub fn installed() -> Vec<isize> {
+    let _p = crate::profile::scope("keyboard.installed");
     unsafe {
         let count = GetKeyboardLayoutList(None).max(0) as usize;
         let mut list = vec![HKL::default(); count];
@@ -245,6 +247,7 @@ pub fn installed() -> Vec<isize> {
 /// Teclado de la ventana activa; `None` si solo hay uno instalado (Windows tampoco
 /// muestra el indicador entonces).
 pub fn current() -> Option<Layout> {
+    let _p = crate::profile::scope("keyboard.current");
     use windows::Win32::UI::WindowsAndMessaging::{GetForegroundWindow, GetWindowThreadProcessId};
     if installed().len() < 2 {
         return None;

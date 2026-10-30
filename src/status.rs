@@ -204,19 +204,20 @@ pub fn draw_battery(
 
 /// Lee el estado actual de red, audio y batería.
 pub fn read() -> Status {
+    let _p = crate::profile::scope("status.read");
     use windows::Win32::System::Com::{CoInitializeEx, CoUninitialize, COINIT_APARTMENTTHREADED};
     unsafe {
         let initialized = CoInitializeEx(None, COINIT_APARTMENTTHREADED).is_ok();
         let status = Status {
-            link: link(),
-            internet: internet(),
-            volume: endpoint().and_then(|v| {
+            link: crate::profile::time("status.read.link", || link()),
+            internet: crate::profile::time("status.read.internet", || internet()),
+            volume: crate::profile::time("status.read.volume", || endpoint()).and_then(|v| {
                 Some(Volume {
                     level: v.GetMasterVolumeLevelScalar().ok()?,
                     muted: v.GetMute().ok()?.as_bool(),
                 })
             }),
-            battery: battery(),
+            battery: crate::profile::time("status.read.battery", || battery()),
         };
         if initialized {
             CoUninitialize();

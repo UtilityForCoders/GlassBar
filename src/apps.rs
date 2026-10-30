@@ -140,6 +140,16 @@ pub fn focus_window(hwnd: isize) -> bool {
     }
 }
 
+/// Memoria de los iconos de una app: el original y el reducido al tamaño del dock.
+#[cfg(feature = "profile")]
+impl AppItem {
+    pub fn icon_bytes(&self) -> usize {
+        let original = self.icon.as_ref().map_or(0, |i| i.data().len());
+        let scaled = self.scaled.borrow().as_ref().map_or(0, |i| i.data().len());
+        original + scaled
+    }
+}
+
 pub fn launch_entry(entry: &AppEntry) -> bool {
     let command: Vec<u16> = OsStr::new(&entry.command)
         .encode_wide()
@@ -199,6 +209,7 @@ impl OpenWindow {
 
 /// Descripción del archivo (p. ej. "Google Chrome"), como la muestra el Explorador.
 pub fn file_description(exe: &str) -> Option<String> {
+    let _p = crate::profile::scope("apps.file_description");
     use windows::Win32::Storage::FileSystem::{
         GetFileVersionInfoSizeW, GetFileVersionInfoW, VerQueryValueW,
     };
@@ -254,6 +265,7 @@ fn file_name(path: &str) -> &str {
 /// Marca los programas anclados con ventana abierta y mantiene en `open` los demás,
 /// en orden estable. Devuelve `true` si cambió la lista de programas abiertos.
 pub fn update_running_apps(pinned: &mut [AppItem], open: &mut Vec<AppItem>) -> bool {
+    let _p = crate::profile::scope("apps.update_running_apps");
     let windows = open_windows();
     let mut claimed = vec![false; windows.len()];
     for app in pinned.iter_mut() {
@@ -303,6 +315,7 @@ pub fn update_running_apps(pinned: &mut [AppItem], open: &mut Vec<AppItem>) -> b
 
 /// Ventanas que la barra nativa mostraría, de la más reciente a la más antigua.
 pub fn open_windows() -> Vec<OpenWindow> {
+    let _p = crate::profile::scope("apps.open_windows (EnumWindows)");
     let mut list: Vec<OpenWindow> = Vec::new();
     unsafe {
         let _ = EnumWindows(
@@ -381,6 +394,7 @@ unsafe extern "system" fn find_hosted_process(child: HWND, lparam: LPARAM) -> BO
 
 /// Ruta del ejecutable y, si es una app empaquetada, su AppUserModelID.
 pub fn process_info(pid: u32) -> Option<(String, Option<String>)> {
+    let _p = crate::profile::scope("apps.process_info");
     use windows::Win32::Storage::Packaging::Appx::GetApplicationUserModelId;
     if pid == 0 {
         return None;
@@ -488,6 +502,7 @@ pub fn draw_app_icon(
 /// Reduce promediando el área de origen que cubre cada píxel; evita el
 /// dentado del bicúbico al reducir varias veces. No amplía iconos pequeños.
 pub fn downscale(src: &Pixmap, side: u32) -> Pixmap {
+    let _p = crate::profile::scope("apps.downscale_icon");
     let (sw, sh) = (src.width(), src.height());
     if sw <= side && sh <= side {
         return src.clone();

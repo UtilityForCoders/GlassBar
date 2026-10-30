@@ -73,6 +73,7 @@ impl TaskbarReplacer {
         self.maintain();
     }
     pub fn maintain(&self) {
+        let _p = crate::profile::scope("shell.maintain");
         if !self.active {
             return;
         }

@@ -63,6 +63,10 @@ features = [
     "Win32_System_SystemInformation",
 ]
 
+[features]
+# Perfilador de CPU y memoria (ver PROFILING.md): cargo run --release --features profile
+profile = ["windows/Win32_System_ProcessStatus"]
+
 [profile.release]
 opt-level = 3
 lto = true

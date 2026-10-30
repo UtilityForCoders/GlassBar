@@ -24,6 +24,8 @@ mod keyboard;
 mod launcher;
 #[path = "../src/pins.rs"]
 mod pins;
+#[path = "../src/profile.rs"]
+mod profile;
 #[path = "../src/spring.rs"]
 mod spring;
 #[path = "../src/status.rs"]

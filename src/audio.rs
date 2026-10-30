@@ -79,6 +79,7 @@ unsafe fn outputs(enumerator: &IMMDeviceEnumerator) -> (Vec<Output>, Option<Stri
 
 /// Lee salidas y aplicaciones. `icons` guarda los iconos ya cargados entre lecturas.
 pub fn read(icons: &mut std::collections::HashMap<String, Option<Pixmap>>) -> Mixer {
+    let _p = crate::profile::scope("audio.read");
     unsafe {
         let Ok(enumerator) =
             CoCreateInstance::<_, IMMDeviceEnumerator>(&MMDeviceEnumerator, None, CLSCTX_ALL)

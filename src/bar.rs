@@ -306,14 +306,17 @@ impl BarState {
         let x = SHADOW_PAD_X * scale;
         let y = SHADOW_PAD_Y * scale;
         let cy = y + DOCK_H * scale / 2.0;
-        draw_transparent_dock(
-            pixmap,
-            x,
-            y,
-            self.dock_width() * scale,
-            DOCK_H * scale,
-            scale,
-        );
+        crate::profile::time("dock.draw.glass", || {
+            draw_transparent_dock(
+                pixmap,
+                x,
+                y,
+                self.dock_width() * scale,
+                DOCK_H * scale,
+                scale,
+            )
+        });
+        let apps_scope = crate::profile::scope("dock.draw.apps");
         let launcher_x = x + APP_START * scale / 2.0;
         if self.hovered == Some(HoverTarget::Launcher) {
             draw_hover(pixmap, launcher_x, cy, scale);
@@ -358,6 +361,8 @@ impl BarState {
             draw_hover(pixmap, cx, cy, scale);
             draw_app_icon(pixmap, app, cx, cy, ICON_SIZE, ICON_SIZE * 1.1, scale);
         }
+        drop(apps_scope);
+        let status_scope = crate::profile::scope("dock.draw.status+idioma");
         let arrow_x = self.overflow_center(scale);
         if self.hovered == Some(HoverTarget::Overflow) {
             draw_hover(pixmap, arrow_x, cy, scale);
@@ -412,6 +417,8 @@ impl BarState {
                 opacity * 0.95,
             );
         }
+        drop(status_scope);
+        let _clock = crate::profile::scope("dock.draw.clock");
         self.clock.draw(
             pixmap,
             x + (self.dock_width() - CLOCK_W / 2.0) * scale,

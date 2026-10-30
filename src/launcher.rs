@@ -149,6 +149,7 @@ pub struct LauncherState {
 }
 impl LauncherState {
     pub fn new(pinned: &[AppEntry]) -> Self {
+        let _p = crate::profile::scope("launcher.catalog_load (LauncherState::new)");
         let mut state = Self {
             apps: crate::catalog::installed(pinned),
             recent: Vec::new(),
@@ -192,7 +193,14 @@ impl LauncherState {
     }
     /// Carga de antemano los iconos de la vista inicial (anclados, recientes y más
     /// usadas), que es lo que más tarda la primera vez que se abre el lanzador.
+    /// Programas en el catálogo, iconos cargados y sus bytes (para el perfilador).
+    #[cfg(feature = "profile")]
+    pub fn memory(&self) -> (usize, usize, usize) {
+        let bytes = self.icons.values().flatten().map(|i| i.data().len()).sum();
+        (self.apps.len(), self.icons.len(), bytes)
+    }
     pub fn preload_icons(&mut self) {
+        let _p = crate::profile::scope("launcher.preload_icons");
         let entries: Vec<String> = self
             .pinned
             .iter()

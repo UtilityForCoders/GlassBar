@@ -80,6 +80,7 @@ pub fn raise(hwnd: HWND) {
 
 /// La ventana activa es de otra app y ocupa todo `monitor` sin barra de título.
 pub fn fullscreen_app(monitor: RECT) -> bool {
+    let _p = crate::profile::scope("priority.fullscreen_app");
     unsafe {
         let window = GetForegroundWindow();
         if window.is_invalid() {

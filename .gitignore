@@ -3,3 +3,6 @@
 *.pdb
 /dock_preview.bmp
 /dock_preview.png
+
+# Resultados del perfilador (PROFILING.md)
+/glassbar-profile

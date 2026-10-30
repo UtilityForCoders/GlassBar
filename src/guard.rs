@@ -12,9 +12,12 @@ const FLAG: &str = "--guard";
 /// Lanza el vigilante de este proceso. Si no se puede, GlassBar sigue igual que antes.
 pub fn spawn() {
     if let Ok(exe) = std::env::current_exe() {
-        let _ = Command::new(exe)
+        let child = Command::new(exe)
             .args([FLAG, &std::process::id().to_string()])
             .spawn();
+        if let Ok(child) = child {
+            crate::profile::set_guard(child.id());
+        }
     }
 }
 

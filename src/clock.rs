@@ -164,15 +164,16 @@ fn rasterize(text: &str, size: f32) -> Pixmap {
 
 type Glyph = std::rc::Rc<(fontdue::Metrics, Vec<u8>)>;
 
-/// Rasterizar un glifo es lo más caro de pintar texto; el lanzador redibuja
-/// decenas de nombres en cada cambio, así que cada glifo se rasteriza una vez.
+// Rasterizar un glifo es lo más caro de pintar texto; el lanzador redibuja
+// decenas de nombres en cada cambio, así que cada glifo se rasteriza una vez.
+thread_local! {
+    static GLYPHS: RefCell<std::collections::HashMap<(usize, char, u32), Glyph>> =
+        RefCell::new(std::collections::HashMap::new());
+}
+
 fn glyph(font: &Font, c: char, size: f32) -> Glyph {
-    thread_local! {
-        static CACHE: RefCell<std::collections::HashMap<(usize, char, u32), Glyph>> =
-            RefCell::new(std::collections::HashMap::new());
-    }
     let key = (font as *const Font as usize, c, size.to_bits());
-    CACHE.with(|cache| {
+    GLYPHS.with(|cache| {
         let mut cache = cache.borrow_mut();
         if let Some(glyph) = cache.get(&key) {
             return glyph.clone();
@@ -180,9 +181,20 @@ fn glyph(font: &Font, c: char, size: f32) -> Glyph {
         if cache.len() > 8192 {
             cache.clear();
         }
-        let glyph = Glyph::new(font.rasterize(c, size));
+        let glyph = crate::profile::time("text.glyph_rasterize (fallo de caché)", || {
+            Glyph::new(font.rasterize(c, size))
+        });
         cache.insert(key, glyph.clone());
         glyph
+    })
+}
+
+/// Glifos guardados en este hilo y los bytes de su cobertura (para el perfilador).
+#[cfg(feature = "profile")]
+pub fn glyph_cache() -> (usize, usize) {
+    GLYPHS.with(|cache| {
+        let cache = cache.borrow();
+        (cache.len(), cache.values().map(|g| g.1.len()).sum())
     })
 }
 
@@ -193,6 +205,7 @@ fn rasterize_with(font: &Font, text: &str, size: f32) -> Pixmap {
 /// Texto rasterizado y cuántos píxeles sube su glifo más alto sobre la línea base
 /// (la primera fila de la imagen).
 fn rasterize_line(font: &Font, text: &str, size: f32) -> (Pixmap, i32) {
+    let _p = crate::profile::scope("text.rasterize_line");
     let glyphs: Vec<Glyph> = text.chars().map(|c| glyph(font, c, size)).collect();
     let width = glyphs.iter().map(|g| g.0.advance_width).sum::<f32>().ceil() as u32 + 2;
     let top = glyphs

@@ -99,6 +99,7 @@ fn address_text(address: u64) -> String {
 
 /// Emparejados ahora mismo; vacío si no hay Bluetooth.
 pub fn devices() -> Vec<Device> {
+    let _p = crate::profile::scope("bluetooth.devices");
     use windows::Devices::Bluetooth::{
         BluetoothConnectionStatus, BluetoothDevice, BluetoothLEDevice,
     };

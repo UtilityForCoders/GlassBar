@@ -23,6 +23,7 @@ mod monitors;
 mod pins;
 mod preview;
 mod priority;
+mod profile;
 mod quick;
 mod shell;
 mod spring;
@@ -96,6 +97,11 @@ thread_local! {
     static APP: RefCell<Option<App>> = const { RefCell::new(None) };
 }
 
+/// Con `--features profile`, cuenta cada asignación de memoria (ver `profile`).
+#[cfg(feature = "profile")]
+#[global_allocator]
+static ALLOCATOR: profile::Counting = profile::Counting;
+
 fn with_app<R>(f: impl FnOnce(&mut App) -> R) -> Option<R> {
     APP.with(|cell| {
         let mut guard = cell.try_borrow_mut().ok()?;
@@ -154,6 +160,7 @@ impl Surface {
 
     /// Convierte RGBA premultiplicado de tiny-skia a BGRA premultiplicado de Windows DIB.
     fn copy_to_dib(&mut self) {
+        let _p = profile::scope("surface.copy_to_dib");
         let len = (self.width * self.height * 4) as usize;
         let dst = unsafe { std::slice::from_raw_parts_mut(self.bits, len) };
         for (d, s) in dst
@@ -214,6 +221,7 @@ impl Tooltip {
     }
     /// Muestra `text` centrado en `cx` con su borde inferior en `bottom` (coordenadas de pantalla).
     fn show(&mut self, text: &str, cx: i32, bottom: i32, left: i32, right: i32, scale: f32) {
+        let _p = profile::scope("tooltip.show");
         let size = 12.0 * scale;
         let text = clock::fit_text(text, size, 320.0 * scale);
         let width = (clock::text_width(&text, size) + 22.0 * scale).ceil() as u32;
@@ -349,7 +357,10 @@ impl LauncherWindow {
         })
     }
     fn render(&mut self) {
-        self.model.draw(&mut self.surface.pixmap, self.scale);
+        let _p = profile::scope("launcher.render");
+        profile::time("launcher.draw", || {
+            self.model.draw(&mut self.surface.pixmap, self.scale)
+        });
         self.surface.copy_to_dib();
         self.present();
     }
@@ -410,6 +421,7 @@ fn present_popup(
     visible: bool,
     animating: bool,
 ) {
+    let _p = profile::scope("popup.present");
     let now = Instant::now();
     let shown = transition.shown(now);
     let running = transition.running(now);
@@ -534,7 +546,10 @@ impl QuickWindow {
         };
     }
     fn render(&mut self) {
-        self.model.draw(&mut self.surface.pixmap, self.scale);
+        let _p = profile::scope("quick.render");
+        profile::time("quick.draw", || {
+            self.model.draw(&mut self.surface.pixmap, self.scale)
+        });
         self.surface.copy_to_dib();
         self.present();
     }
@@ -645,6 +660,7 @@ unsafe extern "system" fn quick_wndproc(
         }
         WM_QUICK_UPDATE => {
             with_app(|app| {
+                let _p = profile::scope("msg.quick_update");
                 if let Some(panel) = &mut app.quick {
                     panel.model.system = panel.backend.snapshot();
                     panel.model.settle(Instant::now());
@@ -1074,6 +1090,7 @@ fn prepare_launcher(
     let (sender, receiver) = std::sync::mpsc::channel();
     let pinned = pinned.to_vec();
     std::thread::spawn(move || {
+        profile::name_thread("carga del lanzador");
         let mut model = launcher::LauncherState::new(&pinned);
         model.preload_icons();
         let _ = sender.send(model);
@@ -1390,6 +1407,7 @@ impl App {
 
     /// Abre o cierra el panel rápido sobre los iconos de red, volumen y batería.
     fn toggle_quick(&mut self) {
+        let _p = profile::scope("quick.toggle");
         if let Some(panel) = self.quick.as_mut().filter(|p| p.visible) {
             panel.hide();
             return;
@@ -1417,6 +1435,7 @@ impl App {
     }
 
     fn toggle_launcher(&mut self) {
+        let _p = profile::scope("launcher.toggle");
         if self.launcher.as_ref().is_some_and(|menu| menu.visible) {
             if let Some(menu) = &mut self.launcher {
                 menu.hide();
@@ -1463,6 +1482,7 @@ impl App {
     /// Pone al día el indicador de idioma con el teclado de la ventana activa; si
     /// aparece o desaparece (al instalar o quitar teclados), el dock se reajusta.
     fn update_keyboard(&mut self) {
+        let _p = profile::scope("app.update_keyboard");
         let keyboard = keyboard::current();
         if keyboard == self.bar.keyboard {
             return;
@@ -1479,6 +1499,7 @@ impl App {
     /// Abre o cierra el panel de idioma sobre el indicador. El teclado elegido se
     /// aplica a la ventana que estaba activa al abrirlo.
     fn toggle_language(&mut self) {
+        let _p = profile::scope("language.toggle");
         if let Some(panel) = self.language.as_mut().filter(|p| p.visible) {
             panel.hide();
             return;
@@ -1506,6 +1527,7 @@ impl App {
     }
 
     fn check_priority(&mut self, raise: bool) {
+        let _p = profile::scope("app.check_priority");
         let monitor = windows::Win32::Foundation::RECT {
             left: self.screen_left,
             top: self.screen_top,
@@ -1539,6 +1561,7 @@ impl App {
 
     /// Ajusta tamaño y posición del dock al número de iconos.
     fn relayout(&mut self) {
+        let _p = profile::scope("dock.relayout");
         let (rc, dpi) = monitors::get_info(monitors::primary());
         self.scale = dpi.min((rc.right - rc.left) as f32 / (self.bar.dock_width() + 40.0));
         let (width, height) = self.bar.window_size(self.scale);
@@ -1633,6 +1656,7 @@ impl App {
 
     /// Muestra la vista previa de las ventanas del programa `target`, si tiene alguna.
     fn show_preview(&mut self, target: HoverTarget) -> bool {
+        let _p = profile::scope("preview.show");
         if !matches!(target, HoverTarget::PrimaryApp(_) | HoverTarget::OpenApp(_)) {
             return false;
         }
@@ -1678,6 +1702,7 @@ impl App {
     /// Cierra la vista previa si el cursor ya no está ni en ella ni en su programa
     /// desde hace un momento (el justo para pasar del icono al panel).
     fn check_preview(&mut self, cursor: POINT, now: Instant) {
+        let _p = profile::scope("edge.check_preview");
         let Some(preview) = self.preview.as_mut().filter(|p| p.visible) else {
             return;
         };
@@ -1700,6 +1725,7 @@ impl App {
 
     /// Actualiza únicamente la posición física de la ventana en pantalla sin redibujar
     fn update_position(&self) {
+        let _p = profile::scope("dock.update_layered");
         let size = SIZE {
             cx: self.surface.width as i32,
             cy: self.surface.height as i32,
@@ -1729,7 +1755,10 @@ impl App {
 
     /// Redibuja el dock en la superficie y lo envía al compositor
     fn render(&mut self) {
-        self.bar.draw(&mut self.surface.pixmap, self.scale);
+        let _p = profile::scope("dock.render");
+        profile::time("dock.draw", || {
+            self.bar.draw(&mut self.surface.pixmap, self.scale)
+        });
         self.surface.copy_to_dib();
         self.update_position();
     }
@@ -1777,6 +1806,7 @@ unsafe extern "system" fn wndproc(hwnd: HWND, msg: u32, wparam: WPARAM, lparam: 
         }
         WM_FOREGROUND => {
             with_app(|app| {
+                let _p = profile::scope("msg.foreground");
                 app.check_priority(true);
                 app.update_keyboard();
             });
@@ -1825,6 +1855,7 @@ unsafe extern "system" fn wndproc(hwnd: HWND, msg: u32, wparam: WPARAM, lparam: 
             let y = ((lparam.0 >> 16) & 0xffff) as i16 as f32;
 
             with_app(|app| {
+                let _p = profile::scope("msg.dock_mousemove");
                 // Al tocar la barra, expande hacia arriba de inmediato
                 app.expand();
 
@@ -2029,6 +2060,7 @@ unsafe extern "system" fn wndproc(hwnd: HWND, msg: u32, wparam: WPARAM, lparam: 
             let id = wparam.0;
             if id == TIMER_ANIM {
                 with_app(|app| {
+                    let _p = profile::scope("timer.anim (dock)");
                     let now = Instant::now();
                     let dt = now.duration_since(app.last_tick).as_secs_f32();
                     app.last_tick = now;
@@ -2055,8 +2087,20 @@ unsafe extern "system" fn wndproc(hwnd: HWND, msg: u32, wparam: WPARAM, lparam: 
                     }
                 });
             } else if id == TIMER_TICK {
+                #[cfg(feature = "profile")]
+                let finished = with_app(|app| {
+                    profile::time("profile.gauges (perfilador)", || app.profile_gauges());
+                    profile::sample()
+                })
+                .unwrap_or(false);
+                #[cfg(feature = "profile")]
+                if finished {
+                    with_app(|app| handle_menu_command(app, CMD_EXIT));
+                    return LRESULT(0);
+                }
                 with_app(|app| {
-                    app.shell.maintain();
+                    let _p = profile::scope("timer.tick");
+                    profile::time("tick.shell_maintain", || app.shell.maintain());
                     // Pasar a pantalla completa (F11) no cambia la ventana activa.
                     app.check_priority(false);
                     // Red, volumen y batería; si aparece o desaparece la batería cambia el ancho.
@@ -2075,9 +2119,10 @@ unsafe extern "system" fn wndproc(hwnd: HWND, msg: u32, wparam: WPARAM, lparam: 
                             panel.render();
                         }
                     }
-                    if apps::update_running_apps(&mut app.bar.primary_apps, &mut app.bar.open_apps)
-                        || resized
-                    {
+                    let changed = profile::time("tick.update_running_apps", || {
+                        apps::update_running_apps(&mut app.bar.primary_apps, &mut app.bar.open_apps)
+                    });
+                    if changed || resized {
                         app.relayout();
                     } else {
                         app.render();
@@ -2092,6 +2137,9 @@ unsafe extern "system" fn wndproc(hwnd: HWND, msg: u32, wparam: WPARAM, lparam: 
                 });
             } else if id == TIMER_EDGE {
                 with_app(|app| {
+                    let _p = profile::scope("timer.edge");
+                    #[cfg(feature = "profile")]
+                    profile::observe(app.profile_mode());
                     // Detección en el borde inferior de la pantalla para auto-hide
                     let mut pt = POINT::default();
                     unsafe {
@@ -2120,7 +2168,9 @@ unsafe extern "system" fn wndproc(hwnd: HWND, msg: u32, wparam: WPARAM, lparam: 
                             || app.preview.as_ref().is_some_and(|p| p.visible)
                             // El panel de iconos ocultos abierto sobre la flecha; se mira
                             // al final porque recorre las ventanas, y solo con el dock fuera.
-                            || (app.visibility.expanded && shell::overflow_window().is_some()),
+                            || (app.visibility.expanded
+                                && profile::time("edge.overflow_window", shell::overflow_window)
+                                    .is_some()),
                         Instant::now(),
                     );
                     if app.visibility.active() {
@@ -2242,6 +2292,7 @@ impl LanguageWindow {
         take_focus(self.hwnd);
     }
     fn render(&mut self) {
+        let _p = profile::scope("language.render");
         if let Some(surface) = &mut self.surface {
             self.model.draw(&mut surface.pixmap, self.scale);
             surface.copy_to_dib();
@@ -2556,6 +2607,7 @@ impl PreviewWindow {
     }
 
     fn render(&mut self) {
+        let _p = profile::scope("preview.render");
         let Some(surface) = &mut self.surface else {
             return;
         };
@@ -2797,6 +2849,254 @@ mod autohide_tests {
     }
 }
 
+/// Mediciones con `--features profile` (ver `profile` y PROFILING.md).
+#[cfg(feature = "profile")]
+impl App {
+    /// Qué hace el dock ahora, para repartir la CPU por estado.
+    fn profile_mode(&self) -> &'static str {
+        if self.launcher.as_ref().is_some_and(|l| l.visible) {
+            "lanzador"
+        } else if self.quick.as_ref().is_some_and(|q| q.visible) {
+            "panel rápido"
+        } else if self.language.as_ref().is_some_and(|l| l.visible) {
+            "panel de idioma"
+        } else if self.preview.as_ref().is_some_and(|p| p.visible) {
+            "vista previa"
+        } else if self.animating {
+            "animando"
+        } else if self.visibility.expanded {
+            "dock visible"
+        } else {
+            "dock oculto"
+        }
+    }
+
+    /// Tamaños de superficies y cachés, para ver qué ocupa la memoria.
+    fn profile_gauges(&self) {
+        let mb = |bytes: usize| bytes as f64 / 1048576.0;
+        let surface = |s: &Surface| {
+            format!(
+                "{}x{} px · {:.2} MB (pixmap + DIB)",
+                s.width,
+                s.height,
+                mb((s.width * s.height * 8) as usize)
+            )
+        };
+        profile::gauge("superficie: dock", surface(&self.surface));
+        if let Some(menu) = &self.launcher {
+            profile::gauge("superficie: lanzador", surface(&menu.surface));
+            let (apps, icons, bytes) = menu.model.memory();
+            profile::gauge(
+                "lanzador: catálogo e iconos",
+                format!("{apps} programas · {icons} iconos · {:.2} MB", mb(bytes)),
+            );
+        }
+        if let Some(panel) = &self.quick {
+            profile::gauge("superficie: panel rápido", surface(&panel.surface));
+        }
+        if let Some(surface_) = self.language.as_ref().and_then(|l| l.surface.as_ref()) {
+            profile::gauge("superficie: idioma", surface(surface_));
+        }
+        if let Some(surface_) = self.preview.as_ref().and_then(|p| p.surface.as_ref()) {
+            profile::gauge("superficie: vista previa", surface(surface_));
+        }
+        let items: Vec<&apps::AppItem> = self
+            .bar
+            .primary_apps
+            .iter()
+            .chain(&self.bar.open_apps)
+            .collect();
+        profile::gauge(
+            "dock: iconos de programas",
+            format!(
+                "{} programas · {:.2} MB",
+                items.len(),
+                mb(items.iter().map(|a| a.icon_bytes()).sum())
+            ),
+        );
+        profile::gauge(
+            "dock: ventanas abiertas",
+            items
+                .iter()
+                .map(|a| a.windows.len())
+                .sum::<usize>()
+                .to_string(),
+        );
+        let (glyphs, bytes) = clock::glyph_cache();
+        profile::gauge(
+            "caché de glifos (hilo UI)",
+            format!("{glyphs} glifos · {:.2} MB", mb(bytes)),
+        );
+    }
+
+    /// `--bench`: repite cada trabajo de la app muchas veces y escribe `bench.txt`.
+    fn bench(&mut self) {
+        use profile::{gauge, memory_now, repeat, time};
+        let mb = |bytes: f64| bytes / 1048576.0;
+        let delta = |label: &'static str, before: (u64, u64, i64)| {
+            let after = memory_now();
+            gauge(
+                label,
+                format!(
+                    "working set {:+.2} MB · privada {:+.2} MB · heap Rust {:+.2} MB",
+                    mb(after.0 as f64 - before.0 as f64),
+                    mb(after.1 as f64 - before.1 as f64),
+                    mb((after.2 - before.2) as f64)
+                ),
+            );
+        };
+        let now = memory_now();
+        gauge(
+            "memoria al iniciar",
+            format!(
+                "working set {:.2} MB · privada {:.2} MB · heap Rust {:.2} MB",
+                mb(now.0 as f64),
+                mb(now.1 as f64),
+                mb(now.2 as f64)
+            ),
+        );
+
+        // El dock.
+        repeat("bench.dock.render (draw+copia+envío)", 300, || {
+            self.render()
+        });
+        repeat("bench.dock.draw", 300, || {
+            self.bar.draw(&mut self.surface.pixmap, self.scale)
+        });
+        repeat("bench.dock.copy_to_dib", 300, || self.surface.copy_to_dib());
+        repeat("bench.dock.update_layered", 300, || self.update_position());
+        repeat("bench.dock.relayout", 20, || self.relayout());
+
+        // Lo que se hace cada segundo (TIMER_TICK) y cada 40 ms (TIMER_EDGE).
+        repeat("bench.tick.status_read", 50, || {
+            status::read();
+        });
+        repeat("bench.tick.keyboard_current", 200, || {
+            keyboard::current();
+        });
+        repeat("bench.tick.update_running_apps", 50, || {
+            apps::update_running_apps(&mut self.bar.primary_apps, &mut self.bar.open_apps);
+        });
+        repeat("bench.tick.check_priority", 200, || {
+            self.check_priority(false)
+        });
+        repeat("bench.tick.shell_maintain", 200, || self.shell.maintain());
+        repeat("bench.edge.overflow_window", 300, || {
+            shell::overflow_window();
+        });
+        repeat("bench.accent.refresh", 50, || {
+            accent::refresh();
+        });
+
+        // Lanzador: primera apertura, dibujo y búsqueda.
+        let before = memory_now();
+        time("bench.launcher.primera_apertura", || self.toggle_launcher());
+        delta("memoria: abrir el lanzador (Δ)", before);
+        if let Some(menu) = &mut self.launcher {
+            repeat("bench.launcher.render", 100, || menu.render());
+            for query in ["c", "ch", "chr", "chro", "x", "zzzz"] {
+                menu.model.edit(|field| field.clear());
+                time("bench.launcher.buscar+render", || {
+                    menu.model.insert_text(query);
+                    menu.render();
+                });
+            }
+            menu.model.edit(|field| field.clear());
+            for _ in 0..20 {
+                menu.model.scroll_by(40.0);
+                time("bench.launcher.scroll+render", || menu.render());
+            }
+            menu.hide();
+        }
+
+        // Panel rápido en cada vista.
+        let before = memory_now();
+        time("bench.quick.primera_apertura", || self.toggle_quick());
+        delta("memoria: abrir el panel rápido (Δ)", before);
+        if let Some(panel) = &mut self.quick {
+            repeat("bench.quick.render (principal)", 100, || panel.render());
+            for (name, view) in [
+                (
+                    "bench.quick.render (lista Wi-Fi)",
+                    quick::View::List(system::Radio::Wifi),
+                ),
+                (
+                    "bench.quick.render (lista Bluetooth)",
+                    quick::View::List(system::Radio::Bluetooth),
+                ),
+                ("bench.quick.render (audio)", quick::View::Audio),
+            ] {
+                panel.set_view(view);
+                repeat(name, 50, || panel.render());
+            }
+            panel.set_view(quick::View::Main);
+            panel.hide();
+        }
+
+        // Panel de idioma (solo si hay más de un teclado).
+        if self.bar.keyboard.is_some() {
+            time("bench.language.primera_apertura", || self.toggle_language());
+            if let Some(panel) = &mut self.language {
+                repeat("bench.language.render", 100, || panel.render());
+                panel.hide();
+            }
+        }
+
+        // Vista previa del primer programa con ventanas.
+        let target = (0..self.bar.primary_apps.len())
+            .map(HoverTarget::PrimaryApp)
+            .chain((0..self.bar.open_apps.len()).map(HoverTarget::OpenApp))
+            .find(|&t| self.bar.item_mut(t).is_some_and(|a| !a.windows.is_empty()));
+        if let Some(target) = target {
+            let before = memory_now();
+            repeat("bench.preview.show", 20, || {
+                self.show_preview(target);
+            });
+            delta("memoria: vista previa abierta (Δ)", before);
+            if let Some(preview) = &mut self.preview {
+                repeat("bench.preview.render", 100, || preview.render());
+                preview.hide();
+            }
+        }
+
+        // Globo con el nombre.
+        let scale = self.scale;
+        if let Some(tip) = &mut self.tooltip {
+            repeat("bench.tooltip.show", 100, || {
+                tip.show("Explorador de archivos", 800, 1000, 0, 1920, scale)
+            });
+            tip.hide();
+        }
+
+        // Catálogo del lanzador leído desde cero (lo que hace el hilo al iniciar).
+        let pinned: Vec<_> = self
+            .bar
+            .primary_apps
+            .iter()
+            .map(|a| a.entry.clone())
+            .collect();
+        repeat("bench.launcher.catalog_load (desde cero)", 3, || {
+            launcher::LauncherState::new(&pinned);
+        });
+
+        // Lecturas del hilo de sistema (al abrir el panel rápido).
+        system::bench();
+
+        self.profile_gauges();
+        let now = memory_now();
+        gauge(
+            "memoria al terminar",
+            format!(
+                "working set {:.2} MB · privada {:.2} MB · heap Rust {:.2} MB",
+                mb(now.0 as f64),
+                mb(now.1 as f64),
+                mb(now.2 as f64)
+            ),
+        );
+        profile::write_bench();
+    }
+}
+
 fn main() -> Result<()> {
     if guard::run(&std::env::args().collect::<Vec<_>>()) {
         return Ok(());
@@ -2947,7 +3247,8 @@ fn main() -> Result<()> {
         )?;
 
         windows::Win32::UI::Shell::DragAcceptFiles(hwnd, true);
-        let mut app = App::new(hwnd)?;
+        profile::name_thread("interfaz (UI)");
+        let mut app = profile::time("startup.app_new", || App::new(hwnd))?;
         app.render();
 
         let _ = ShowWindow(hwnd, SW_SHOWNOACTIVATE);
@@ -2961,6 +3262,13 @@ fn main() -> Result<()> {
         // Inicia el temporizador de proximidad al borde de pantalla (cada 60ms)
         let _ = SetTimer(Some(hwnd), TIMER_EDGE, EDGE_MS, None);
 
+        #[cfg(feature = "profile")]
+        if profile::is_bench() {
+            app.bench();
+            app.shell.restore();
+            return Ok(());
+        }
+
         APP.with(|cell| *cell.borrow_mut() = Some(app));
 
         // La tecla Windows abre el lanzador propio; se quita al salir del bucle.
@@ -2969,11 +3277,15 @@ fn main() -> Result<()> {
 
         let mut msg = MSG::default();
         while GetMessageW(&mut msg, None, 0, 0).as_bool() {
+            profile::message(msg.message, msg.wParam.0);
+            let _p = profile::scope("loop.dispatch (todo mensaje; incluye menús modales)");
             let _ = TranslateMessage(&msg);
             DispatchMessageW(&msg);
         }
 
         APP.with(|cell| cell.borrow_mut().take());
+        #[cfg(feature = "profile")]
+        profile::finish();
     }
     Ok(())
 }

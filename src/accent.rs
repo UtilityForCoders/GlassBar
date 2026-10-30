@@ -61,6 +61,7 @@ pub fn from_color(argb: u32) -> Accent {
 }
 
 fn read() -> Accent {
+    let _p = crate::profile::scope("accent.read (registro)");
     use windows::core::w;
     use windows::Win32::System::Registry::{RegGetValueW, HKEY_CURRENT_USER, RRF_RT_REG_BINARY};
     let mut bytes = [0u8; 32];
