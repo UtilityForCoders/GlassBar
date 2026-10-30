@@ -69,6 +69,8 @@ pub enum AudioRow {
     Header(&'static str),
     /// Aviso en lugar de filas (sin aplicaciones, o sin salida por aplicación).
     Note(&'static str),
+    /// El último cambio de salida falló (el texto está en `Mixer::error`).
+    Error,
     /// Salida de audio, por su posición.
     Output(usize),
     /// Aplicación, por su posición.
@@ -81,7 +83,7 @@ impl AudioRow {
     fn height(self) -> f32 {
         match self {
             Self::Header(_) => 32.0,
-            Self::Note(_) => 40.0,
+            Self::Note(_) | Self::Error => 40.0,
             Self::Output(_) => 44.0,
             Self::App(_) => ROW,
             Self::Choice(..) => 36.0,
@@ -223,6 +225,9 @@ impl QuickState {
     pub fn audio_rows(&self) -> Vec<AudioRow> {
         let mixer = self.mixer();
         let mut rows = vec![AudioRow::Header("Salida")];
+        if mixer.error.is_some() {
+            rows.push(AudioRow::Error);
+        }
         rows.extend((0..mixer.outputs.len()).map(AudioRow::Output));
         rows.push(AudioRow::Header("Aplicaciones"));
         if !mixer.per_app {
@@ -520,7 +525,10 @@ impl QuickState {
             if self.view == View::Audio {
                 // Los títulos y avisos no se pulsan.
                 let row = self.audio_rows()[index];
-                let clickable = !matches!(row, AudioRow::Header(_) | AudioRow::Note(_));
+                let clickable = !matches!(
+                    row,
+                    AudioRow::Header(_) | AudioRow::Note(_) | AudioRow::Error
+                );
                 return (clickable && (PAD - 8.0..WIDTH - PAD + 8.0).contains(&x))
                     .then_some(Hit::Row(index));
             }
@@ -1297,6 +1305,18 @@ impl QuickState {
                     0.55,
                 );
             }
+            AudioRow::Error => {
+                let text = self.mixer().error.as_deref().unwrap_or_default();
+                let size = 12.0 * scale;
+                draw_text(
+                    image,
+                    &fit_text(text, size, (WIDTH - PAD * 2.0) * scale),
+                    PAD * scale,
+                    (top + 11.0) * scale,
+                    size,
+                    0.9,
+                );
+            }
             AudioRow::Output(output) => {
                 let Some(output) = mixer.outputs.get(output) else {
                     return;
@@ -1924,6 +1944,7 @@ mod tests {
             default: Some("a".into()),
             apps: vec![app("Discord", Some("b")), app("Spotify", None)],
             per_app: true,
+            error: None,
         }
     }
 
@@ -2006,6 +2027,15 @@ mod tests {
             Some(&AudioRow::Note("Esta versión de Windows no lo permite"))
         );
         assert!(!rows.iter().any(|r| matches!(r, AudioRow::App(_))));
+
+        // Si un cambio de salida falló, el aviso va arriba y no se pulsa.
+        quick.system.audio = Mixer {
+            error: Some("No se pudo cambiar la salida (0x80004002)".into()),
+            ..mixer()
+        };
+        assert_eq!(quick.audio_rows()[1], AudioRow::Error);
+        let center = LIST_Y + quick.row_top(1) + quick.row_height(1) / 2.0;
+        assert_eq!(quick.hit_test(WIDTH / 2.0, center), None);
     }
 
     #[test]
