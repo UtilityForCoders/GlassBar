@@ -37,6 +37,7 @@ El estado se lee una vez por segundo. Al pasar el cursor se muestra el detalle (
 Un clic en el grupo abre el panel rápido de GlassBar justo encima, con el estilo del lanzador:
 
 - **Wi-Fi** y **Bluetooth:** botones para encenderlos y apagarlos (API de radios de Windows); el de Wi-Fi muestra el nombre de la red conectada.
+- **Redes Wi-Fi:** la flecha **›** del botón de Wi-Fi abre la lista de redes cercanas (API WLAN), con la intensidad de la señal y un candado en las protegidas, la conectada primero y el resto por señal. Al abrirla se buscan redes y la lista se actualiza sola unos segundos después. Un clic conecta con una red guardada o desconecta la actual; las redes nuevas, que piden contraseña, abren la lista de Windows. **Más configuración de Wi-Fi** abre la configuración de Windows.
 - **Brillo:** barra para la pantalla donde está el dock (el monitor principal). Si es la integrada del portátil se usa WMI; si es un monitor externo, DDC/CI, el mismo canal que usa su menú (algunos monitores lo traen desactivado en sus ajustes). Si ninguna vía responde, la barra aparece como no disponible en lugar de cambiar el brillo de otra pantalla.
 - **Volumen:** barra de la salida predeterminada; el icono del altavoz silencia o quita el silencio.
 - **Pie:** nivel de batería (si la hay) y **Más opciones**, que abre el panel de Windows para lo demás.

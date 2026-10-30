@@ -25,6 +25,7 @@ mod system;
 mod textfield;
 mod tray;
 mod usage;
+mod wifi;
 mod winkey;
 
 use std::cell::RefCell;
@@ -540,8 +541,28 @@ impl QuickWindow {
             false,
         );
     }
+    /// Cambia entre la vista principal y la de redes. La de redes es más alta: el
+    /// panel crece hacia arriba y su borde inferior queda en el mismo sitio.
+    fn set_view(&mut self, view: quick::View) {
+        self.model.view = view;
+        self.model.hovered = None;
+        self.model.list_scroll = 0.0;
+        let height = (self.model.height() * self.scale).ceil() as u32;
+        if height == self.surface.height {
+            return;
+        }
+        if let Ok(surface) = Surface::new(self.surface.width, height) {
+            let bottom = self.pos.y + self.surface.height as i32;
+            self.surface = surface;
+            self.pos.y = bottom - height as i32;
+        }
+    }
     fn show(&mut self) {
         self.visible = true;
+        // Siempre abre en la vista principal, como el panel de Windows.
+        let anchor_bottom = self.pos.y + self.surface.height as i32;
+        self.set_view(quick::View::Main);
+        self.pos.y = anchor_bottom - self.surface.height as i32;
         // Lo último conocido mientras el hilo de sistema vuelve a leerlo.
         self.model.system = self.backend.snapshot();
         self.backend.refresh();
@@ -617,6 +638,7 @@ unsafe extern "system" fn quick_wndproc(
             with_app(|app| {
                 if let Some(panel) = &mut app.quick {
                     panel.model.system = panel.backend.snapshot();
+                    panel.model.settle(Instant::now());
                     if panel.visible {
                         panel.render();
                     }
@@ -711,6 +733,47 @@ unsafe extern "system" fn quick_wndproc(
                         panel.hide();
                         status::open_quick_settings();
                     }
+                    Some(quick::Hit::WifiList) => {
+                        panel.set_view(quick::View::Wifi);
+                        panel.backend.scan();
+                        panel.render();
+                    }
+                    Some(quick::Hit::Back) => {
+                        panel.set_view(quick::View::Main);
+                        panel.render();
+                    }
+                    Some(quick::Hit::Network(index)) => {
+                        let Some(network) = panel.model.networks().get(index).cloned() else {
+                            return;
+                        };
+                        let pending = |connect| quick::Pending {
+                            ssid: network.ssid.clone(),
+                            connect,
+                            since: Instant::now(),
+                        };
+                        if network.connected {
+                            panel.model.pending = Some(pending(false));
+                            panel.backend.disconnect();
+                        } else if let Some(profile) = network.profile.clone() {
+                            panel.model.pending = Some(pending(true));
+                            panel.backend.connect(profile);
+                        } else {
+                            // Red nueva: pide contraseña, así que se usa la lista de
+                            // Windows hasta que el panel tenga un campo para escribirla.
+                            panel.hide();
+                            let _ = std::process::Command::new("explorer.exe")
+                                .arg("ms-availablenetworks:")
+                                .spawn();
+                            return;
+                        }
+                        panel.render();
+                    }
+                    Some(quick::Hit::WifiSettings) => {
+                        panel.hide();
+                        let _ = std::process::Command::new("explorer.exe")
+                            .arg("ms-settings:network-wifi")
+                            .spawn();
+                    }
                     _ => {}
                 }
             });
@@ -721,13 +784,28 @@ unsafe extern "system" fn quick_wndproc(
                 let Some(panel) = app.quick.as_mut().filter(|p| p.visible) else {
                     return;
                 };
+                let steps = ((wparam.0 >> 16) & 0xffff) as i16 as f32 / 120.0;
+                // En la lista de redes, la rueda la desplaza (algo más de una red por muesca).
+                if panel.model.view == quick::View::Wifi {
+                    panel.model.scroll_list(-steps * 60.0);
+                    let (x, y) = {
+                        let mut cursor = POINT::default();
+                        let _ = GetCursorPos(&mut cursor);
+                        (
+                            (cursor.x - panel.pos.x) as f32 / panel.scale,
+                            (cursor.y - panel.pos.y) as f32 / panel.scale,
+                        )
+                    };
+                    panel.model.hovered = panel.model.hit_test(x, y);
+                    panel.render();
+                    return;
+                }
                 let slider = match panel.model.hovered {
                     Some(quick::Hit::Slider(slider)) => slider,
                     Some(quick::Hit::Mute) => quick::Slider::Volume,
                     _ => return,
                 };
                 if let Some(value) = panel.model.value(slider) {
-                    let steps = ((wparam.0 >> 16) & 0xffff) as i16 as f32 / 120.0;
                     let value = ((value * 50.0).round() + steps).clamp(0.0, 50.0) / 50.0;
                     panel.set_slider(slider, value);
                 }
