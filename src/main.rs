@@ -1246,7 +1246,10 @@ unsafe extern "system" fn wndproc(hwnd: HWND, msg: u32, wparam: WPARAM, lparam: 
                         (at_edge && !app.fullscreen)
                             || inside
                             || app.bar.drag.is_some()
-                            || app.launcher.as_ref().is_some_and(|l| l.visible),
+                            || app.launcher.as_ref().is_some_and(|l| l.visible)
+                            // El panel de iconos ocultos abierto sobre la flecha; se mira
+                            // al final porque recorre las ventanas, y solo con el dock fuera.
+                            || (app.visibility.expanded && shell::overflow_window().is_some()),
                         Instant::now(),
                     );
                     if app.visibility.active() {
