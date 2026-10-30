@@ -15,6 +15,7 @@ mod clock;
 mod glass;
 mod guard;
 mod icons;
+mod keyboard;
 mod launcher;
 mod monitors;
 mod pins;
@@ -1323,6 +1324,7 @@ impl App {
         let mut bar = BarState::new();
         apps::update_running_apps(&mut bar.primary_apps, &mut bar.open_apps);
         bar.status = status::read();
+        bar.keyboard = keyboard::current();
         let scale = scale.min((rc.right - rc.left) as f32 / (bar.dock_width() + 40.0));
         let (width, height) = bar.window_size(scale);
         let surface = Surface::new(width, height)?;
@@ -1438,6 +1440,75 @@ impl App {
 
     /// Con una app a pantalla completa el dock se aparta; si no, al cambiar de ventana
     /// (`raise`) vuelve a ponerse por encima de las demás, incluida la barra nativa.
+    /// Pone al día el indicador de idioma con el teclado de la ventana activa; si
+    /// aparece o desaparece (al instalar o quitar teclados), el dock se reajusta.
+    fn update_keyboard(&mut self) {
+        let keyboard = keyboard::current();
+        if keyboard == self.bar.keyboard {
+            return;
+        }
+        let resized = keyboard.is_some() != self.bar.keyboard.is_some();
+        self.bar.keyboard = keyboard;
+        if resized {
+            self.relayout();
+        } else {
+            self.render();
+        }
+    }
+
+    /// Menú con los teclados instalados, como el de idioma de Windows: el elegido se
+    /// aplica a la ventana que estaba activa.
+    fn show_language_menu(&mut self) {
+        use windows::Win32::UI::WindowsAndMessaging::{
+            AppendMenuW, CreatePopupMenu, DestroyMenu, GetForegroundWindow, SetForegroundWindow,
+            TrackPopupMenuEx, MF_CHECKED, MF_STRING, TPM_BOTTOMALIGN, TPM_CENTERALIGN,
+            TPM_RETURNCMD,
+        };
+        let current = self.bar.keyboard.as_ref().map(|k| k.id);
+        let layouts: Vec<_> = keyboard::installed()
+            .into_iter()
+            .map(keyboard::describe)
+            .collect();
+        unsafe {
+            // La ventana activa antes de que el menú se lleve el foco.
+            let target = GetForegroundWindow();
+            let Ok(menu) = CreatePopupMenu() else {
+                return;
+            };
+            for (index, layout) in layouts.iter().enumerate() {
+                let label = windows::core::HSTRING::from(layout.name.as_str());
+                let flags = if Some(layout.id) == current {
+                    MF_STRING | MF_CHECKED
+                } else {
+                    MF_STRING
+                };
+                let _ = AppendMenuW(menu, flags, index + 1, &label);
+            }
+            let x = self.pos.x + self.bar.language_center(self.scale).round() as i32;
+            // Obligatorio para que el menú se cierre al hacer clic fuera.
+            let _ = SetForegroundWindow(self.hwnd);
+            let chosen = TrackPopupMenuEx(
+                menu,
+                TPM_RETURNCMD.0 | TPM_CENTERALIGN.0 | TPM_BOTTOMALIGN.0,
+                x,
+                self.y_shown - (4.0 * self.scale).round() as i32,
+                self.hwnd,
+                None,
+            );
+            let _ = DestroyMenu(menu);
+            if !target.is_invalid() {
+                let _ = SetForegroundWindow(target);
+            }
+            if let Some(layout) = (chosen.0 as usize)
+                .checked_sub(1)
+                .and_then(|i| layouts.get(i))
+            {
+                keyboard::switch(target, layout.id);
+            }
+        }
+        self.update_keyboard();
+    }
+
     fn check_priority(&mut self, raise: bool) {
         let monitor = windows::Win32::Foundation::RECT {
             left: self.screen_left,
@@ -1505,6 +1576,7 @@ impl App {
                         | HoverTarget::OpenApp(_)
                         | HoverTarget::Overflow
                         | HoverTarget::Status(_)
+                        | HoverTarget::Language
                         | HoverTarget::Clock
                 )
             ) && self.bar.pressed.is_none()
@@ -1608,7 +1680,10 @@ impl App {
 unsafe extern "system" fn wndproc(hwnd: HWND, msg: u32, wparam: WPARAM, lparam: LPARAM) -> LRESULT {
     match msg {
         WM_FOREGROUND => {
-            with_app(|app| app.check_priority(true));
+            with_app(|app| {
+                app.check_priority(true);
+                app.update_keyboard();
+            });
             LRESULT(0)
         }
         WM_SHOW_LAUNCHER => {
@@ -1755,6 +1830,12 @@ unsafe extern "system" fn wndproc(hwnd: HWND, msg: u32, wparam: WPARAM, lparam: 
                             app.bar.launcher_press.set_target(1.0);
                             app.toggle_launcher();
                         }
+                        HoverTarget::Language => {
+                            if let Some(tip) = &mut app.tooltip {
+                                tip.hide();
+                            }
+                            app.show_language_menu();
+                        }
                         HoverTarget::PrimaryApp(_) => {
                             if let Some(menu) = &mut app.launcher {
                                 menu.hide();
@@ -1881,6 +1962,8 @@ unsafe extern "system" fn wndproc(hwnd: HWND, msg: u32, wparam: WPARAM, lparam: 
                     app.check_priority(false);
                     // Red, volumen y batería; si aparece o desaparece la batería cambia el ancho.
                     let status = status::read();
+                    // El idioma también cambia con atajos (Win+Espacio, Alt+Mayús).
+                    app.update_keyboard();
                     let resized = status.items().len() != app.bar.status.items().len();
                     app.bar.status = status;
                     // El volumen puede cambiar con las teclas o desde otra app.

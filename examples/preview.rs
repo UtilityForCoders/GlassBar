@@ -16,6 +16,8 @@ mod clock;
 mod glass;
 #[path = "../src/icons.rs"]
 mod icons;
+#[path = "../src/keyboard.rs"]
+mod keyboard;
 #[path = "../src/launcher.rs"]
 mod launcher;
 #[path = "../src/pins.rs"]
