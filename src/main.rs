@@ -1791,6 +1791,14 @@ unsafe extern "system" fn wndproc(hwnd: HWND, msg: u32, wparam: WPARAM, lparam: 
         }
         WM_FOREGROUND => {
             with_app(|app| {
+                // Se abrió el Inicio nativo pese a todo: se abre el lanzador, que al
+                // llevarse el foco lo cierra (como hacer clic fuera de él).
+                if app.shell.is_active() && shell::native_start_open() {
+                    if !app.launcher.as_ref().is_some_and(|menu| menu.visible) {
+                        app.toggle_launcher();
+                    }
+                    return;
+                }
                 app.check_priority(true);
                 app.update_keyboard();
             });

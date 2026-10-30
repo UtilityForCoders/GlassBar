@@ -72,6 +72,10 @@ impl TaskbarReplacer {
         }
         self.maintain();
     }
+    /// GlassBar está sustituyendo la barra nativa.
+    pub fn is_active(&self) -> bool {
+        self.active
+    }
     pub fn maintain(&self) {
         if !self.active {
             return;
@@ -241,6 +245,21 @@ unsafe fn invoke_chevron(tray: HWND) -> bool {
         Ok(false)
     })();
     result.unwrap_or(false)
+}
+
+/// La ventana activa es el Inicio nativo. Puede abrirse aunque se filtre la tecla
+/// Windows: con una ventana de administrador activa (el filtro no ve sus teclas) o
+/// con Ctrl+Esc.
+pub fn native_start_open() -> bool {
+    unsafe {
+        let mut pid = 0;
+        GetWindowThreadProcessId(GetForegroundWindow(), Some(&mut pid));
+        crate::apps::process_info(pid).is_some_and(|(exe, _)| {
+            exe.rsplit('\\')
+                .next()
+                .is_some_and(|file| file.eq_ignore_ascii_case("StartMenuExperienceHost.exe"))
+        })
+    }
 }
 
 /// Ventana del panel de iconos ocultos, si está abierto. `FindWindowW` no la encuentra.
