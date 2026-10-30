@@ -171,6 +171,8 @@ fn run(
     let mut join_failed: Option<String> = None;
     // Iconos de las aplicaciones con audio, cargados una vez.
     let mut icons = std::collections::HashMap::new();
+    // El último cambio de salida de audio que falló, para mostrarlo en el panel.
+    let mut audio_error: Option<String> = None;
     // Última lista de dispositivos Bluetooth; si hay una lectura en curso, y si hace
     // falta otra al terminar (algo cambió mientras tanto).
     let mut devices: Vec<Device> = Vec::new();
@@ -230,11 +232,15 @@ fn run(
                     reread = true;
                 }
                 Command::DefaultOutput(id) => {
-                    crate::audio::set_default(id);
+                    audio_error = crate::audio::set_default(id)
+                        .err()
+                        .map(|e| format!("No se pudo cambiar la salida ({e})"));
                     reread = true;
                 }
                 Command::AppOutput(pids, id) => {
-                    crate::audio::set_app_output(pids, id.as_deref());
+                    audio_error = crate::audio::set_app_output(pids, id.as_deref())
+                        .err()
+                        .map(|e| format!("No se pudo cambiar la salida de la app ({e})"));
                     reread = true;
                 }
                 Command::BluetoothAudio(address, connected) => {
@@ -326,7 +332,10 @@ fn run(
                 Vec::new()
             },
             join_failed: join_failed.clone(),
-            audio: crate::audio::read(&mut icons),
+            audio: crate::audio::Mixer {
+                error: audio_error.clone(),
+                ..crate::audio::read(&mut icons)
+            },
         };
         if let Ok(mut shared) = shared.lock() {
             *shared = snapshot;

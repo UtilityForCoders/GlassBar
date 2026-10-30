@@ -41,6 +41,8 @@ pub struct Mixer {
     pub apps: Vec<App>,
     /// Esta versión de Windows permite elegir la salida de cada aplicación.
     pub per_app: bool,
+    /// El último cambio de salida falló: qué y con qué código de Windows.
+    pub error: Option<String>,
 }
 
 /// Salida de audio activa de cada dispositivo, y la predeterminada.
@@ -134,6 +136,7 @@ pub fn read(icons: &mut std::collections::HashMap<String, Option<Pixmap>>) -> Mi
             default,
             apps,
             per_app: policy.is_some(),
+            error: None,
         }
     }
 }
@@ -237,9 +240,37 @@ fn owner(pid: u32, processes: &std::collections::HashMap<u32, (u32, String)>) ->
     }
 }
 
+/// Ejecuta `work` en un hilo propio con COM en modo STA, como la configuración de
+/// sonido de Windows. Estas interfaces internas no tienen intermediario para pasar
+/// de un tipo de hilo a otro: pedidas desde el hilo de sistema (MTA), Windows las
+/// crea en otro hilo y la llamada falla.
+fn in_sta<R: Send + 'static>(work: impl FnOnce() -> R + Send + 'static) -> Option<R> {
+    use windows::Win32::System::Com::{CoInitializeEx, CoUninitialize, COINIT_APARTMENTTHREADED};
+    std::thread::spawn(move || unsafe {
+        let initialized = CoInitializeEx(None, COINIT_APARTMENTTHREADED).is_ok();
+        let result = work();
+        if initialized {
+            CoUninitialize();
+        }
+        result
+    })
+    .join()
+    .ok()
+}
+
+/// Código de un error de Windows, para mostrarlo ("0x80004002").
+fn code(result: HRESULT) -> String {
+    format!("0x{:08X}", result.0 as u32)
+}
+
 /// Cambia la salida predeterminada (para música y vídeo y para el resto, como hace
-/// Windows al elegir "Dispositivo predeterminado").
-pub fn set_default(id: &str) {
+/// Windows al elegir "Dispositivo predeterminado"). Si falla, dice en qué paso.
+pub fn set_default(id: &str) -> Result<(), String> {
+    let id = id.to_string();
+    in_sta(move || set_default_here(&id)).unwrap_or_else(|| Err("hilo de audio".into()))
+}
+
+fn set_default_here(id: &str) -> Result<(), String> {
     // CLSID de PolicyConfigClient e IID de IPolicyConfig (Windows 7 en adelante).
     const CLSID: GUID = GUID::from_u128(0x870af99c_171d_4f9e_af0d_e63df40c2bc9);
     const IID: GUID = GUID::from_u128(0xf8679f50_850a_41cf_9c72_430f290290c8);
@@ -247,30 +278,38 @@ pub fn set_default(id: &str) {
     type SetDefault = unsafe extern "system" fn(*mut c_void, PCWSTR, i32) -> HRESULT;
     let wide: Vec<u16> = id.encode_utf16().chain(Some(0)).collect();
     unsafe {
-        let Ok(client) = CoCreateInstance::<_, windows::core::IUnknown>(&CLSID, None, CLSCTX_ALL)
-        else {
-            return;
-        };
+        let client = CoCreateInstance::<_, windows::core::IUnknown>(&CLSID, None, CLSCTX_ALL)
+            .map_err(|e| format!("crear PolicyConfig {}", code(e.code())))?;
         let mut config = std::ptr::null_mut();
-        if client.query(&IID, &mut config).is_err() || config.is_null() {
-            return;
+        let found = client.query(&IID, &mut config);
+        if found.is_err() || config.is_null() {
+            return Err(format!("IPolicyConfig {}", code(found)));
         }
         let set: SetDefault = std::mem::transmute(method(config, 13));
+        let mut result = Ok(());
         for role in [eConsole, eMultimedia] {
-            let _ = set(config, PCWSTR(wide.as_ptr()), role.0);
+            let done = set(config, PCWSTR(wide.as_ptr()), role.0);
+            if done.is_err() && result.is_ok() {
+                result = Err(format!("SetDefaultEndpoint {}", code(done)));
+            }
         }
         release(config);
+        result
     }
 }
 
 /// Elige la salida de los procesos de una aplicación; `None` vuelve a la
 /// predeterminada. Windows lo recuerda para la próxima vez que se abra.
-pub fn set_app_output(pids: &[u32], id: Option<&str>) {
-    if let Some(policy) = Policy::open() {
-        for &pid in pids {
-            policy.set(pid, id);
-        }
-    }
+pub fn set_app_output(pids: &[u32], id: Option<&str>) -> Result<(), String> {
+    let (pids, id) = (pids.to_vec(), id.map(str::to_string));
+    in_sta(move || {
+        let policy = Policy::open().ok_or("AudioPolicyConfig no disponible")?;
+        pids.iter()
+            .map(|&pid| policy.set(pid, id.as_deref()))
+            .find(|r| r.is_err())
+            .unwrap_or(Ok(()))
+    })
+    .unwrap_or_else(|| Err("hilo de audio".into()))
 }
 
 /// Entrada `index` de la tabla de métodos de un objeto COM.
@@ -326,23 +365,28 @@ impl Policy {
 
     // Tras los 6 métodos de IInspectable vienen 19 que no se usan aquí; luego
     // SetPersistedDefaultAudioEndpoint (25) y GetPersistedDefaultAudioEndpoint (26).
-    fn set(&self, pid: u32, id: Option<&str>) {
+    fn set(&self, pid: u32, id: Option<&str>) -> Result<(), String> {
         type Set = unsafe extern "system" fn(*mut c_void, u32, i32, i32, *mut c_void) -> HRESULT;
         let device = id
             .map(|id| HSTRING::from(policy_id(id)))
             .unwrap_or_default();
+        let mut result = Ok(());
         unsafe {
             let set: Set = std::mem::transmute(method(self.factory, 25));
             for role in [eConsole, eMultimedia] {
-                let _ = set(
+                let done = set(
                     self.factory,
                     pid,
                     eRender.0,
                     role.0,
                     std::mem::transmute_copy(&device),
                 );
+                if done.is_err() && result.is_ok() {
+                    result = Err(format!("SetPersistedDefaultAudioEndpoint {}", code(done)));
+                }
             }
         }
+        result
     }
     fn get(&self, pid: u32) -> Option<String> {
         type Get =
