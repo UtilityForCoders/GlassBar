@@ -1,8 +1,9 @@
-//! Dock compacto: Inicio, programas anclados y hora.
+//! Dock compacto: Inicio, programas anclados, estado del sistema y hora.
 use crate::apps::{default_apps, draw_app_icon, draw_windows_start_icon, AppItem};
-use crate::clock::ClockRenderer;
+use crate::clock::{draw_icon, ClockRenderer};
 use crate::glass::{draw_hover, draw_running_dot, draw_transparent_dock};
 use crate::spring::Spring;
+use crate::status::{Item, Status};
 use tiny_skia::Pixmap;
 
 pub const DOCK_H: f32 = 52.0;
@@ -14,6 +15,10 @@ const APP_STEP: f32 = 46.0;
 const CLOCK_W: f32 = 78.0;
 const ICON_SIZE: f32 = 28.0;
 const OVERFLOW_W: f32 = 30.0;
+/// Grupo de red, volumen y batería: margen a cada lado y ancho de cada icono.
+const STATUS_PAD: f32 = 6.0;
+const STATUS_STEP: f32 = 24.0;
+const STATUS_ICON: f32 = 15.0;
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum HoverTarget {
@@ -23,6 +28,8 @@ pub enum HoverTarget {
     OpenApp(usize),
     /// Flecha que abre los iconos ocultos de la bandeja.
     Overflow,
+    /// Icono del grupo de estado (red, volumen o batería), por su posición.
+    Status(usize),
     Clock,
 }
 
@@ -46,6 +53,7 @@ pub struct BarState {
     pub launcher_press: Spring,
     pub hovered: Option<HoverTarget>,
     pub pressed: Option<HoverTarget>,
+    pub status: Status,
     clock: ClockRenderer,
 }
 
@@ -59,11 +67,28 @@ impl BarState {
             launcher_press: Spring::new(1.0, 340.0, 32.0),
             hovered: None,
             pressed: None,
+            status: Status::default(),
             clock: ClockRenderer::new(),
         }
     }
     pub fn dock_width(&self) -> f32 {
-        APP_START + self.item_count() as f32 * APP_STEP + OVERFLOW_W + CLOCK_W
+        APP_START + self.item_count() as f32 * APP_STEP + OVERFLOW_W + self.status_width() + CLOCK_W
+    }
+    fn status_width(&self) -> f32 {
+        STATUS_PAD * 2.0 + self.status.items().len() as f32 * STATUS_STEP
+    }
+    /// Borde izquierdo del grupo de estado, en unidades del dock.
+    fn status_left(&self) -> f32 {
+        APP_START + self.item_count() as f32 * APP_STEP + OVERFLOW_W
+    }
+    /// Centro horizontal del icono de estado `index`, en píxeles de la ventana.
+    fn status_center(&self, index: usize, scale: f32) -> f32 {
+        (SHADOW_PAD_X + self.status_left() + STATUS_PAD + (index as f32 + 0.5) * STATUS_STEP)
+            * scale
+    }
+    /// Qué muestra el icono de estado `index` (red, volumen o batería).
+    pub fn status_item(&self, index: usize) -> Option<Item> {
+        self.status.items().get(index).copied()
     }
     /// Centro horizontal de la flecha, en píxeles de la ventana.
     pub fn overflow_center(&self, scale: f32) -> f32 {
@@ -84,6 +109,10 @@ impl BarState {
     pub fn item_label(&self, target: HoverTarget, scale: f32) -> Option<(String, f32)> {
         if target == HoverTarget::Overflow {
             return Some(("Mostrar iconos ocultos".into(), self.overflow_center(scale)));
+        }
+        if let HoverTarget::Status(index) = target {
+            let item = self.status_item(index)?;
+            return Some((self.status.label(item), self.status_center(index, scale)));
         }
         let (i, (_, app)) = self.items().enumerate().find(|(_, (t, _))| *t == target)?;
         let cx = (SHADOW_PAD_X + APP_START + (i as f32 + 0.5) * APP_STEP) * scale;
@@ -224,8 +253,12 @@ impl BarState {
             Some(HoverTarget::PrimaryApp(index))
         } else if index < self.item_count() {
             Some(HoverTarget::OpenApp(index - self.primary_apps.len()))
-        } else if x < APP_START + self.item_count() as f32 * APP_STEP + OVERFLOW_W {
+        } else if x < self.status_left() {
             Some(HoverTarget::Overflow)
+        } else if x < self.status_left() + self.status_width() {
+            let index = ((x - self.status_left() - STATUS_PAD) / STATUS_STEP).floor();
+            let last = self.status.items().len() - 1;
+            Some(HoverTarget::Status((index.max(0.0) as usize).min(last)))
         } else {
             Some(HoverTarget::Clock)
         }
@@ -292,6 +325,29 @@ impl BarState {
             draw_hover(pixmap, arrow_x, cy, scale);
         }
         draw_chevron(pixmap, arrow_x, cy, scale);
+        // Como en Windows, el resaltado cubre el grupo entero: todo abre la configuración rápida.
+        if matches!(self.hovered, Some(HoverTarget::Status(_))) {
+            crate::apps::fill_rounded(
+                pixmap,
+                [255, 255, 255, 17],
+                x + (self.status_left() + 2.0) * scale,
+                cy - 19.0 * scale,
+                (self.status_width() - 4.0) * scale,
+                38.0 * scale,
+                10.0 * scale,
+            );
+        }
+        for (index, item) in self.status.items().into_iter().enumerate() {
+            let (glyph, opacity) = self.status.glyph(item);
+            draw_icon(
+                pixmap,
+                glyph,
+                self.status_center(index, scale),
+                cy,
+                STATUS_ICON * scale,
+                opacity * 0.95,
+            );
+        }
         self.clock.draw(
             pixmap,
             x + (self.dock_width() - CLOCK_W / 2.0) * scale,
@@ -376,6 +432,11 @@ mod tests {
     #[test]
     fn icons_and_clock_remain_clickable_without_overlap() {
         let mut bar = BarState::new();
+        // Con batería el grupo de estado tiene tres iconos.
+        bar.status.battery = Some(crate::status::Battery {
+            percent: 80,
+            plugged: false,
+        });
         for count in [0, 1, 5, 24] {
             bar.primary_apps = (0..count)
                 .map(|_| {
@@ -409,6 +470,12 @@ mod tests {
                     bar.hit_test(bar.overflow_center(scale), cy, scale),
                     Some(HoverTarget::Overflow)
                 );
+                for index in 0..bar.status.items().len() {
+                    assert_eq!(
+                        bar.hit_test(bar.status_center(index, scale), cy, scale),
+                        Some(HoverTarget::Status(index))
+                    );
+                }
                 assert_eq!(bar.hit_test(-1.0, cy, scale), None);
             }
         }

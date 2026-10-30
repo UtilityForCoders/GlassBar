@@ -19,6 +19,7 @@ mod pins;
 mod priority;
 mod shell;
 mod spring;
+mod status;
 mod textfield;
 mod tray;
 mod usage;
@@ -765,6 +766,7 @@ impl App {
 
         let mut bar = BarState::new();
         apps::update_running_apps(&mut bar.primary_apps, &mut bar.open_apps);
+        bar.status = status::read();
         let scale = scale.min((rc.right - rc.left) as f32 / (bar.dock_width() + 40.0));
         let (width, height) = bar.window_size(scale);
         let surface = Surface::new(width, height)?;
@@ -913,7 +915,12 @@ impl App {
             let _ = KillTimer(Some(self.hwnd), TIMER_TIP);
             if matches!(
                 self.bar.hovered,
-                Some(HoverTarget::PrimaryApp(_) | HoverTarget::OpenApp(_) | HoverTarget::Overflow)
+                Some(
+                    HoverTarget::PrimaryApp(_)
+                        | HoverTarget::OpenApp(_)
+                        | HoverTarget::Overflow
+                        | HoverTarget::Status(_)
+                )
             ) && self.bar.pressed.is_none()
             {
                 let _ = SetTimer(Some(self.hwnd), TIMER_TIP, TIP_MS, None);
@@ -1193,6 +1200,15 @@ unsafe extern "system" fn wndproc(hwnd: HWND, msg: u32, wparam: WPARAM, lparam: 
                                 app.screen_right,
                             );
                         }
+                        HoverTarget::Status(_) => {
+                            if let Some(menu) = &mut app.launcher {
+                                menu.hide();
+                            }
+                            if let Some(tip) = &mut app.tooltip {
+                                tip.hide();
+                            }
+                            status::open_quick_settings();
+                        }
                         HoverTarget::Clock => {
                             let _ = std::process::Command::new("explorer.exe")
                                 .arg("ms-settings:dateandtime")
@@ -1201,6 +1217,24 @@ unsafe extern "system" fn wndproc(hwnd: HWND, msg: u32, wparam: WPARAM, lparam: 
                     }
                     app.start_animating();
                     app.render();
+                }
+            });
+            LRESULT(0)
+        }
+
+        // La rueda sobre el volumen lo sube o lo baja, como en la barra de Windows.
+        windows::Win32::UI::WindowsAndMessaging::WM_MOUSEWHEEL => {
+            with_app(|app| {
+                let volume = matches!(
+                    app.bar.hovered,
+                    Some(HoverTarget::Status(i)) if app.bar.status_item(i) == Some(status::Item::Volume)
+                );
+                if volume {
+                    let delta = ((wparam.0 >> 16) & 0xffff) as i16 as f32 / 120.0;
+                    status::change_volume(delta);
+                    app.bar.status = status::read();
+                    app.render();
+                    app.restart_tooltip();
                 }
             });
             LRESULT(0)
@@ -1257,7 +1291,12 @@ unsafe extern "system" fn wndproc(hwnd: HWND, msg: u32, wparam: WPARAM, lparam: 
                     app.shell.maintain();
                     // Pasar a pantalla completa (F11) no cambia la ventana activa.
                     app.check_priority(false);
+                    // Red, volumen y batería; si aparece o desaparece la batería cambia el ancho.
+                    let status = status::read();
+                    let resized = status.items().len() != app.bar.status.items().len();
+                    app.bar.status = status;
                     if apps::update_running_apps(&mut app.bar.primary_apps, &mut app.bar.open_apps)
+                        || resized
                     {
                         app.relayout();
                     } else {
