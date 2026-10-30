@@ -401,17 +401,21 @@ pub fn process_info(pid: u32) -> Option<(String, Option<String>)> {
     }
     unsafe {
         let process = OpenProcess(PROCESS_QUERY_LIMITED_INFORMATION, false, pid).ok()?;
-        let mut buf = vec![0u16; 32768];
-        let mut len = buf.len() as u32;
-        let exe = QueryFullProcessImageNameW(
-            process,
-            PROCESS_NAME_WIN32,
-            PWSTR(buf.as_mut_ptr()),
-            &mut len,
-        )
-        .is_ok()
-        .then(|| String::from_utf16_lossy(&buf[..len as usize]));
-        let mut id = vec![0u16; 256];
+        // Se mira cada segundo por ventana: casi todas las rutas caben en el búfer
+        // de la pila, y solo las muy largas piden el máximo de Windows.
+        let read = |buf: &mut [u16]| {
+            let mut len = buf.len() as u32;
+            QueryFullProcessImageNameW(
+                process,
+                PROCESS_NAME_WIN32,
+                PWSTR(buf.as_mut_ptr()),
+                &mut len,
+            )
+            .is_ok()
+            .then(|| String::from_utf16_lossy(&buf[..len as usize]))
+        };
+        let exe = read(&mut [0u16; 1024]).or_else(|| read(&mut vec![0u16; 32768]));
+        let mut id = [0u16; 256];
         let mut id_len = id.len() as u32;
         let app_id =
             (GetApplicationUserModelId(process, &mut id_len, Some(PWSTR(id.as_mut_ptr()))).is_ok())

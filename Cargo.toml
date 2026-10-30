@@ -11,7 +11,8 @@ tiny-skia = { version = "0.12", default-features = false, features = ["std", "si
 windows-core = "0.62"
 serde = { version = "1", features = ["derive"] }
 serde_json = "1"
-fontdue = "0.9"
+# Lectura de fuentes TrueType (las letras se rasterizan en `font`).
+ttf-parser = "0.25"
 unicode-normalization = "0.1"
 
 [dependencies.windows]
@@ -41,6 +42,7 @@ features = [
     "Win32_NetworkManagement_WiFi",
     "Win32_Networking_NetworkListManager",
     "Win32_Networking_WinSock",
+    "Win32_System_IO",
     "Win32_System_LibraryLoader",
     "Win32_Security",
     "Win32_Security_Authentication_Identity",

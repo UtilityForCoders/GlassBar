@@ -14,6 +14,8 @@ mod bar;
 mod catalog;
 #[path = "../src/clock.rs"]
 mod clock;
+#[path = "../src/font.rs"]
+mod font;
 #[path = "../src/glass.rs"]
 mod glass;
 #[path = "../src/icons.rs"]

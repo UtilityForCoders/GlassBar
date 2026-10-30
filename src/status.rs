@@ -202,27 +202,157 @@ pub fn draw_battery(
     pixmap.fill_path(&path, &paint, tiny_skia::FillRule::Winding, identity, None);
 }
 
-/// Lee el estado actual de red, audio y batería.
-pub fn read() -> Status {
-    let _p = crate::profile::scope("status.read");
-    use windows::Win32::System::Com::{CoInitializeEx, CoUninitialize, COINIT_APARTMENTTHREADED};
-    unsafe {
-        let initialized = CoInitializeEx(None, COINIT_APARTMENTTHREADED).is_ok();
-        let status = Status {
-            link: crate::profile::time("status.read.link", || link()),
-            internet: crate::profile::time("status.read.internet", || internet()),
-            volume: crate::profile::time("status.read.volume", || endpoint()).and_then(|v| {
-                Some(Volume {
-                    level: v.GetMasterVolumeLevelScalar().ok()?,
-                    muted: v.GetMute().ok()?.as_bool(),
-                })
-            }),
-            battery: crate::profile::time("status.read.battery", || battery()),
+/// Lee el estado una vez por segundo reutilizando los objetos de Windows: crear el
+/// de audio y el de red en cada lectura costaba unos 11 ms por segundo. La red,
+/// que es lo más lento de mirar, solo se vuelve a leer cuando Windows avisa de que
+/// cambió alguna dirección IP, o cada 10 s por si cambió otra cosa (Internet).
+pub struct Reader {
+    devices: Option<windows::Win32::Media::Audio::IMMDeviceEnumerator>,
+    /// Salida predeterminada (su id) y su control de volumen.
+    endpoint: Option<(
+        String,
+        windows::Win32::Media::Audio::Endpoints::IAudioEndpointVolume,
+    )>,
+    network: Option<windows::Win32::Networking::NetworkListManager::INetworkListManager>,
+    changes: Option<AddressChanges>,
+    /// Última lectura de la red y cuándo se hizo.
+    last_network: Option<(std::time::Instant, Link, bool)>,
+}
+
+const NETWORK_EVERY: std::time::Duration = std::time::Duration::from_secs(10);
+
+impl Reader {
+    /// Se crea en el hilo de la interfaz, que queda con COM iniciado para siempre.
+    pub fn new() -> Self {
+        use windows::Win32::Media::Audio::MMDeviceEnumerator;
+        use windows::Win32::Networking::NetworkListManager::NetworkListManager;
+        use windows::Win32::System::Com::{
+            CoCreateInstance, CoInitializeEx, CLSCTX_ALL, COINIT_APARTMENTTHREADED,
         };
-        if initialized {
-            CoUninitialize();
+        unsafe {
+            let _ = CoInitializeEx(None, COINIT_APARTMENTTHREADED);
+            Self {
+                devices: CoCreateInstance(&MMDeviceEnumerator, None, CLSCTX_ALL).ok(),
+                endpoint: None,
+                network: CoCreateInstance(&NetworkListManager, None, CLSCTX_ALL).ok(),
+                changes: AddressChanges::new(),
+                last_network: None,
+            }
         }
-        status
+    }
+
+    pub fn read(&mut self) -> Status {
+        let _p = crate::profile::scope("status.read");
+        let now = std::time::Instant::now();
+        // Se mira el aviso siempre, para volver a vigilar aunque toque leer igual.
+        let changed = self.changes.as_mut().is_some_and(AddressChanges::changed);
+        let (link, internet) = match self.last_network {
+            Some((at, link, internet)) if !changed && now.duration_since(at) < NETWORK_EVERY => {
+                (link, internet)
+            }
+            _ => {
+                let link = crate::profile::time("status.read.link", || unsafe { link() });
+                let internet = crate::profile::time("status.read.internet", || self.internet());
+                self.last_network = Some((now, link, internet));
+                (link, internet)
+            }
+        };
+        Status {
+            link,
+            internet,
+            volume: crate::profile::time("status.read.volume", || self.volume()),
+            battery: crate::profile::time("status.read.battery", || unsafe { battery() }),
+        }
+    }
+
+    fn internet(&self) -> bool {
+        use windows::Win32::Networking::NetworkListManager::{
+            NLM_CONNECTIVITY_IPV4_INTERNET, NLM_CONNECTIVITY_IPV6_INTERNET,
+        };
+        let Some(manager) = &self.network else {
+            return unsafe { internet() };
+        };
+        unsafe { manager.GetConnectivity() }.is_ok_and(|c| {
+            c.0 & (NLM_CONNECTIVITY_IPV4_INTERNET.0 | NLM_CONNECTIVITY_IPV6_INTERNET.0) != 0
+        })
+    }
+
+    /// Volumen de la salida predeterminada. Su control solo se vuelve a pedir si la
+    /// salida cambió (otro dispositivo, o se desconectó).
+    fn volume(&mut self) -> Option<Volume> {
+        use windows::Win32::Media::Audio::{eConsole, eRender};
+        use windows::Win32::System::Com::{CoTaskMemFree, CLSCTX_ALL};
+        let devices = self.devices.as_ref()?;
+        unsafe {
+            let Ok(device) = devices.GetDefaultAudioEndpoint(eRender, eConsole) else {
+                self.endpoint = None;
+                return None;
+            };
+            let raw = device.GetId().ok()?;
+            let id = raw.to_string().unwrap_or_default();
+            CoTaskMemFree(Some(raw.0 as *const _));
+            if self.endpoint.as_ref().is_none_or(|(known, _)| *known != id) {
+                self.endpoint = device.Activate(CLSCTX_ALL, None).ok().map(|v| (id, v));
+            }
+            let (_, control) = self.endpoint.as_ref()?;
+            Some(Volume {
+                level: control.GetMasterVolumeLevelScalar().ok()?,
+                muted: control.GetMute().ok()?.as_bool(),
+            })
+        }
+    }
+}
+
+/// Aviso de Windows cuando cambia alguna dirección IP (conectar o desconectar la
+/// red), sin tener que preguntar cada segundo.
+struct AddressChanges {
+    overlapped: Box<windows::Win32::System::IO::OVERLAPPED>,
+    handle: windows::Win32::Foundation::HANDLE,
+}
+
+impl AddressChanges {
+    fn new() -> Option<Self> {
+        use windows::Win32::Foundation::{CloseHandle, ERROR_IO_PENDING};
+        use windows::Win32::NetworkManagement::IpHelper::NotifyAddrChange;
+        use windows::Win32::System::Threading::CreateEventW;
+        unsafe {
+            let event = CreateEventW(None, false, false, None).ok()?;
+            let overlapped = Box::new(windows::Win32::System::IO::OVERLAPPED {
+                hEvent: event,
+                ..Default::default()
+            });
+            let mut handle = Default::default();
+            if NotifyAddrChange(&mut handle, &*overlapped) != ERROR_IO_PENDING.0 {
+                let _ = CloseHandle(event);
+                return None;
+            }
+            Some(Self { overlapped, handle })
+        }
+    }
+
+    /// Si cambió alguna dirección desde la última vez; en ese caso vuelve a vigilar.
+    fn changed(&mut self) -> bool {
+        use windows::Win32::Foundation::WAIT_OBJECT_0;
+        use windows::Win32::NetworkManagement::IpHelper::NotifyAddrChange;
+        use windows::Win32::System::Threading::WaitForSingleObject;
+        unsafe {
+            if WaitForSingleObject(self.overlapped.hEvent, 0) != WAIT_OBJECT_0 {
+                return false;
+            }
+            let _ = NotifyAddrChange(&mut self.handle, &*self.overlapped);
+        }
+        true
+    }
+}
+
+impl Drop for AddressChanges {
+    fn drop(&mut self) {
+        use windows::Win32::Foundation::CloseHandle;
+        use windows::Win32::NetworkManagement::IpHelper::CancelIPChangeNotify;
+        unsafe {
+            let _ = CancelIPChangeNotify(&*self.overlapped);
+            let _ = CloseHandle(self.overlapped.hEvent);
+        }
     }
 }
 

@@ -13,6 +13,7 @@ mod bar;
 mod bluetooth;
 mod catalog;
 mod clock;
+mod font;
 mod glass;
 mod guard;
 mod icons;
@@ -78,6 +79,8 @@ const WM_FOREGROUND: u32 = windows::Win32::UI::WindowsAndMessaging::WM_APP + 3;
 const WM_DWMCOLORIZATIONCOLORCHANGED: u32 = 0x0320;
 /// El hilo de sistema terminó de leer Wi-Fi, Bluetooth, brillo y red.
 const WM_QUICK_UPDATE: u32 = windows::Win32::UI::WindowsAndMessaging::WM_APP + 4;
+/// El hilo de iconos del lanzador cargó alguno nuevo.
+const WM_LAUNCHER_ICONS: u32 = windows::Win32::UI::WindowsAndMessaging::WM_APP + 5;
 
 const TIMER_ANIM: usize = 1;
 const TIMER_TICK: usize = 2;
@@ -312,7 +315,7 @@ struct LauncherWindow {
 impl LauncherWindow {
     fn new(
         owner: HWND,
-        model: launcher::LauncherState,
+        mut model: launcher::LauncherState,
         dock_left: i32,
         dock_top: i32,
     ) -> Result<Self> {
@@ -346,6 +349,11 @@ impl LauncherWindow {
                 None,
             )?
         };
+        model.load_icons_with(launcher::IconLoader::start(
+            scale,
+            hwnd.0 as isize,
+            WM_LAUNCHER_ICONS,
+        ));
         Ok(Self {
             hwnd,
             surface,
@@ -1123,6 +1131,13 @@ unsafe extern "system" fn launcher_wndproc(
                 }
             });
         }
+        WM_LAUNCHER_ICONS => {
+            with_app(|app| {
+                if let Some(menu) = app.launcher.as_mut().filter(|m| m.visible) {
+                    menu.render();
+                }
+            });
+        }
         WM_TIMER if wparam.0 == TIMER_ANIM => {
             with_app(|app| {
                 if let Some(menu) = &mut app.launcher {
@@ -1342,6 +1357,8 @@ struct App {
     animating: bool,
     last_tick: Instant,
     mouse_tracked: bool,
+    /// Lee red, volumen y batería cada segundo.
+    status: status::Reader,
 }
 
 impl App {
@@ -1351,7 +1368,8 @@ impl App {
 
         let mut bar = BarState::new();
         apps::update_running_apps(&mut bar.primary_apps, &mut bar.open_apps);
-        bar.status = status::read();
+        let mut status_reader = status::Reader::new();
+        bar.status = status_reader.read();
         bar.keyboard = keyboard::current();
         let scale = scale.min((rc.right - rc.left) as f32 / (bar.dock_width() + 40.0));
         let (width, height) = bar.window_size(scale);
@@ -1402,6 +1420,7 @@ impl App {
             animating: false,
             last_tick: Instant::now(),
             mouse_tracked: false,
+            status: status_reader,
         })
     }
 
@@ -2031,7 +2050,7 @@ unsafe extern "system" fn wndproc(hwnd: HWND, msg: u32, wparam: WPARAM, lparam: 
                 if volume {
                     let delta = ((wparam.0 >> 16) & 0xffff) as i16 as f32 / 120.0;
                     status::change_volume(delta);
-                    app.bar.status = status::read();
+                    app.bar.status = app.status.read();
                     app.render();
                     app.restart_tooltip();
                 }
@@ -2104,10 +2123,11 @@ unsafe extern "system" fn wndproc(hwnd: HWND, msg: u32, wparam: WPARAM, lparam: 
                     // Pasar a pantalla completa (F11) no cambia la ventana activa.
                     app.check_priority(false);
                     // Red, volumen y batería; si aparece o desaparece la batería cambia el ancho.
-                    let status = status::read();
+                    let status = app.status.read();
                     // El idioma también cambia con atajos (Win+Espacio, Alt+Mayús).
                     app.update_keyboard();
                     let resized = status.items().len() != app.bar.status.items().len();
+                    let status_changed = status != app.bar.status;
                     app.bar.status = status;
                     // El volumen puede cambiar con las teclas o desde otra app.
                     if let Some(panel) = app.quick.as_mut().filter(|p| p.visible) {
@@ -2119,12 +2139,21 @@ unsafe extern "system" fn wndproc(hwnd: HWND, msg: u32, wparam: WPARAM, lparam: 
                             panel.render();
                         }
                     }
-                    let changed = profile::time("tick.update_running_apps", || {
+                    let running = |app: &App| -> Vec<bool> {
+                        app.bar.primary_apps.iter().map(|a| a.is_running).collect()
+                    };
+                    let was_running = running(app);
+                    let opened_or_closed = profile::time("tick.update_running_apps", || {
                         apps::update_running_apps(&mut app.bar.primary_apps, &mut app.bar.open_apps)
                     });
-                    if changed || resized {
+                    if opened_or_closed || resized {
                         app.relayout();
-                    } else {
+                    } else if status_changed
+                        || running(app) != was_running
+                        || app.bar.clock_outdated()
+                    {
+                        // Solo si algo de lo que se ve cambió: redibujar el dock entero
+                        // cada segundo era la mayor parte de su gasto en reposo.
                         app.render();
                     }
                 });
@@ -2969,7 +2998,7 @@ impl App {
 
         // Lo que se hace cada segundo (TIMER_TICK) y cada 40 ms (TIMER_EDGE).
         repeat("bench.tick.status_read", 50, || {
-            status::read();
+            self.status.read();
         });
         repeat("bench.tick.keyboard_current", 200, || {
             keyboard::current();
