@@ -1,8 +1,10 @@
 //! Panel rápido propio, que se abre sobre los iconos de red, volumen y batería:
 //! Wi-Fi y Bluetooth, brillo y volumen, con el estilo del lanzador. La flecha de los
-//! botones de Wi-Fi y Bluetooth abre la lista de redes o de dispositivos. "Más
-//! opciones" abre el panel de Windows para lo que este aún no tiene.
+//! botones de Wi-Fi y Bluetooth abre la lista de redes o de dispositivos, y la del
+//! volumen, la de salidas de audio y aplicaciones. "Más opciones" abre el panel de
+//! Windows para lo que este aún no tiene.
 use crate::apps::{fill_rounded, stroke_rounded};
+use crate::audio::Mixer;
 use crate::bluetooth::{Device, Kind};
 use crate::clock::{
     draw_icon_aligned, draw_text, draw_text_on_baseline, draw_text_semibold, fit_text,
@@ -27,7 +29,10 @@ const BRIGHTNESS_Y: f32 = 112.0;
 const VOLUME_Y: f32 = 160.0;
 const ROW_H: f32 = 40.0;
 const SLIDER_X: f32 = PAD + 40.0;
-const SLIDER_W: f32 = WIDTH - PAD - 44.0 - SLIDER_X;
+/// Las barras dejan sitio a la derecha para el porcentaje y, en la del volumen, la
+/// flecha que abre las salidas de audio.
+const SLIDER_W: f32 = WIDTH - PAD - 76.0 - SLIDER_X;
+const AUDIO_BUTTON: f32 = 28.0;
 const FOOTER_Y: f32 = 196.0;
 const MORE_W: f32 = 112.0;
 const BACKGROUND: [u8; 4] = [32, 32, 34, 246];
@@ -56,6 +61,34 @@ pub enum View {
     Main,
     /// Redes Wi-Fi o dispositivos Bluetooth.
     List(Radio),
+    /// Salidas de audio y aplicaciones que lo usan.
+    Audio,
+}
+
+/// Filas de la vista de audio.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum AudioRow {
+    Header(&'static str),
+    /// Aviso en lugar de filas (sin aplicaciones, o sin salida por aplicación).
+    Note(&'static str),
+    /// Salida de audio, por su posición.
+    Output(usize),
+    /// Aplicación, por su posición.
+    App(usize),
+    /// Salida que se puede elegir para la aplicación desplegada; `None` es la
+    /// predeterminada.
+    Choice(usize, Option<usize>),
+}
+impl AudioRow {
+    fn height(self) -> f32 {
+        match self {
+            Self::Header(_) => 32.0,
+            Self::Note(_) => 40.0,
+            Self::Output(_) => 44.0,
+            Self::App(_) => ROW,
+            Self::Choice(..) => 36.0,
+        }
+    }
 }
 
 /// Conexión o desconexión pedida y aún sin confirmar: de una red (por su nombre) o
@@ -91,6 +124,8 @@ pub enum Hit {
     More,
     /// Flecha de un botón: abre su lista.
     List(Radio),
+    /// Flecha junto al volumen: abre las salidas de audio.
+    AudioList,
     /// Volver de una lista a la vista principal.
     Back,
     /// Red o dispositivo de la lista, por su posición.
@@ -101,6 +136,8 @@ pub enum Hit {
     Password,
     JoinConfirm,
     JoinCancel,
+    /// Barra de desplazamiento de la lista.
+    Scrollbar,
 }
 
 #[derive(Default)]
@@ -114,12 +151,17 @@ pub struct QuickState {
     pub view: View,
     /// Desplazamiento de la lista.
     pub list_scroll: f32,
+    /// Arrastre de la barra de desplazamiento: dónde se agarró y el desplazamiento
+    /// que tenía la lista entonces.
+    pub scroll_drag: Option<(f32, f32)>,
     pub pending: Option<Pending>,
     /// Red nueva cuya contraseña se está escribiendo.
     pub join: Option<JoinEditor>,
     /// Red nueva a la que se intenta conectar: si Windows dice que falló, su
     /// formulario vuelve a abrirse con el aviso.
     pub joining: Option<JoinEditor>,
+    /// Aplicación con su lista de salidas desplegada (por la ruta de su ejecutable).
+    pub audio_app: Option<String>,
 }
 
 fn tile_x(radio: Radio) -> f32 {
@@ -133,6 +175,14 @@ fn back_rect() -> (f32, f32, f32, f32) {
 }
 fn settings_rect() -> (f32, f32, f32, f32) {
     (PAD - 6.0, LIST_FOOTER_Y + 10.0, 240.0, 32.0)
+}
+fn audio_button_rect() -> (f32, f32, f32, f32) {
+    (
+        WIDTH - PAD - AUDIO_BUTTON + 4.0,
+        VOLUME_Y - AUDIO_BUTTON / 2.0,
+        AUDIO_BUTTON,
+        AUDIO_BUTTON,
+    )
 }
 fn more_rect() -> (f32, f32, f32, f32) {
     (WIDTH - PAD - MORE_W, FOOTER_Y + 8.0, MORE_W, 32.0)
@@ -164,7 +214,46 @@ impl QuickState {
     pub fn height(&self) -> f32 {
         match self.view {
             View::Main => HEIGHT,
-            View::List(_) => LIST_HEIGHT,
+            View::List(_) | View::Audio => LIST_HEIGHT,
+        }
+    }
+    pub fn mixer(&self) -> &Mixer {
+        &self.system.audio
+    }
+    /// Filas de la vista de audio: salidas y aplicaciones, con las salidas posibles
+    /// bajo la aplicación desplegada.
+    pub fn audio_rows(&self) -> Vec<AudioRow> {
+        let mixer = self.mixer();
+        let mut rows = vec![AudioRow::Header("Salida")];
+        rows.extend((0..mixer.outputs.len()).map(AudioRow::Output));
+        rows.push(AudioRow::Header("Aplicaciones"));
+        if !mixer.per_app {
+            rows.push(AudioRow::Note("Esta versión de Windows no lo permite"));
+        } else if mixer.apps.is_empty() {
+            rows.push(AudioRow::Note("Ninguna aplicación está usando el audio"));
+        }
+        if mixer.per_app {
+            for (index, app) in mixer.apps.iter().enumerate() {
+                rows.push(AudioRow::App(index));
+                if self.audio_app.as_deref() == Some(app.path.as_str()) {
+                    rows.push(AudioRow::Choice(index, None));
+                    rows.extend((0..mixer.outputs.len()).map(|o| AudioRow::Choice(index, Some(o))));
+                }
+            }
+        }
+        rows
+    }
+    /// Nombre de la salida que usa una aplicación.
+    fn app_output_name(&self, output: Option<&str>) -> String {
+        match output {
+            None => "Predeterminada".into(),
+            Some(id) => self
+                .mixer()
+                .outputs
+                .iter()
+                .find(|o| o.id == id)
+                .map(|o| o.name.clone())
+                .unwrap_or_else(|| "Salida desconectada".into()),
         }
     }
     pub fn networks(&self) -> &[Network] {
@@ -179,6 +268,7 @@ impl QuickState {
             View::Main => 0,
             View::List(Radio::Wifi) => self.networks().len(),
             View::List(Radio::Bluetooth) => self.devices().len(),
+            View::Audio => self.audio_rows().len(),
         }
     }
     /// La fila tiene el formulario de contraseña desplegado.
@@ -190,11 +280,48 @@ impl QuickState {
                 .is_some_and(|j| self.networks().get(index).is_some_and(|n| n.ssid == j.ssid))
     }
     fn row_height(&self, index: usize) -> f32 {
+        if self.view == View::Audio {
+            return self.audio_rows().get(index).map_or(ROW, |r| r.height());
+        }
         ROW + if self.expanded(index) { EDITOR_H } else { 0.0 }
     }
     /// Borde superior de la fila dentro de la lista, sin desplazar.
     fn row_top(&self, index: usize) -> f32 {
+        if self.view == View::Audio {
+            return self
+                .audio_rows()
+                .iter()
+                .take(index)
+                .map(|r| r.height())
+                .sum();
+        }
         (0..index).map(|i| self.row_height(i)).sum()
+    }
+    /// Despliega u oculta las salidas que se pueden elegir para una aplicación.
+    pub fn toggle_audio_app(&mut self, app: usize) {
+        let path = self.mixer().apps.get(app).map(|a| a.path.clone());
+        self.audio_app = if self.audio_app == path { None } else { path };
+        self.list_scroll = self.list_scroll.clamp(0.0, self.max_list_scroll());
+        if let Some(index) = self
+            .audio_rows()
+            .iter()
+            .position(|r| *r == AudioRow::App(app))
+            .filter(|_| self.audio_app.is_some())
+        {
+            // Que se vean las salidas recién desplegadas.
+            let rows = self.audio_rows();
+            let bottom = self.row_top(index)
+                + rows[index..]
+                    .iter()
+                    .take_while(
+                        |r| matches!(r, AudioRow::App(i) | AudioRow::Choice(i, _) if *i == app),
+                    )
+                    .map(|r| r.height())
+                    .sum::<f32>();
+            if bottom - self.list_scroll > Self::list_height() {
+                self.list_scroll = (bottom - Self::list_height()).min(self.row_top(index));
+            }
+        }
     }
     fn list_height() -> f32 {
         LIST_FOOTER_Y - LIST_Y
@@ -203,6 +330,47 @@ impl QuickState {
         (self.row_top(self.rows()) - Self::list_height()).max(0.0)
     }
     /// Desplaza la lista (positivo: hacia abajo).
+    /// Tirador de la barra de desplazamiento (arriba y alto, en el panel); `None` si
+    /// todo cabe y no hace falta barra.
+    fn scroll_thumb(&self) -> Option<(f32, f32)> {
+        let max = self.max_list_scroll();
+        if self.view == View::Main || max <= 0.0 {
+            return None;
+        }
+        let track = Self::list_height() - 8.0;
+        let content = max + Self::list_height();
+        let height = (track * Self::list_height() / content).max(24.0);
+        Some((
+            LIST_Y + 4.0 + (track - height) * self.list_scroll / max,
+            height,
+        ))
+    }
+    /// Empieza a arrastrar la barra en `y`. Un clic fuera del tirador lo lleva antes
+    /// hasta ahí, como en Windows.
+    pub fn grab_scrollbar(&mut self, y: f32) {
+        let Some((top, height)) = self.scroll_thumb() else {
+            return;
+        };
+        if !(top..top + height).contains(&y) {
+            self.drag_scrollbar_from(top + height / 2.0, self.list_scroll, y);
+        }
+        self.scroll_drag = Some((y, self.list_scroll));
+    }
+    /// Sigue el arrastre de la barra con el cursor en `y`.
+    pub fn drag_scrollbar(&mut self, y: f32) {
+        if let Some((grab, start)) = self.scroll_drag {
+            self.drag_scrollbar_from(grab, start, y);
+        }
+    }
+    fn drag_scrollbar_from(&mut self, grab: f32, start: f32, y: f32) {
+        let Some((_, height)) = self.scroll_thumb() else {
+            return;
+        };
+        let room = (Self::list_height() - 8.0 - height).max(1.0);
+        let max = self.max_list_scroll();
+        self.list_scroll = (start + (y - grab) * max / room).clamp(0.0, max);
+    }
+
     pub fn scroll_list(&mut self, delta: f32) {
         self.list_scroll = (self.list_scroll + delta).clamp(0.0, self.max_list_scroll());
     }
@@ -326,7 +494,7 @@ impl QuickState {
     pub fn hit_test(&self, x: f32, y: f32) -> Option<Hit> {
         let within =
             |rx: f32, ry: f32, w: f32, h: f32| x >= rx && x < rx + w && y >= ry && y < ry + h;
-        if let View::List(radio) = self.view {
+        if self.view != View::Main {
             let (bx, by, bw, bh) = back_rect();
             if within(bx, by, bw, bh) {
                 return Some(Hit::Back);
@@ -335,14 +503,29 @@ impl QuickState {
             if within(sx, sy, sw, sh) {
                 return Some(Hit::Settings);
             }
-            if self.radio(radio) != Some(true) || !(LIST_Y..LIST_FOOTER_Y).contains(&y) {
+            let enabled = match self.view {
+                View::List(radio) => self.radio(radio) == Some(true),
+                _ => true,
+            };
+            if !enabled || !(LIST_Y..LIST_FOOTER_Y).contains(&y) {
                 return None;
+            }
+            // La barra ocupa el borde derecho, a lo alto de toda la lista.
+            if self.scroll_thumb().is_some() && x >= WIDTH - 14.0 {
+                return Some(Hit::Scrollbar);
             }
             let content = y - LIST_Y + self.list_scroll;
             let index = (0..self.rows()).find(|&i| {
                 let top = self.row_top(i);
                 (top..top + self.row_height(i)).contains(&content)
             })?;
+            if self.view == View::Audio {
+                // Los títulos y avisos no se pulsan.
+                let row = self.audio_rows()[index];
+                let clickable = !matches!(row, AudioRow::Header(_) | AudioRow::Note(_));
+                return (clickable && (PAD - 8.0..WIDTH - PAD + 8.0).contains(&x))
+                    .then_some(Hit::Row(index));
+            }
             let inside = content - self.row_top(index);
             if inside < ROW {
                 return (PAD - 8.0..WIDTH - PAD + 8.0)
@@ -377,6 +560,10 @@ impl QuickState {
                 return Some(Hit::Tile(radio));
             }
         }
+        let (ax, ay, aw, ah) = audio_button_rect();
+        if within(ax, ay, aw, ah) {
+            return Some(Hit::AudioList);
+        }
         for slider in [Slider::Brightness, Slider::Volume] {
             let top = row_y(slider) - ROW_H / 2.0;
             if self.value(slider).is_none() {
@@ -402,11 +589,11 @@ impl QuickState {
     pub fn draw(&self, image: &mut Pixmap, scale: f32) {
         let footer_y = match self.view {
             View::Main => FOOTER_Y,
-            View::List(_) => LIST_FOOTER_Y,
+            View::List(_) | View::Audio => LIST_FOOTER_Y,
         };
         self.draw_chrome(image, footer_y, scale);
-        if let View::List(radio) = self.view {
-            self.draw_list(image, radio, scale);
+        if self.view != View::Main {
+            self.draw_list(image, scale);
             return;
         }
         self.draw_tile(image, Radio::Wifi, scale);
@@ -565,7 +752,7 @@ impl QuickState {
     }
 
     /// Vista de lista: cabecera con "volver", lista desplazable y pie.
-    fn draw_list(&self, image: &mut Pixmap, radio: Radio, scale: f32) {
+    fn draw_list(&self, image: &mut Pixmap, scale: f32) {
         let (bx, by, bw, bh) = back_rect();
         if self.hovered == Some(Hit::Back) {
             fill_rounded(
@@ -586,9 +773,10 @@ impl QuickState {
             13.0 * scale,
             0.9,
         );
-        let (title, settings) = match radio {
-            Radio::Wifi => ("Wi-Fi", "Más configuración de Wi-Fi"),
-            Radio::Bluetooth => ("Bluetooth", "Más configuración de Bluetooth"),
+        let (title, settings) = match self.view {
+            View::List(Radio::Wifi) => ("Wi-Fi", "Más configuración de Wi-Fi"),
+            View::List(Radio::Bluetooth) => ("Bluetooth", "Más configuración de Bluetooth"),
+            _ => ("Salida de audio", "Más configuración de sonido"),
         };
         draw_text_semibold(
             image,
@@ -599,14 +787,22 @@ impl QuickState {
             1.0,
         );
 
-        let message = match (radio, self.radio(radio), self.rows() == 0) {
-            (Radio::Wifi, Some(false), _) => Some("El Wi-Fi está desactivado"),
-            (Radio::Wifi, None, _) => Some("No hay adaptador Wi-Fi"),
-            (Radio::Wifi, Some(true), true) => Some("Buscando redes…"),
-            (Radio::Bluetooth, Some(false), _) => Some("El Bluetooth está desactivado"),
-            (Radio::Bluetooth, None, _) => Some("No hay Bluetooth"),
-            (Radio::Bluetooth, Some(true), true) => Some("No hay dispositivos emparejados"),
-            _ => None,
+        let state = match self.view {
+            View::List(radio) => (Some(radio), self.radio(radio), self.rows() == 0),
+            _ => (None, Some(true), self.mixer().outputs.is_empty()),
+        };
+        let message = match state {
+            (None, _, true) => Some("No hay salidas de audio"),
+            (None, _, false) => None,
+            (Some(radio), on, empty) => match (radio, on, empty) {
+                (Radio::Wifi, Some(false), _) => Some("El Wi-Fi está desactivado"),
+                (Radio::Wifi, None, _) => Some("No hay adaptador Wi-Fi"),
+                (Radio::Wifi, Some(true), true) => Some("Buscando redes…"),
+                (Radio::Bluetooth, Some(false), _) => Some("El Bluetooth está desactivado"),
+                (Radio::Bluetooth, None, _) => Some("No hay Bluetooth"),
+                (Radio::Bluetooth, Some(true), true) => Some("No hay dispositivos emparejados"),
+                _ => None,
+            },
         };
         if let Some(message) = message {
             let size = 13.0 * scale;
@@ -629,13 +825,15 @@ impl QuickState {
                 if top + self.row_height(index) < 0.0 || top > Self::list_height() {
                     continue;
                 }
-                match radio {
-                    Radio::Wifi => {
+                match self.view {
+                    View::Audio => self.draw_audio_row(&mut list, index, top, scale),
+                    View::List(Radio::Wifi) => {
                         self.draw_network(&mut list, index, &self.networks()[index], top, scale)
                     }
-                    Radio::Bluetooth => {
+                    View::List(Radio::Bluetooth) => {
                         self.draw_device(&mut list, index, &self.devices()[index], top, scale)
                     }
+                    View::Main => {}
                 }
             }
             image.draw_pixmap(
@@ -645,6 +843,20 @@ impl QuickState {
                 &tiny_skia::PixmapPaint::default(),
                 tiny_skia::Transform::identity(),
                 None,
+            );
+        }
+        // Barra fina que se ensancha al pasar el cursor o arrastrarla, como en Windows.
+        if let Some((top, height)) = self.scroll_thumb() {
+            let active = self.hovered == Some(Hit::Scrollbar) || self.scroll_drag.is_some();
+            let width = if active { 6.0 } else { 3.0 };
+            fill_rounded(
+                image,
+                [255, 255, 255, if active { 140 } else { 90 }],
+                (WIDTH - 6.0 - width) * scale,
+                top * scale,
+                width * scale,
+                height * scale,
+                width / 2.0 * scale,
             );
         }
 
@@ -1004,6 +1216,219 @@ impl QuickState {
         }
     }
 
+    /// Flecha junto al volumen que abre las salidas de audio, como en Windows.
+    fn draw_audio_button(&self, image: &mut Pixmap, scale: f32) {
+        let (x, y, w, h) = audio_button_rect();
+        if self.hovered == Some(Hit::AudioList) {
+            fill_rounded(
+                image,
+                [255, 255, 255, 20],
+                x * scale,
+                y * scale,
+                w * scale,
+                h * scale,
+                5.0 * scale,
+            );
+        }
+        draw_icon_aligned(
+            image,
+            '\u{E76C}',
+            (x + w / 2.0) * scale,
+            (y + h / 2.0) * scale,
+            12.0 * scale,
+            0.9,
+        );
+    }
+
+    fn draw_audio_row(&self, image: &mut Pixmap, index: usize, top: f32, scale: f32) {
+        let rows = self.audio_rows();
+        let Some(&row) = rows.get(index) else {
+            return;
+        };
+        let height = row.height();
+        let cy = top + height / 2.0;
+        let size = 13.0 * scale;
+        let (ascent, descent) = line_metrics(size);
+        let baseline = |cy: f32| cy * scale + (ascent - descent) / 2.0;
+        let hovered = self.hovered == Some(Hit::Row(index));
+        let highlight = |image: &mut Pixmap, left: f32, alpha: u8| {
+            fill_rounded(
+                image,
+                [255, 255, 255, alpha],
+                left * scale,
+                (top + 2.0) * scale,
+                (WIDTH - PAD + 6.0 - left) * scale,
+                (height - 4.0) * scale,
+                6.0 * scale,
+            );
+        };
+        let check = |image: &mut Pixmap| {
+            draw_icon_aligned(
+                image,
+                '\u{E73E}',
+                (WIDTH - PAD - 10.0) * scale,
+                cy * scale,
+                12.0 * scale,
+                0.95,
+            );
+        };
+        let mixer = self.mixer();
+        match row {
+            AudioRow::Header(title) => {
+                draw_text_semibold(
+                    image,
+                    title,
+                    PAD * scale,
+                    (top + 12.0) * scale,
+                    12.0 * scale,
+                    0.7,
+                );
+            }
+            AudioRow::Note(text) => {
+                draw_text(
+                    image,
+                    text,
+                    PAD * scale,
+                    (top + 11.0) * scale,
+                    12.0 * scale,
+                    0.55,
+                );
+            }
+            AudioRow::Output(output) => {
+                let Some(output) = mixer.outputs.get(output) else {
+                    return;
+                };
+                let chosen = mixer.default.as_deref() == Some(output.id.as_str());
+                if hovered || chosen {
+                    highlight(image, PAD - 6.0, if hovered { 20 } else { 10 });
+                }
+                draw_icon_aligned(
+                    image,
+                    '\u{E7F5}',
+                    (PAD + 14.0) * scale,
+                    cy * scale,
+                    16.0 * scale,
+                    0.95,
+                );
+                let room = (WIDTH - PAD * 2.0 - 64.0) * scale;
+                draw_text_on_baseline(
+                    image,
+                    &fit_text(&output.name, size, room),
+                    (PAD + 40.0) * scale,
+                    baseline(cy),
+                    size,
+                    1.0,
+                );
+                if chosen {
+                    check(image);
+                }
+            }
+            AudioRow::App(app) => {
+                let Some(app) = mixer.apps.get(app) else {
+                    return;
+                };
+                let open = self.audio_app.as_deref() == Some(app.path.as_str());
+                if hovered || open {
+                    highlight(image, PAD - 6.0, if hovered { 20 } else { 10 });
+                }
+                self.draw_app_icon(image, app, PAD + 14.0, cy, scale);
+                let room = (WIDTH - PAD * 2.0 - 70.0) * scale;
+                draw_text(
+                    image,
+                    &fit_text(&app.name, size, room),
+                    (PAD + 40.0) * scale,
+                    (top + 9.0) * scale,
+                    size,
+                    1.0,
+                );
+                draw_text(
+                    image,
+                    &fit_text(
+                        &self.app_output_name(app.output.as_deref()),
+                        12.0 * scale,
+                        room,
+                    ),
+                    (PAD + 40.0) * scale,
+                    (top + 28.0) * scale,
+                    12.0 * scale,
+                    0.7,
+                );
+                // Flecha hacia abajo o hacia arriba, según esté desplegada.
+                draw_icon_aligned(
+                    image,
+                    if open { '\u{E70E}' } else { '\u{E70D}' },
+                    (WIDTH - PAD - 10.0) * scale,
+                    cy * scale,
+                    11.0 * scale,
+                    0.8,
+                );
+            }
+            AudioRow::Choice(app, output) => {
+                let Some(app) = mixer.apps.get(app) else {
+                    return;
+                };
+                let id = output
+                    .and_then(|o| mixer.outputs.get(o))
+                    .map(|o| o.id.as_str());
+                let chosen = app.output.as_deref() == id;
+                if hovered {
+                    highlight(image, PAD + 30.0, 20);
+                }
+                let name = match output.and_then(|o| mixer.outputs.get(o)) {
+                    Some(output) => output.name.clone(),
+                    None => "Predeterminada".into(),
+                };
+                let room = (WIDTH - PAD * 2.0 - 84.0) * scale;
+                draw_text_on_baseline(
+                    image,
+                    &fit_text(&name, size, room),
+                    (PAD + 40.0) * scale,
+                    baseline(cy),
+                    size,
+                    if chosen { 1.0 } else { 0.85 },
+                );
+                if chosen {
+                    check(image);
+                }
+            }
+        }
+    }
+
+    /// Icono de una aplicación con audio; si no se pudo cargar, el de altavoz.
+    fn draw_app_icon(
+        &self,
+        image: &mut Pixmap,
+        app: &crate::audio::App,
+        cx: f32,
+        cy: f32,
+        scale: f32,
+    ) {
+        let side = 24.0 * scale;
+        let Some(icon) = &app.icon else {
+            draw_icon_aligned(image, '\u{E767}', cx * scale, cy * scale, 16.0 * scale, 0.9);
+            return;
+        };
+        let transform = tiny_skia::Transform::from_scale(
+            side / icon.width() as f32,
+            side / icon.height() as f32,
+        )
+        .post_translate(
+            (cx * scale - side / 2.0).round(),
+            (cy * scale - side / 2.0).round(),
+        );
+        image.draw_pixmap(
+            0,
+            0,
+            icon.as_ref(),
+            &tiny_skia::PixmapPaint {
+                quality: tiny_skia::FilterQuality::Bicubic,
+                ..Default::default()
+            },
+            transform,
+            None,
+        );
+    }
+
     fn draw_slider(&self, image: &mut Pixmap, slider: Slider, scale: f32) {
         let cy = row_y(slider);
         let value = self.value(slider);
@@ -1092,11 +1517,14 @@ impl QuickState {
         draw_text(
             image,
             &percent,
-            (WIDTH - PAD) * scale - text_width(&percent, 13.0 * scale),
+            (WIDTH - PAD - AUDIO_BUTTON - 4.0) * scale - text_width(&percent, 13.0 * scale),
             (cy - 9.0) * scale,
             13.0 * scale,
             0.9,
         );
+        if slider == Slider::Volume {
+            self.draw_audio_button(image, scale);
+        }
     }
 
     fn draw_footer(&self, image: &mut Pixmap, scale: f32) {
@@ -1470,5 +1898,150 @@ mod tests {
         assert_eq!(quick.network_state(&list[0]), "Conectado, protegida");
         assert_eq!(quick.network_state(&list[1]), "Protegida");
         assert_eq!(quick.network_state(&list[2]), "Protegida · Guardada");
+    }
+
+    fn mixer() -> Mixer {
+        let output = |id: &str, name: &str| crate::audio::Output {
+            id: id.into(),
+            name: name.into(),
+        };
+        let app = |name: &str, output: Option<&str>| crate::audio::App {
+            name: name.into(),
+            path: format!("C:\\{name}.exe"),
+            pids: vec![1, 2],
+            output: output.map(Into::into),
+            icon: None,
+        };
+        Mixer {
+            outputs: vec![output("a", "Altavoces"), output("b", "Auriculares")],
+            default: Some("a".into()),
+            apps: vec![app("Discord", Some("b")), app("Spotify", None)],
+            per_app: true,
+        }
+    }
+
+    #[test]
+    fn audio_view_lists_outputs_then_apps_with_their_choices() {
+        let mut quick = state();
+        // La flecha junto al volumen abre la vista, y no pisa la barra.
+        let (ax, ay, aw, ah) = audio_button_rect();
+        assert_eq!(
+            quick.hit_test(ax + aw / 2.0, ay + ah / 2.0),
+            Some(Hit::AudioList)
+        );
+        assert!(SLIDER_X + SLIDER_W + 10.0 < ax);
+
+        quick.system.audio = mixer();
+        quick.view = View::Audio;
+        assert_eq!(
+            quick.audio_rows(),
+            [
+                AudioRow::Header("Salida"),
+                AudioRow::Output(0),
+                AudioRow::Output(1),
+                AudioRow::Header("Aplicaciones"),
+                AudioRow::App(0),
+                AudioRow::App(1),
+            ]
+        );
+        assert_eq!(quick.app_output_name(Some("b")), "Auriculares");
+        assert_eq!(quick.app_output_name(None), "Predeterminada");
+        assert_eq!(quick.app_output_name(Some("x")), "Salida desconectada");
+
+        // Los títulos no se pulsan; las salidas y aplicaciones sí.
+        let center = |index: usize| LIST_Y + quick.row_top(index) + quick.row_height(index) / 2.0;
+        assert_eq!(quick.hit_test(WIDTH / 2.0, center(0)), None);
+        assert_eq!(quick.hit_test(WIDTH / 2.0, center(2)), Some(Hit::Row(2)));
+        assert_eq!(quick.hit_test(WIDTH / 2.0, center(4)), Some(Hit::Row(4)));
+
+        // Al desplegar Discord aparecen "Predeterminada" y cada salida bajo ella.
+        quick.toggle_audio_app(0);
+        assert_eq!(
+            quick.audio_rows()[4..8],
+            [
+                AudioRow::App(0),
+                AudioRow::Choice(0, None),
+                AudioRow::Choice(0, Some(0)),
+                AudioRow::Choice(0, Some(1)),
+            ]
+        );
+        assert_eq!(quick.audio_rows()[8], AudioRow::App(1));
+        let center = |index: usize| {
+            LIST_Y + quick.row_top(index) + quick.row_height(index) / 2.0 - quick.list_scroll
+        };
+        assert_eq!(quick.hit_test(WIDTH / 2.0, center(7)), Some(Hit::Row(7)));
+        // Otro clic la pliega.
+        quick.toggle_audio_app(0);
+        assert_eq!(quick.audio_rows().len(), 6);
+    }
+
+    #[test]
+    fn audio_view_explains_when_there_is_nothing_to_choose() {
+        let mut quick = state();
+        quick.view = View::Audio;
+        quick.system.audio = Mixer {
+            per_app: true,
+            ..mixer()
+        };
+        quick.system.audio.apps.clear();
+        assert_eq!(
+            quick.audio_rows().last(),
+            Some(&AudioRow::Note("Ninguna aplicación está usando el audio"))
+        );
+        // Sin la interfaz interna de Windows no se listan aplicaciones.
+        quick.system.audio = Mixer {
+            per_app: false,
+            ..mixer()
+        };
+        let rows = quick.audio_rows();
+        assert_eq!(
+            rows.last(),
+            Some(&AudioRow::Note("Esta versión de Windows no lo permite"))
+        );
+        assert!(!rows.iter().any(|r| matches!(r, AudioRow::App(_))));
+    }
+
+    #[test]
+    fn scrollbar_appears_when_the_list_overflows_and_can_be_dragged() {
+        let mut quick = state();
+        quick.view = View::Audio;
+        quick.system.audio = mixer();
+        // Todo cabe: no hay barra.
+        assert_eq!(quick.scroll_thumb(), None);
+        assert_ne!(
+            quick.hit_test(WIDTH - 8.0, LIST_Y + 10.0),
+            Some(Hit::Scrollbar)
+        );
+
+        // Con muchas aplicaciones la lista no cabe y aparece la barra a la derecha.
+        let many = (0..12).map(|i| crate::audio::App {
+            name: format!("App {i}"),
+            path: format!("C:\\app{i}.exe"),
+            pids: vec![i],
+            output: None,
+            icon: None,
+        });
+        quick.system.audio.apps.extend(many);
+        let (top, height) = quick.scroll_thumb().unwrap();
+        assert_eq!(top, LIST_Y + 4.0);
+        assert!(height < QuickState::list_height() - 8.0);
+        assert_eq!(
+            quick.hit_test(WIDTH - 8.0, LIST_Y + 10.0),
+            Some(Hit::Scrollbar)
+        );
+
+        // Arrastrar el tirador hasta abajo lleva la lista a su final, y no más allá.
+        quick.grab_scrollbar(top + 5.0);
+        quick.drag_scrollbar(top + 5.0 + 10_000.0);
+        assert_eq!(quick.list_scroll, quick.max_list_scroll());
+        let (bottom_top, _) = quick.scroll_thumb().unwrap();
+        assert!((bottom_top + height - (LIST_FOOTER_Y - 4.0)).abs() < 0.01);
+        quick.drag_scrollbar(-10_000.0);
+        assert_eq!(quick.list_scroll, 0.0);
+        quick.scroll_drag = None;
+
+        // Un clic en el carril, abajo, salta hasta ahí.
+        quick.grab_scrollbar(LIST_FOOTER_Y - 6.0);
+        assert!(quick.list_scroll > quick.max_list_scroll() * 0.8);
     }
 }

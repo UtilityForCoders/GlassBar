@@ -1,5 +1,5 @@
 //! Ajustes del sistema para el panel rápido: Wi-Fi y Bluetooth (encender/apagar),
-//! redes Wi-Fi, dispositivos Bluetooth, brillo de la pantalla del dock y nombre de la red. Leerlos y
+//! redes Wi-Fi, dispositivos Bluetooth, salidas de audio, brillo de la pantalla del dock y nombre de la red. Leerlos y
 //! cambiarlos puede tardar (WMI, radios, búsquedas), así que se hace en un hilo
 //! aparte que avisa al panel con un mensaje al terminar.
 use crate::bluetooth::Device;
@@ -27,6 +27,8 @@ pub struct Snapshot {
     /// Red nueva a la que no se pudo conectar (contraseña incorrecta o sin señal);
     /// su perfil ya se borró.
     pub join_failed: Option<String>,
+    /// Salidas de audio y aplicaciones que lo usan.
+    pub audio: crate::audio::Mixer,
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -52,6 +54,10 @@ enum Command {
     },
     /// Conectar o desconectar el audio de un dispositivo Bluetooth.
     BluetoothAudio(u64, bool),
+    /// Salida de audio predeterminada.
+    DefaultOutput(String),
+    /// Salida de una aplicación (sus procesos); `None` vuelve a la predeterminada.
+    AppOutput(Vec<u32>, Option<String>),
 }
 
 /// Tiempo para que Windows confirme la conexión a una red nueva; si no lo hace, la
@@ -109,6 +115,12 @@ impl Backend {
             .sender
             .send(Command::BluetoothAudio(address, connected));
     }
+    pub fn set_default_output(&self, id: String) {
+        let _ = self.sender.send(Command::DefaultOutput(id));
+    }
+    pub fn set_app_output(&self, pids: Vec<u32>, id: Option<String>) {
+        let _ = self.sender.send(Command::AppOutput(pids, id));
+    }
 }
 
 fn run(receiver: Receiver<Command>, shared: Arc<Mutex<Snapshot>>, target: isize, message: u32) {
@@ -124,6 +136,8 @@ fn run(receiver: Receiver<Command>, shared: Arc<Mutex<Snapshot>>, target: isize,
     // Red nueva a la espera de que Windows confirme la conexión, y hasta cuándo.
     let mut joining: Option<(String, Instant)> = None;
     let mut join_failed: Option<String> = None;
+    // Iconos de las aplicaciones con audio, cargados una vez.
+    let mut icons = std::collections::HashMap::new();
     // Cuántas lecturas quedan pendientes tras una búsqueda o conexión, y cuándo.
     let (mut rereads, mut reread_at) = (0, Instant::now());
     loop {
@@ -176,6 +190,14 @@ fn run(receiver: Receiver<Command>, shared: Arc<Mutex<Snapshot>>, target: isize,
                         }
                         None => join_failed = Some(ssid.clone()),
                     }
+                    reread = true;
+                }
+                Command::DefaultOutput(id) => {
+                    crate::audio::set_default(id);
+                    reread = true;
+                }
+                Command::AppOutput(pids, id) => {
+                    crate::audio::set_app_output(pids, id.as_deref());
                     reread = true;
                 }
                 Command::BluetoothAudio(address, connected) => {
@@ -237,6 +259,7 @@ fn run(receiver: Receiver<Command>, shared: Arc<Mutex<Snapshot>>, target: isize,
                 Vec::new()
             },
             join_failed: join_failed.clone(),
+            audio: crate::audio::read(&mut icons),
         };
         if let Ok(mut shared) = shared.lock() {
             *shared = snapshot;
