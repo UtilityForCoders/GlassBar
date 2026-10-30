@@ -199,8 +199,6 @@ impl LauncherState {
         self.power_menu = false;
         self.reset_results();
     }
-    /// Carga de antemano los iconos de la vista inicial (anclados, recientes y más
-    /// usadas), que es lo que más tarda la primera vez que se abre el lanzador.
     /// Desde ahora los iconos que falten se cargan en segundo plano.
     pub fn load_icons_with(&mut self, loader: IconLoader) {
         self.loader = Some(loader);
@@ -217,6 +215,8 @@ impl LauncherState {
             }
         }
     }
+    /// Carga de antemano los iconos de la vista inicial (anclados, recientes y más
+    /// usadas), que es lo que más tarda la primera vez que se abre el lanzador.
     pub fn preload_icons(&mut self) {
         let entries: Vec<String> = self
             .pinned
