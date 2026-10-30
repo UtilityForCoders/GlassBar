@@ -2200,6 +2200,9 @@ unsafe extern "system" fn wndproc(hwnd: HWND, msg: u32, wparam: WPARAM, lparam: 
                         app.scale,
                     );
                     app.check_preview(pt, Instant::now());
+                    if let Some(panel) = app.tray_panel.as_mut().filter(|p| p.visible) {
+                        panel.watch_menu();
+                    }
                     // Que los iconos de los demás programas sigan llegando a la bandeja propia.
                     if let Some(host) = &app.systray {
                         host.keep_in_front();
@@ -2520,6 +2523,9 @@ struct TrayWindow {
     transition: launcher::Transition,
     /// Dónde abrirlo: centro de la flecha, borde superior del dock y bordes de la pantalla.
     anchor: (i32, i32, (i32, i32)),
+    /// Clic derecho en un icono: cuándo, y si ya se vio su menú abierto. Mientras
+    /// tanto el panel sigue abierto aunque el menú se lleve el foco.
+    menu: Option<(Instant, bool)>,
 }
 impl TrayWindow {
     fn new(owner: HWND) -> Result<Self> {
@@ -2548,6 +2554,7 @@ impl TrayWindow {
             visible: false,
             transition: launcher::Transition::hidden(),
             anchor: (0, 0, (0, 0)),
+            menu: None,
         })
     }
     fn show(&mut self, anchor_x: i32, dock_top: i32, bounds: (i32, i32)) {
@@ -2627,9 +2634,41 @@ impl TrayWindow {
             return;
         }
         self.visible = false;
+        self.menu = None;
         self.model.hovered = None;
         self.transition.close(Instant::now());
         self.present();
+    }
+    /// Sigue el menú abierto con clic derecho (cada 40 ms). Al cerrarse: si el
+    /// programa abrió una ventana o se pulsó fuera, el panel se cierra; si no
+    /// (Escape, o de vuelta al panel), recupera el foco para cerrarse como siempre.
+    fn watch_menu(&mut self) {
+        let Some((since, seen)) = self.menu else {
+            return;
+        };
+        if menu_open() {
+            self.menu = Some((since, true));
+            return;
+        }
+        // Algunos programas tardan en abrirlo; si no llega a abrirse, se deja de esperar.
+        if !seen && since.elapsed() < Duration::from_millis(1500) {
+            return;
+        }
+        self.menu = None;
+        let elsewhere = unsafe {
+            use windows::Win32::UI::WindowsAndMessaging::{
+                GetForegroundWindow, GetWindowThreadProcessId, IsWindowVisible,
+            };
+            let front = GetForegroundWindow();
+            let mut pid = 0;
+            GetWindowThreadProcessId(front, Some(&mut pid));
+            pid != std::process::id() && IsWindowVisible(front).as_bool()
+        };
+        if elsewhere {
+            self.hide();
+        } else {
+            take_focus(self.hwnd);
+        }
     }
 }
 impl Drop for TrayWindow {
@@ -2672,8 +2711,13 @@ unsafe extern "system" fn tray_wndproc(
                     tip.hide();
                 }
                 app.tray_clicked = Some(Instant::now());
-                // Se cierra antes de pasarle el foco al programa, como el de Windows.
-                panel.hide();
+                // Con clic derecho sigue abierto mientras está el menú del icono; con
+                // los demás se cierra, porque el programa suele abrir su ventana.
+                if click == systray::Click::Right {
+                    panel.menu = Some((Instant::now(), false));
+                } else {
+                    panel.hide();
+                }
                 systray::click(index, click, cursor());
             }
         });
@@ -2684,7 +2728,11 @@ unsafe extern "system" fn tray_wndproc(
                 if let Some(tip) = &mut app.tooltip {
                     tip.hide();
                 }
-                app.tray_panel.as_mut().map(TrayWindow::hide)
+                // El menú de un icono se lleva el foco: el panel sigue abierto.
+                app.tray_panel
+                    .as_mut()
+                    .filter(|p| p.menu.is_none())
+                    .map(TrayWindow::hide)
             });
         }
         WM_TIMER if wparam.0 == TIMER_ANIM => {
