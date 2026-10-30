@@ -15,6 +15,8 @@ const APP_STEP: f32 = 46.0;
 const CLOCK_W: f32 = 78.0;
 const ICON_SIZE: f32 = 28.0;
 const OVERFLOW_W: f32 = 30.0;
+/// Indicador de idioma del teclado ("ESP" / "INTL"), entre la flecha y el estado.
+const LANGUAGE_W: f32 = 44.0;
 /// Grupo de red, volumen y batería: margen a cada lado y ancho de cada icono.
 const STATUS_PAD: f32 = 6.0;
 const STATUS_STEP: f32 = 24.0;
@@ -28,6 +30,8 @@ pub enum HoverTarget {
     OpenApp(usize),
     /// Flecha que abre los iconos ocultos de la bandeja.
     Overflow,
+    /// Indicador de idioma del teclado.
+    Language,
     /// Icono del grupo de estado (red, volumen o batería), por su posición.
     Status(usize),
     Clock,
@@ -54,6 +58,8 @@ pub struct BarState {
     pub hovered: Option<HoverTarget>,
     pub pressed: Option<HoverTarget>,
     pub status: Status,
+    /// Teclado de la ventana activa; `None` si solo hay uno instalado.
+    pub keyboard: Option<crate::keyboard::Layout>,
     clock: ClockRenderer,
 }
 
@@ -68,18 +74,34 @@ impl BarState {
             hovered: None,
             pressed: None,
             status: Status::default(),
+            keyboard: None,
             clock: ClockRenderer::new(),
         }
     }
     pub fn dock_width(&self) -> f32 {
-        APP_START + self.item_count() as f32 * APP_STEP + OVERFLOW_W + self.status_width() + CLOCK_W
+        self.status_left() + self.status_width() + CLOCK_W
+    }
+    fn language_width(&self) -> f32 {
+        if self.keyboard.is_some() {
+            LANGUAGE_W
+        } else {
+            0.0
+        }
+    }
+    /// Borde izquierdo del indicador de idioma, en unidades del dock.
+    fn language_left(&self) -> f32 {
+        APP_START + self.item_count() as f32 * APP_STEP + OVERFLOW_W
+    }
+    /// Centro horizontal del indicador de idioma, en píxeles de la ventana.
+    pub fn language_center(&self, scale: f32) -> f32 {
+        (SHADOW_PAD_X + self.language_left() + LANGUAGE_W / 2.0) * scale
     }
     fn status_width(&self) -> f32 {
         STATUS_PAD * 2.0 + self.status.items().len() as f32 * STATUS_STEP
     }
     /// Borde izquierdo del grupo de estado, en unidades del dock.
     fn status_left(&self) -> f32 {
-        APP_START + self.item_count() as f32 * APP_STEP + OVERFLOW_W
+        self.language_left() + self.language_width()
     }
     /// Centro horizontal del icono de estado `index`, en píxeles de la ventana.
     fn status_center(&self, index: usize, scale: f32) -> f32 {
@@ -114,6 +136,15 @@ impl BarState {
     pub fn item_label(&self, target: HoverTarget, scale: f32) -> Option<(String, f32)> {
         if target == HoverTarget::Overflow {
             return Some(("Mostrar iconos ocultos".into(), self.overflow_center(scale)));
+        }
+        if target == HoverTarget::Language {
+            let name = self.keyboard.as_ref()?.name.clone();
+            return Some((name, self.language_center(scale)));
+        }
+        if target == HoverTarget::Clock {
+            // Como en Windows: la fecha completa al pasar el cursor por el reloj.
+            let cx = (SHADOW_PAD_X + self.dock_width() - CLOCK_W / 2.0) * scale;
+            return Some((crate::clock::today(true), cx));
         }
         if let HoverTarget::Status(index) = target {
             let item = self.status_item(index)?;
@@ -258,8 +289,10 @@ impl BarState {
             Some(HoverTarget::PrimaryApp(index))
         } else if index < self.item_count() {
             Some(HoverTarget::OpenApp(index - self.primary_apps.len()))
-        } else if x < self.status_left() {
+        } else if x < self.language_left() {
             Some(HoverTarget::Overflow)
+        } else if x < self.status_left() {
+            Some(HoverTarget::Language)
         } else if x < self.status_left() + self.status_width() {
             let index = ((x - self.status_left() - STATUS_PAD) / STATUS_STEP).floor();
             let last = self.status.items().len() - 1;
@@ -330,6 +363,21 @@ impl BarState {
             draw_hover(pixmap, arrow_x, cy, scale);
         }
         draw_chevron(pixmap, arrow_x, cy, scale);
+        if let Some(keyboard) = &self.keyboard {
+            let lx = self.language_center(scale);
+            if self.hovered == Some(HoverTarget::Language) {
+                crate::apps::fill_rounded(
+                    pixmap,
+                    [255, 255, 255, 17],
+                    lx - (LANGUAGE_W / 2.0 - 2.0) * scale,
+                    cy - 19.0 * scale,
+                    (LANGUAGE_W - 4.0) * scale,
+                    38.0 * scale,
+                    10.0 * scale,
+                );
+            }
+            draw_language(pixmap, keyboard, lx, cy, scale);
+        }
         // Como en Windows, el resaltado cubre el grupo entero: todo abre la configuración rápida.
         if matches!(self.hovered, Some(HoverTarget::Status(_))) {
             crate::apps::fill_rounded(
@@ -369,6 +417,35 @@ impl BarState {
             x + (self.dock_width() - CLOCK_W / 2.0) * scale,
             cy,
             scale,
+        );
+    }
+}
+
+/// Idioma en una línea o, si la distribución no es la normal, idioma arriba y
+/// distribución debajo, como la barra de Windows.
+fn draw_language(
+    pixmap: &mut Pixmap,
+    keyboard: &crate::keyboard::Layout,
+    cx: f32,
+    cy: f32,
+    scale: f32,
+) {
+    use crate::clock::{draw_text_on_baseline, line_metrics, text_width};
+    let size = 11.0 * scale;
+    let (ascent, descent) = line_metrics(size);
+    let line = ascent + descent;
+    let lines: Vec<&str> = std::iter::once(keyboard.language.as_str())
+        .chain(keyboard.variant.as_deref())
+        .collect();
+    let top = cy - line * lines.len() as f32 / 2.0;
+    for (index, text) in lines.iter().enumerate() {
+        draw_text_on_baseline(
+            pixmap,
+            text,
+            cx - text_width(text, size) / 2.0,
+            top + line * index as f32 + ascent,
+            size,
+            0.95,
         );
     }
 }
@@ -448,6 +525,13 @@ mod tests {
     #[test]
     fn icons_and_clock_remain_clickable_without_overlap() {
         let mut bar = BarState::new();
+        // Con varios teclados aparece el indicador de idioma.
+        bar.keyboard = Some(crate::keyboard::Layout {
+            id: 0x0409,
+            language: "ESP".into(),
+            variant: Some("INTL".into()),
+            name: "Español (España) · Estados Unidos-Internacional".into(),
+        });
         // Con batería el grupo de estado tiene tres iconos.
         bar.status.battery = Some(crate::status::Battery {
             percent: 80,
@@ -488,6 +572,12 @@ mod tests {
                     bar.hit_test(bar.overflow_center(scale), cy, scale),
                     Some(HoverTarget::Overflow)
                 );
+                if bar.keyboard.is_some() {
+                    assert_eq!(
+                        bar.hit_test(bar.language_center(scale), cy, scale),
+                        Some(HoverTarget::Language)
+                    );
+                }
                 for index in 0..bar.status.items().len() {
                     assert_eq!(
                         bar.hit_test(bar.status_center(index, scale), cy, scale),

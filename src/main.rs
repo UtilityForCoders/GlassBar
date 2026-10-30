@@ -4,6 +4,7 @@
 //! Barra de tareas moderna ultra-transparente estilo Windows 11 Glass para Windows, ultraligera en Rust.
 //! Comportamiento auto-hide nativo (sale suavemente desde abajo al acercar el mouse) y estética translúcida.
 
+mod accent;
 mod apps;
 mod audio;
 mod autohide;
@@ -15,9 +16,12 @@ mod clock;
 mod glass;
 mod guard;
 mod icons;
+mod keyboard;
+mod language;
 mod launcher;
 mod monitors;
 mod pins;
+mod preview;
 mod priority;
 mod quick;
 mod shell;
@@ -69,6 +73,8 @@ const WM_MOUSELEAVE: u32 = 0x02A3;
 const WM_SHOW_LAUNCHER: u32 = windows::Win32::UI::WindowsAndMessaging::WM_APP + 2;
 /// Cambió la ventana activa: el dock comprueba si debe ponerse encima o apartarse.
 const WM_FOREGROUND: u32 = windows::Win32::UI::WindowsAndMessaging::WM_APP + 3;
+/// DWM avisa de que cambió el color de énfasis o de las ventanas.
+const WM_DWMCOLORIZATIONCOLORCHANGED: u32 = 0x0320;
 /// El hilo de sistema terminó de leer Wi-Fi, Bluetooth, brillo y red.
 const WM_QUICK_UPDATE: u32 = windows::Win32::UI::WindowsAndMessaging::WM_APP + 4;
 
@@ -1306,10 +1312,16 @@ struct App {
     launcher: Option<LauncherWindow>,
     /// Panel rápido; se crea la primera vez que se abre.
     quick: Option<QuickWindow>,
+    /// Panel de idioma del teclado; también se crea al abrirlo.
+    language: Option<LanguageWindow>,
     /// Lanzador preparado en segundo plano al iniciar (catálogo e iconos), para que
     /// la primera apertura no tenga que esperar a leerlos.
     prepared: Option<std::sync::mpsc::Receiver<launcher::LauncherState>>,
     tooltip: Option<Tooltip>,
+    /// Vista previa de ventanas; `preview_away` es desde cuándo el cursor no está ni
+    /// en ella ni en su programa (se cierra tras un momento, para poder llegar a ella).
+    preview: Option<PreviewWindow>,
+    preview_away: Option<Instant>,
     animating: bool,
     last_tick: Instant,
     mouse_tracked: bool,
@@ -1323,6 +1335,7 @@ impl App {
         let mut bar = BarState::new();
         apps::update_running_apps(&mut bar.primary_apps, &mut bar.open_apps);
         bar.status = status::read();
+        bar.keyboard = keyboard::current();
         let scale = scale.min((rc.right - rc.left) as f32 / (bar.dock_width() + 40.0));
         let (width, height) = bar.window_size(scale);
         let surface = Surface::new(width, height)?;
@@ -1364,8 +1377,11 @@ impl App {
             tray,
             launcher: None,
             quick: None,
+            language: None,
             prepared: Some(prepare_launcher(&pinned)),
             tooltip: Tooltip::new(hwnd).ok(),
+            preview: PreviewWindow::new(hwnd).ok(),
+            preview_away: None,
             animating: false,
             last_tick: Instant::now(),
             mouse_tracked: false,
@@ -1380,6 +1396,9 @@ impl App {
         }
         if let Some(menu) = &mut self.launcher {
             menu.hide();
+        }
+        if let Some(panel) = &mut self.language {
+            panel.hide();
         }
         if self.quick.is_none() {
             match QuickWindow::new(self.hwnd) {
@@ -1405,6 +1424,9 @@ impl App {
             return;
         }
         if let Some(panel) = &mut self.quick {
+            panel.hide();
+        }
+        if let Some(panel) = &mut self.language {
             panel.hide();
         }
         let pinned: Vec<_> = self
@@ -1438,6 +1460,51 @@ impl App {
 
     /// Con una app a pantalla completa el dock se aparta; si no, al cambiar de ventana
     /// (`raise`) vuelve a ponerse por encima de las demás, incluida la barra nativa.
+    /// Pone al día el indicador de idioma con el teclado de la ventana activa; si
+    /// aparece o desaparece (al instalar o quitar teclados), el dock se reajusta.
+    fn update_keyboard(&mut self) {
+        let keyboard = keyboard::current();
+        if keyboard == self.bar.keyboard {
+            return;
+        }
+        let resized = keyboard.is_some() != self.bar.keyboard.is_some();
+        self.bar.keyboard = keyboard;
+        if resized {
+            self.relayout();
+        } else {
+            self.render();
+        }
+    }
+
+    /// Abre o cierra el panel de idioma sobre el indicador. El teclado elegido se
+    /// aplica a la ventana que estaba activa al abrirlo.
+    fn toggle_language(&mut self) {
+        if let Some(panel) = self.language.as_mut().filter(|p| p.visible) {
+            panel.hide();
+            return;
+        }
+        if let Some(menu) = &mut self.launcher {
+            menu.hide();
+        }
+        if let Some(panel) = &mut self.quick {
+            panel.hide();
+        }
+        if self.language.is_none() {
+            match LanguageWindow::new(self.hwnd) {
+                Ok(panel) => self.language = Some(panel),
+                Err(_) => return,
+            }
+        }
+        let target = unsafe { windows::Win32::UI::WindowsAndMessaging::GetForegroundWindow() };
+        let anchor = self.pos.x + self.bar.language_center(self.scale).round() as i32;
+        let current = self.bar.keyboard.as_ref().map(|k| k.id);
+        let (top, bounds) = (self.y_shown, (self.screen_left, self.screen_right));
+        if let Some(panel) = &mut self.language {
+            panel.show(target, current, anchor, top, bounds);
+        }
+        self.expand();
+    }
+
     fn check_priority(&mut self, raise: bool) {
         let monitor = windows::Win32::Foundation::RECT {
             left: self.screen_left,
@@ -1496,6 +1563,20 @@ impl App {
         if let Some(tip) = &mut self.tooltip {
             tip.hide();
         }
+        // Con una vista previa abierta, pasar a otro programa con ventana la cambia al
+        // momento, como en Windows; si no la tiene, se cierra.
+        let previewing = self.preview.as_ref().is_some_and(|p| p.visible);
+        if previewing && self.bar.pressed.is_none() {
+            if let Some(target) = self.bar.hovered {
+                if !self.show_preview(target) {
+                    if let Some(preview) = &mut self.preview {
+                        preview.hide();
+                    }
+                } else {
+                    return;
+                }
+            }
+        }
         unsafe {
             let _ = KillTimer(Some(self.hwnd), TIMER_TIP);
             if matches!(
@@ -1505,6 +1586,8 @@ impl App {
                         | HoverTarget::OpenApp(_)
                         | HoverTarget::Overflow
                         | HoverTarget::Status(_)
+                        | HoverTarget::Language
+                        | HoverTarget::Clock
                 )
             ) && self.bar.pressed.is_none()
             {
@@ -1526,6 +1609,13 @@ impl App {
         {
             return;
         }
+        if target == HoverTarget::Language && self.language.as_ref().is_some_and(|l| l.visible) {
+            return;
+        }
+        // Programa con ventana abierta: vista previa en lugar del nombre.
+        if self.show_preview(target) {
+            return;
+        }
         let Some((name, cx)) = self.bar.item_label(target, self.scale) else {
             return;
         };
@@ -1538,6 +1628,68 @@ impl App {
                 self.screen_right,
                 self.scale,
             );
+        }
+    }
+
+    /// Muestra la vista previa de las ventanas del programa `target`, si tiene alguna.
+    fn show_preview(&mut self, target: HoverTarget) -> bool {
+        if !matches!(target, HoverTarget::PrimaryApp(_) | HoverTarget::OpenApp(_)) {
+            return false;
+        }
+        let Some((name, cx)) = self.bar.item_label(target, self.scale) else {
+            return false;
+        };
+        let windows = self
+            .bar
+            .item_mut(target)
+            .map(|a| a.windows.clone())
+            .unwrap_or_default();
+        if windows.is_empty() {
+            return false;
+        }
+        // Cada tarjeta con el título de su ventana; sin título, el del programa.
+        let sources: Vec<(isize, String)> = windows
+            .into_iter()
+            .map(|w| {
+                let title = window_title(w);
+                let title = if title.trim().is_empty() {
+                    name.clone()
+                } else {
+                    title
+                };
+                (w, title)
+            })
+            .collect();
+        let (anchor, top, scale) = (self.pos.x + cx.round() as i32, self.y_shown, self.scale);
+        let bounds = (self.screen_left, self.screen_right);
+        let Some(preview) = &mut self.preview else {
+            return false;
+        };
+        let shown = preview.show(&sources, target, anchor, top, bounds, scale);
+        if shown {
+            self.preview_away = None;
+            if let Some(tip) = &mut self.tooltip {
+                tip.hide();
+            }
+        }
+        shown
+    }
+
+    /// Cierra la vista previa si el cursor ya no está ni en ella ni en su programa
+    /// desde hace un momento (el justo para pasar del icono al panel).
+    fn check_preview(&mut self, cursor: POINT, now: Instant) {
+        let Some(preview) = self.preview.as_mut().filter(|p| p.visible) else {
+            return;
+        };
+        let over = preview.contains(cursor) || self.bar.hovered == preview.target;
+        if over || self.bar.pressed.is_some() && self.bar.pressed == preview.target {
+            self.preview_away = None;
+            return;
+        }
+        let since = *self.preview_away.get_or_insert(now);
+        if now.duration_since(since) > Duration::from_millis(250) {
+            preview.hide();
+            self.preview_away = None;
         }
     }
 
@@ -1606,8 +1758,28 @@ impl App {
 
 unsafe extern "system" fn wndproc(hwnd: HWND, msg: u32, wparam: WPARAM, lparam: LPARAM) -> LRESULT {
     match msg {
+        // Cambió el color de énfasis (Windows avisa con estos dos mensajes, también
+        // por otros ajustes): se vuelve a leer y, si es otro, se redibuja lo abierto.
+        windows::Win32::UI::WindowsAndMessaging::WM_SETTINGCHANGE
+        | WM_DWMCOLORIZATIONCOLORCHANGED => {
+            with_app(|app| {
+                if accent::refresh() {
+                    app.render();
+                    if let Some(panel) = app.quick.as_mut().filter(|p| p.visible) {
+                        panel.render();
+                    }
+                    if let Some(menu) = app.launcher.as_mut().filter(|m| m.visible) {
+                        menu.render();
+                    }
+                }
+            });
+            DefWindowProcW(hwnd, msg, wparam, lparam)
+        }
         WM_FOREGROUND => {
-            with_app(|app| app.check_priority(true));
+            with_app(|app| {
+                app.check_priority(true);
+                app.update_keyboard();
+            });
             LRESULT(0)
         }
         WM_SHOW_LAUNCHER => {
@@ -1704,6 +1876,9 @@ unsafe extern "system" fn wndproc(hwnd: HWND, msg: u32, wparam: WPARAM, lparam: 
             with_app(|app| {
                 if let Some(target) = app.bar.hovered {
                     app.bar.pressed = Some(target);
+                    if let Some(preview) = &mut app.preview {
+                        preview.hide();
+                    }
                     app.restart_tooltip();
                     let x = (lparam.0 & 0xffff) as i16 as f32;
                     app.bar.begin_drag(target, x, app.scale);
@@ -1753,6 +1928,12 @@ unsafe extern "system" fn wndproc(hwnd: HWND, msg: u32, wparam: WPARAM, lparam: 
                         HoverTarget::Launcher => {
                             app.bar.launcher_press.set_target(1.0);
                             app.toggle_launcher();
+                        }
+                        HoverTarget::Language => {
+                            if let Some(tip) = &mut app.tooltip {
+                                tip.hide();
+                            }
+                            app.toggle_language();
                         }
                         HoverTarget::PrimaryApp(_) => {
                             if let Some(menu) = &mut app.launcher {
@@ -1880,6 +2061,8 @@ unsafe extern "system" fn wndproc(hwnd: HWND, msg: u32, wparam: WPARAM, lparam: 
                     app.check_priority(false);
                     // Red, volumen y batería; si aparece o desaparece la batería cambia el ancho.
                     let status = status::read();
+                    // El idioma también cambia con atajos (Win+Espacio, Alt+Mayús).
+                    app.update_keyboard();
                     let resized = status.items().len() != app.bar.status.items().len();
                     app.bar.status = status;
                     // El volumen puede cambiar con las teclas o desde otra app.
@@ -1921,6 +2104,7 @@ unsafe extern "system" fn wndproc(hwnd: HWND, msg: u32, wparam: WPARAM, lparam: 
                         app.screen_bottom,
                         app.scale,
                     );
+                    app.check_preview(pt, Instant::now());
                     let inside = app.visibility.expanded
                         && pt.x >= app.pos.x
                         && pt.x < app.pos.x + app.surface.width as i32
@@ -1932,6 +2116,8 @@ unsafe extern "system" fn wndproc(hwnd: HWND, msg: u32, wparam: WPARAM, lparam: 
                             || app.bar.drag.is_some()
                             || app.launcher.as_ref().is_some_and(|l| l.visible)
                             || app.quick.as_ref().is_some_and(|q| q.visible)
+                            || app.language.as_ref().is_some_and(|l| l.visible)
+                            || app.preview.as_ref().is_some_and(|p| p.visible)
                             // El panel de iconos ocultos abierto sobre la flecha; se mira
                             // al final porque recorre las ventanas, y solo con el dock fuera.
                             || (app.visibility.expanded && shell::overflow_window().is_some()),
@@ -1971,6 +2157,559 @@ unsafe extern "system" fn wndproc(hwnd: HWND, msg: u32, wparam: WPARAM, lparam: 
             LRESULT(0)
         }
 
+        _ => DefWindowProcW(hwnd, msg, wparam, lparam),
+    }
+}
+
+/// Panel de idioma del teclado sobre el indicador del dock.
+struct LanguageWindow {
+    hwnd: HWND,
+    surface: Option<Surface>,
+    pos: POINT,
+    scale: f32,
+    model: language::LanguageState,
+    visible: bool,
+    transition: launcher::Transition,
+    /// Ventana que estaba activa al abrirlo: a ella se aplica el teclado elegido.
+    target: HWND,
+}
+impl LanguageWindow {
+    fn new(owner: HWND) -> Result<Self> {
+        let hwnd = unsafe {
+            CreateWindowExW(
+                WS_EX_LAYERED | WS_EX_TOPMOST | WS_EX_TOOLWINDOW,
+                w!("GlassBarLanguage"),
+                w!("GlassBar — Idioma del teclado"),
+                WS_POPUP,
+                0,
+                0,
+                1,
+                1,
+                Some(owner),
+                None,
+                Some(GetModuleHandleW(None)?.into()),
+                None,
+            )?
+        };
+        Ok(Self {
+            hwnd,
+            surface: None,
+            pos: POINT::default(),
+            scale: 1.0,
+            model: language::LanguageState::default(),
+            visible: false,
+            transition: launcher::Transition::hidden(),
+            target: HWND::default(),
+        })
+    }
+    /// Lo abre sobre `anchor_x`, encima del dock, con los teclados instalados.
+    fn show(
+        &mut self,
+        target: HWND,
+        current: Option<isize>,
+        anchor_x: i32,
+        dock_top: i32,
+        (left, right): (i32, i32),
+    ) {
+        self.target = target;
+        self.model = language::LanguageState {
+            layouts: keyboard::installed()
+                .into_iter()
+                .map(keyboard::describe)
+                .collect(),
+            current,
+            hovered: None,
+        };
+        let (_, dpi) = monitors::get_info(monitors::primary());
+        self.scale = dpi.max(0.3);
+        let width = (language::WIDTH * self.scale).ceil() as u32;
+        let height = (self.model.height() * self.scale).ceil() as u32;
+        let Ok(surface) = Surface::new(width, height) else {
+            return;
+        };
+        self.surface = Some(surface);
+        let margin = (12.0 * self.scale).round() as i32;
+        self.pos = POINT {
+            x: (anchor_x - width as i32 / 2).clamp(
+                left + margin,
+                (right - width as i32 - margin).max(left + margin),
+            ),
+            y: dock_top - height as i32 - margin,
+        };
+        self.visible = true;
+        self.transition.open(Instant::now());
+        self.render();
+        take_focus(self.hwnd);
+    }
+    fn render(&mut self) {
+        if let Some(surface) = &mut self.surface {
+            self.model.draw(&mut surface.pixmap, self.scale);
+            surface.copy_to_dib();
+        }
+        self.present();
+    }
+    fn present(&mut self) {
+        if let Some(surface) = &self.surface {
+            present_popup(
+                self.hwnd,
+                surface,
+                self.pos,
+                self.scale,
+                &self.transition,
+                self.visible,
+                false,
+            );
+        }
+    }
+    fn hide(&mut self) {
+        if !self.visible {
+            return;
+        }
+        self.visible = false;
+        self.model.hovered = None;
+        self.transition.close(Instant::now());
+        self.present();
+    }
+}
+impl Drop for LanguageWindow {
+    fn drop(&mut self) {
+        unsafe {
+            let _ = windows::Win32::UI::WindowsAndMessaging::DestroyWindow(self.hwnd);
+        }
+    }
+}
+
+/// Aplica el teclado elegido en el panel de idioma a la ventana que estaba activa y
+/// le devuelve el foco.
+fn choose_language(app: &mut App, index: usize) {
+    let Some(panel) = &mut app.language else {
+        return;
+    };
+    let Some(layout) = panel.model.layouts.get(index).map(|l| l.id) else {
+        return;
+    };
+    let target = panel.target;
+    panel.hide();
+    unsafe {
+        if !target.is_invalid() {
+            let _ = windows::Win32::UI::WindowsAndMessaging::SetForegroundWindow(target);
+            keyboard::switch(target, layout);
+        }
+    }
+    app.update_keyboard();
+}
+
+unsafe extern "system" fn language_wndproc(
+    hwnd: HWND,
+    msg: u32,
+    wparam: WPARAM,
+    lparam: LPARAM,
+) -> LRESULT {
+    use windows::Win32::UI::WindowsAndMessaging::{WA_INACTIVE, WM_ACTIVATE, WM_KEYDOWN};
+    let point = |scale: f32| {
+        (
+            (lparam.0 & 0xffff) as i16 as f32 / scale,
+            ((lparam.0 >> 16) & 0xffff) as i16 as f32 / scale,
+        )
+    };
+    match msg {
+        WM_ACTIVATE if (wparam.0 & 0xffff) as u32 == WA_INACTIVE => {
+            with_app(|app| app.language.as_mut().map(LanguageWindow::hide));
+        }
+        WM_TIMER if wparam.0 == TIMER_ANIM => {
+            with_app(|app| app.language.as_mut().map(LanguageWindow::present));
+        }
+        WM_MOUSEMOVE => {
+            with_app(|app| {
+                let Some(panel) = app.language.as_mut().filter(|p| p.visible) else {
+                    return;
+                };
+                let mut track = TRACKMOUSEEVENT {
+                    cbSize: std::mem::size_of::<TRACKMOUSEEVENT>() as u32,
+                    dwFlags: TME_LEAVE,
+                    hwndTrack: hwnd,
+                    dwHoverTime: 0,
+                };
+                let _ = TrackMouseEvent(&mut track);
+                let (x, y) = point(panel.scale);
+                let hit = panel.model.hit_test(x, y);
+                if hit != panel.model.hovered {
+                    panel.model.hovered = hit;
+                    panel.render();
+                }
+            });
+        }
+        WM_MOUSELEAVE => {
+            with_app(|app| {
+                if let Some(panel) = app.language.as_mut().filter(|p| p.visible) {
+                    if panel.model.hovered.take().is_some() {
+                        panel.render();
+                    }
+                }
+            });
+        }
+        WM_LBUTTONUP => {
+            with_app(|app| {
+                let Some(panel) = app.language.as_mut().filter(|p| p.visible) else {
+                    return;
+                };
+                let (x, y) = point(panel.scale);
+                match panel.model.hit_test(x, y) {
+                    Some(language::Hit::Layout(index)) => choose_language(app, index),
+                    Some(language::Hit::Settings) => {
+                        panel.hide();
+                        let _ = std::process::Command::new("explorer.exe")
+                            .arg("ms-settings:keyboard")
+                            .spawn();
+                    }
+                    None => {}
+                }
+            });
+        }
+        // Escape cierra; las flechas recorren los teclados y Enter elige.
+        WM_KEYDOWN => {
+            with_app(|app| {
+                let Some(panel) = app.language.as_mut().filter(|p| p.visible) else {
+                    return;
+                };
+                match wparam.0 {
+                    0x1B => panel.hide(),
+                    0x26 | 0x28 => {
+                        panel
+                            .model
+                            .move_selection(if wparam.0 == 0x26 { -1 } else { 1 });
+                        panel.render();
+                    }
+                    0x0D => {
+                        if let Some(language::Hit::Layout(index)) = panel.model.hovered {
+                            choose_language(app, index);
+                        }
+                    }
+                    _ => {}
+                }
+            });
+        }
+        _ => return DefWindowProcW(hwnd, msg, wparam, lparam),
+    }
+    LRESULT(0)
+}
+
+/// Vista previa de las ventanas de un programa del dock: una tarjeta por ventana.
+/// El marco y los títulos se dibujan como el resto de GlassBar; las miniaturas en
+/// vivo las pone Windows (DWM) encima, en el hueco de cada tarjeta.
+struct PreviewWindow {
+    hwnd: HWND,
+    surface: Option<Surface>,
+    pos: POINT,
+    scale: f32,
+    visible: bool,
+    /// Ventanas que se muestran, con su miniatura registrada en DWM y su título.
+    sources: Vec<isize>,
+    thumbnails: Vec<isize>,
+    titles: Vec<String>,
+    /// Programa del dock al que pertenecen.
+    target: Option<HoverTarget>,
+    layout: preview::Layout,
+    hovered: Option<usize>,
+    close_hovered: Option<usize>,
+}
+impl PreviewWindow {
+    fn new(owner: HWND) -> Result<Self> {
+        let hwnd = unsafe {
+            CreateWindowExW(
+                WS_EX_LAYERED | WS_EX_TOPMOST | WS_EX_TOOLWINDOW | WS_EX_NOACTIVATE,
+                w!("GlassBarPreview"),
+                w!("GlassBar — Vista previa"),
+                WS_POPUP,
+                0,
+                0,
+                1,
+                1,
+                Some(owner),
+                None,
+                Some(GetModuleHandleW(None)?.into()),
+                None,
+            )?
+        };
+        Ok(Self {
+            hwnd,
+            surface: None,
+            pos: POINT::default(),
+            scale: 1.0,
+            visible: false,
+            sources: Vec::new(),
+            thumbnails: Vec::new(),
+            titles: Vec::new(),
+            target: None,
+            layout: preview::Layout::default(),
+            hovered: None,
+            close_hovered: None,
+        })
+    }
+
+    fn unregister(&mut self) {
+        for thumbnail in self.thumbnails.drain(..) {
+            unsafe {
+                let _ = windows::Win32::Graphics::Dwm::DwmUnregisterThumbnail(thumbnail);
+            }
+        }
+    }
+
+    /// Muestra las ventanas `sources` (con sus títulos) sobre `anchor_x`, encima del
+    /// dock. Devuelve `false` si Windows no da ninguna miniatura (entonces se usa el
+    /// globo con el nombre).
+    #[allow(clippy::too_many_arguments)]
+    fn show(
+        &mut self,
+        sources: &[(isize, String)],
+        target: HoverTarget,
+        anchor_x: i32,
+        dock_top: i32,
+        (left, right): (i32, i32),
+        scale: f32,
+    ) -> bool {
+        use windows::Win32::Graphics::Dwm::{DwmQueryThumbnailSourceSize, DwmRegisterThumbnail};
+        let ids: Vec<isize> = sources.iter().map(|(w, _)| *w).collect();
+        if self.visible && self.sources == ids {
+            self.target = Some(target);
+            return true;
+        }
+        self.unregister();
+        self.sources.clear();
+        self.titles.clear();
+        let mut sizes = Vec::new();
+        for (window, title) in sources {
+            unsafe {
+                let Ok(thumbnail) = DwmRegisterThumbnail(self.hwnd, HWND(*window as *mut _)) else {
+                    continue;
+                };
+                let Ok(size) = DwmQueryThumbnailSourceSize(thumbnail) else {
+                    let _ = windows::Win32::Graphics::Dwm::DwmUnregisterThumbnail(thumbnail);
+                    continue;
+                };
+                self.thumbnails.push(thumbnail);
+                self.sources.push(*window);
+                self.titles.push(title.clone());
+                sizes.push((size.cx as f32, size.cy as f32));
+            }
+        }
+        if sizes.is_empty() {
+            self.hide();
+            return false;
+        }
+        let margin = (8.0 * scale).round() as i32;
+        let room = (right - left - margin * 2) as f32 / scale;
+        self.layout = preview::layout(&sizes, scale, room);
+        self.scale = scale;
+        self.target = Some(target);
+        self.hovered = None;
+        self.close_hovered = None;
+        let width = (self.layout.width * scale).ceil() as u32;
+        let height = (self.layout.height * scale).ceil() as u32;
+        let Ok(surface) = Surface::new(width, height) else {
+            self.hide();
+            return false;
+        };
+        self.surface = Some(surface);
+        self.pos = POINT {
+            x: (anchor_x - width as i32 / 2).clamp(
+                left + margin,
+                (right - width as i32 - margin).max(left + margin),
+            ),
+            y: dock_top - height as i32 - margin,
+        };
+        self.render();
+        unsafe {
+            let _ = ShowWindow(self.hwnd, SW_SHOWNOACTIVATE);
+        }
+        self.visible = true;
+        self.place_thumbnails();
+        true
+    }
+
+    /// Le dice a Windows dónde pintar cada miniatura dentro de su tarjeta.
+    fn place_thumbnails(&self) {
+        use windows::Win32::Graphics::Dwm::{
+            DwmUpdateThumbnailProperties, DWM_THUMBNAIL_PROPERTIES,
+        };
+        // DWM_TNP_RECTDESTINATION | DWM_TNP_OPACITY | DWM_TNP_VISIBLE.
+        const FLAGS: u32 = 0x1 | 0x4 | 0x8;
+        let s = self.scale;
+        for (thumbnail, card) in self.thumbnails.iter().zip(&self.layout.cards) {
+            let (x, y, w, h) = card.thumb;
+            let properties = DWM_THUMBNAIL_PROPERTIES {
+                dwFlags: FLAGS,
+                rcDestination: windows::Win32::Foundation::RECT {
+                    left: (x * s).round() as i32,
+                    top: (y * s).round() as i32,
+                    right: ((x + w) * s).round() as i32,
+                    bottom: ((y + h) * s).round() as i32,
+                },
+                opacity: 255,
+                fVisible: true.into(),
+                ..Default::default()
+            };
+            unsafe {
+                let _ = DwmUpdateThumbnailProperties(*thumbnail, &properties);
+            }
+        }
+    }
+
+    fn render(&mut self) {
+        let Some(surface) = &mut self.surface else {
+            return;
+        };
+        preview::draw(
+            &mut surface.pixmap,
+            &self.layout,
+            &self.titles,
+            self.hovered,
+            self.close_hovered,
+            self.scale,
+        );
+        surface.copy_to_dib();
+        let blend = BLENDFUNCTION {
+            BlendOp: AC_SRC_OVER as u8,
+            SourceConstantAlpha: 255,
+            AlphaFormat: AC_SRC_ALPHA as u8,
+            ..Default::default()
+        };
+        unsafe {
+            let _ = UpdateLayeredWindow(
+                self.hwnd,
+                None,
+                Some(&self.pos),
+                Some(&SIZE {
+                    cx: surface.width as i32,
+                    cy: surface.height as i32,
+                }),
+                Some(surface.dc),
+                Some(&POINT { x: 0, y: 0 }),
+                COLORREF(0),
+                Some(&blend),
+                ULW_ALPHA,
+            );
+        }
+    }
+
+    fn hide(&mut self) {
+        if !self.visible && self.thumbnails.is_empty() {
+            return;
+        }
+        self.unregister();
+        unsafe {
+            let _ = ShowWindow(self.hwnd, SW_HIDE);
+        }
+        self.visible = false;
+        self.target = None;
+        self.sources.clear();
+        self.titles.clear();
+    }
+
+    /// El cursor (en pantalla) está sobre el panel.
+    fn contains(&self, point: POINT) -> bool {
+        let Some(surface) = &self.surface else {
+            return false;
+        };
+        self.visible
+            && point.x >= self.pos.x
+            && point.x < self.pos.x + surface.width as i32
+            && point.y >= self.pos.y
+            && point.y < self.pos.y + surface.height as i32
+    }
+}
+impl Drop for PreviewWindow {
+    fn drop(&mut self) {
+        self.hide();
+        unsafe {
+            let _ = windows::Win32::UI::WindowsAndMessaging::DestroyWindow(self.hwnd);
+        }
+    }
+}
+
+/// Título de una ventana, para la vista previa.
+fn window_title(hwnd: isize) -> String {
+    use windows::Win32::UI::WindowsAndMessaging::GetWindowTextW;
+    let mut buffer = [0u16; 256];
+    let len = unsafe { GetWindowTextW(HWND(hwnd as *mut _), &mut buffer) };
+    String::from_utf16_lossy(&buffer[..len.max(0) as usize])
+}
+
+unsafe extern "system" fn preview_wndproc(
+    hwnd: HWND,
+    msg: u32,
+    wparam: WPARAM,
+    lparam: LPARAM,
+) -> LRESULT {
+    let point = |scale: f32| {
+        (
+            (lparam.0 & 0xffff) as i16 as f32 / scale,
+            ((lparam.0 >> 16) & 0xffff) as i16 as f32 / scale,
+        )
+    };
+    match msg {
+        // Pulsarla no quita el foco a la ventana activa.
+        WM_MOUSEACTIVATE => LRESULT(MA_NOACTIVATE as isize),
+        WM_MOUSEMOVE => {
+            with_app(|app| {
+                let Some(panel) = app.preview.as_mut().filter(|p| p.visible) else {
+                    return;
+                };
+                let mut track = TRACKMOUSEEVENT {
+                    cbSize: std::mem::size_of::<TRACKMOUSEEVENT>() as u32,
+                    dwFlags: TME_LEAVE,
+                    hwndTrack: hwnd,
+                    dwHoverTime: 0,
+                };
+                let _ = TrackMouseEvent(&mut track);
+                let (x, y) = point(panel.scale);
+                let hovered = panel.layout.card_at(x, y);
+                let close = panel.layout.close_at(x, y);
+                if (hovered, close) != (panel.hovered, panel.close_hovered) {
+                    panel.hovered = hovered;
+                    panel.close_hovered = close;
+                    panel.render();
+                }
+            });
+            LRESULT(0)
+        }
+        WM_MOUSELEAVE => {
+            with_app(|app| {
+                if let Some(panel) = app.preview.as_mut().filter(|p| p.visible) {
+                    panel.hovered = None;
+                    panel.close_hovered = None;
+                    panel.render();
+                }
+            });
+            LRESULT(0)
+        }
+        // Clic en una tarjeta: trae su ventana al frente; en su ✕, la cierra (como en
+        // Windows, le pide que se cierre, así que puede preguntar si guardar).
+        WM_LBUTTONUP => {
+            with_app(|app| {
+                let Some(panel) = app.preview.as_mut().filter(|p| p.visible) else {
+                    return;
+                };
+                let (x, y) = point(panel.scale);
+                let close = panel.layout.close_at(x, y);
+                let Some(index) = close.or_else(|| panel.layout.card_at(x, y)) else {
+                    return;
+                };
+                let source = panel.sources[index];
+                panel.hide();
+                if close.is_some() {
+                    let _ = windows::Win32::UI::WindowsAndMessaging::PostMessageW(
+                        Some(HWND(source as *mut _)),
+                        windows::Win32::UI::WindowsAndMessaging::WM_CLOSE,
+                        WPARAM(0),
+                        LPARAM(0),
+                    );
+                } else {
+                    apps::focus_window(source);
+                }
+            });
+            LRESULT(0)
+        }
         _ => DefWindowProcW(hwnd, msg, wparam, lparam),
     }
 }
@@ -2153,6 +2892,30 @@ fn main() -> Result<()> {
             ..Default::default()
         };
         if RegisterClassExW(&quick_class) == 0 {
+            return Err(windows::core::Error::from_thread());
+        }
+
+        let language_class = WNDCLASSEXW {
+            cbSize: std::mem::size_of::<WNDCLASSEXW>() as u32,
+            lpfnWndProc: Some(language_wndproc),
+            hInstance: instance.into(),
+            hCursor: LoadCursorW(None, IDC_ARROW)?,
+            lpszClassName: w!("GlassBarLanguage"),
+            ..Default::default()
+        };
+        if RegisterClassExW(&language_class) == 0 {
+            return Err(windows::core::Error::from_thread());
+        }
+
+        let preview_class = WNDCLASSEXW {
+            cbSize: std::mem::size_of::<WNDCLASSEXW>() as u32,
+            lpfnWndProc: Some(preview_wndproc),
+            hInstance: instance.into(),
+            hCursor: LoadCursorW(None, IDC_ARROW)?,
+            lpszClassName: w!("GlassBarPreview"),
+            ..Default::default()
+        };
+        if RegisterClassExW(&preview_class) == 0 {
             return Err(windows::core::Error::from_thread());
         }
 

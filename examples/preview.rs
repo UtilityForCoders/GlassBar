@@ -4,6 +4,8 @@ use std::fs::File;
 use std::io::Write;
 use tiny_skia::Pixmap;
 
+#[path = "../src/accent.rs"]
+mod accent;
 #[path = "../src/apps.rs"]
 mod apps;
 #[path = "../src/bar.rs"]
@@ -16,6 +18,8 @@ mod clock;
 mod glass;
 #[path = "../src/icons.rs"]
 mod icons;
+#[path = "../src/keyboard.rs"]
+mod keyboard;
 #[path = "../src/launcher.rs"]
 mod launcher;
 #[path = "../src/pins.rs"]

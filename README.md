@@ -1,6 +1,6 @@
 # GlassBar
 
-Dock minimalista para Windows 10/11: iconos reales, estado de red, volumen y batería, y hora en Segoe UI. Fondo plano con 51% de opacidad, borde tenue y sin sombras ni brillo superior. No incluye widgets ni fecha.
+Dock minimalista para Windows 10/11: iconos reales con vista previa de sus ventanas, idioma del teclado, estado de red, volumen y batería, y hora y fecha en Segoe UI. Fondo plano con 51% de opacidad, borde tenue y sin sombras ni brillo superior. No incluye widgets.
 
 ## Agregar programas
 
@@ -24,6 +24,18 @@ Escribe para buscar; la búsqueda ignora mayúsculas y tildes, admite varias pal
 
 El botón de encendido del pie abre un menú como el del Inicio de Windows 11 con **Bloquear**, **Suspender**, **Apagar** y **Reiniciar**, con los iconos del sistema (Segoe Fluent Icons). Aparece en 200 ms, desvaneciéndose y subiendo unos píxeles; si los efectos de animación de Windows están desactivados, aparece directamente. También se recorre con las flechas y Enter; Escape o un clic fuera lo cierran sin hacer nada. Apagar y reiniciar piden a Windows el cierre normal, sin forzar el de las aplicaciones abiertas.
 
+## Vista previa de ventanas
+
+Al dejar el cursor sobre un programa con ventanas abiertas aparece, encima de su icono, una tarjeta por ventana con su título y su miniatura en vivo (la dibuja Windows con DWM, como en su barra), en fila; si no caben en la pantalla se encogen. La tarjeta bajo el cursor se resalta y muestra su ✕. Al pasar a otro programa la vista previa cambia al momento; un clic trae la ventana al frente y la **✕** le pide que se cierre. El panel se mantiene mientras el cursor va del icono hacia él y el dock no se oculta mientras está abierto. Los programas sin ventana siguen mostrando su nombre.
+
+## Idioma del teclado
+
+Con más de un teclado instalado, entre la flecha de iconos ocultos y el estado aparece el idioma de la ventana activa en tres letras ("ESP") y, debajo, la distribución si no es la normal de ese idioma ("INTL" para Estados Unidos-Internacional), como en la barra de Windows. Se actualiza al cambiar de ventana y con los atajos de idioma. El globo muestra el nombre completo. Un clic abre el panel de idioma de GlassBar, con el estilo del panel rápido: un teclado por fila (abreviatura, nombre y una marca en el actual) y **Más configuración de idioma**. El elegido se aplica a la ventana que estaba activa; también se recorre con las flechas y Enter, y Escape o un clic fuera lo cierran.
+
+## Hora y fecha
+
+El reloj muestra la hora y, debajo, la fecha corta en el formato regional del usuario; al pasar el cursor, el globo muestra la fecha larga. Un clic abre la configuración de fecha y hora.
+
 ## Red, volumen y batería
 
 Entre la flecha de iconos ocultos y la hora, el dock muestra el estado del sistema con los iconos de Windows 11 (Segoe Fluent Icons):
@@ -44,7 +56,7 @@ Un clic en el grupo abre el panel rápido de GlassBar justo encima, con el estil
 - **Salida de audio:** la flecha **›** junto al volumen abre la lista de salidas (altavoces, auriculares…), con la predeterminada marcada; un clic la cambia. Debajo aparecen las aplicaciones que están usando el audio, con su icono y la salida que usan; un clic despliega las salidas para elegir otra o volver a la predeterminada, y Windows lo recuerda para la próxima vez. Windows no ofrece una API pública para esto: GlassBar usa las interfaces internas de su configuración de sonido (`IPolicyConfig` y `AudioPolicyConfig`, Windows 10 1803 o posterior), como EarTrumpet. Si no están, la lista lo indica. **Más configuración de sonido** abre "Volumen y dispositivos de aplicaciones".
 - **Pie:** nivel de batería (si la hay) y **Más opciones**, que abre el panel de Windows para lo demás.
 
-Las barras se arrastran o se mueven con la rueda de 2 % en 2 %. Leer y cambiar las radios y el brillo puede tardar, así que se hace en un hilo aparte y el panel no se bloquea. Escape o un clic fuera lo cierran.
+Los botones activos, las barras, la línea del campo de contraseña y las selecciones de texto usan el color de énfasis de Windows (Configuración → Personalización → Colores), con los mismos tonos que Windows usa en modo oscuro: el oscuro para los botones activos y el claro para barras y selecciones. Si se cambia el color, GlassBar lo aplica al momento. Las barras se arrastran o se mueven con la rueda de 2 % en 2 %. Leer y cambiar las radios y el brillo puede tardar, así que se hace en un hilo aparte y el panel no se bloquea. Escape o un clic fuera lo cierran.
 
 ## Tecla Windows
 
@@ -56,7 +68,7 @@ Volver a ejecutar GlassBar mientras ya está abierto muestra u oculta este lanza
 
 Acerca el cursor a los últimos 6 píxeles lógicos del borde inferior del monitor principal para desplegar la barra. Al alejarlo, espera 300 ms y se oculta con una animación suave sin rebote. El margen entre la barra y el borde también permite mantenerla abierta. Se oculta por completo, incluso si activaste el borde sin entrar en ella.
 
-La barra inicia con el Explorador si no hay configuración guardada. El ancho se adapta a los programas anclados; si supera la pantalla, se reduce la escala. La hora usa formato de 24 horas. Los indicadores de ejecución comparan nombres de ejecutables; los accesos web y algunas aplicaciones empaquetadas pueden no mostrar indicador.
+La barra inicia con el Explorador si no hay configuración guardada. El ancho se adapta a los programas anclados; si supera la pantalla, se reduce la escala. La hora usa formato de 24 horas; la fecha, el formato regional. Los indicadores de ejecución comparan nombres de ejecutables; los accesos web y algunas aplicaciones empaquetadas pueden no mostrar indicador.
 
 La transparencia usa composición alfa real, sin desenfoque de fondo. Mientras GlassBar está abierto, oculta las barras nativas del monitor principal y los secundarios. Un evento de Windows vuelve a ocultarlas cuando Explorer intenta mostrarlas; la comprobación periódica también cubre reinicios de Explorer. Al salir normalmente, se quita el detector y se restaura la barra original. No se modifican las preferencias de la barra de Windows. Un segundo proceso `glassbar.exe` (el vigilante) espera a que GlassBar termine y vuelve a mostrar la barra nativa, incluso si se cerró a la fuerza o falló.
 

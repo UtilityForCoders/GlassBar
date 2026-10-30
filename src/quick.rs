@@ -36,9 +36,7 @@ const AUDIO_BUTTON: f32 = 28.0;
 const FOOTER_Y: f32 = 196.0;
 const MORE_W: f32 = 112.0;
 const BACKGROUND: [u8; 4] = [32, 32, 34, 246];
-/// Azul de los controles activos, como el color de énfasis por defecto de Windows.
-const ACCENT: [u8; 4] = [76, 160, 255, 255];
-const TILE_ON: [u8; 4] = [0, 95, 184, 255];
+// Los controles activos usan el color de énfasis de Windows (`crate::accent`).
 /// Zona de la flecha "›" a la derecha de los botones de Wi-Fi y Bluetooth.
 const ARROW_W: f32 = 36.0;
 /// Vista de lista (redes o dispositivos): más alta, con cabecera, lista desplazable
@@ -650,8 +648,8 @@ impl QuickState {
         let on = state == Some(true);
         let hovered = self.hovered == Some(Hit::Tile(radio));
         let fill = match (on, hovered) {
-            (true, false) => TILE_ON,
-            (true, true) => [24, 112, 200, 255],
+            (true, false) => crate::accent::current().dark,
+            (true, true) => crate::accent::current().base,
             (false, false) => [255, 255, 255, 14],
             (false, true) => [255, 255, 255, 24],
         };
@@ -1041,7 +1039,7 @@ impl QuickState {
             // Línea de color abajo: el campo tiene el teclado, como en Windows.
             fill_rounded(
                 image,
-                ACCENT,
+                crate::accent::current().light,
                 (fx + 1.0) * scale,
                 (fy + fh - 2.0) * scale,
                 (fw - 2.0) * scale,
@@ -1067,7 +1065,7 @@ impl QuickState {
                 );
                 fill_rounded(
                     image,
-                    [76, 160, 255, 110],
+                    crate::accent::with_alpha(crate::accent::current().light, 110),
                     text_x + (start - first) as f32 * dot + scale,
                     cy * scale - (ascent + descent) / 2.0,
                     (end - start) as f32 * dot,
@@ -1114,12 +1112,17 @@ impl QuickState {
                 Hit::JoinCancel,
                 [255, 255, 255, 20],
             ),
-            (confirm_rect(), "Conectar", Hit::JoinConfirm, TILE_ON),
+            (
+                confirm_rect(),
+                "Conectar",
+                Hit::JoinConfirm,
+                crate::accent::current().dark,
+            ),
         ] {
             let (x, y, w, h) = rect;
             let hovered = self.hovered == Some(hit);
             let fill = match (hovered, hit) {
-                (true, Hit::JoinConfirm) => [24, 112, 200, 255],
+                (true, Hit::JoinConfirm) => crate::accent::current().base,
                 (true, _) => [255, 255, 255, 32],
                 _ => fill,
             };
@@ -1482,7 +1485,11 @@ impl QuickState {
             return;
         };
         let muted = slider == Slider::Volume && self.volume.is_some_and(|v| v.muted);
-        let color = if muted { [150, 150, 155, 255] } else { ACCENT };
+        let color = if muted {
+            [150, 150, 155, 255]
+        } else {
+            crate::accent::current().light
+        };
         let thumb = SLIDER_X + SLIDER_W * value;
         fill_rounded(
             image,
