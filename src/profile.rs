@@ -244,6 +244,11 @@ mod enabled {
         }
     }
 
+    /// Registra una duración ya medida (p. ej. el tiempo entre dos fotogramas).
+    pub fn interval(name: &'static str, elapsed: Duration) {
+        record(name, elapsed, 0, 0);
+    }
+
     /// Mide una expresión.
     pub fn time<R>(name: &'static str, f: impl FnOnce() -> R) -> R {
         let _scope = scope(name);
@@ -662,7 +667,7 @@ mod enabled {
 
     fn timer_name(id: usize) -> &'static str {
         match id {
-            1 => "TIMER_ANIM (16 ms, animaciones)",
+            1 => "TIMER_ANIM (un fotograma por refresco)",
             2 => "TIMER_TICK (1 s, reloj/apps/estado)",
             3 => "TIMER_EDGE (40 ms, borde/autoocultar)",
             4 => "TIMER_TIP (globo)",
