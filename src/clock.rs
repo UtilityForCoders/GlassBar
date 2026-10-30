@@ -100,6 +100,12 @@ fn glyph(font: &Font, c: char, size: f32) -> Glyph {
 }
 
 fn rasterize_with(font: &Font, text: &str, size: f32) -> Pixmap {
+    rasterize_line(font, text, size).0
+}
+
+/// Texto rasterizado y cuántos píxeles sube su glifo más alto sobre la línea base
+/// (la primera fila de la imagen).
+fn rasterize_line(font: &Font, text: &str, size: f32) -> (Pixmap, i32) {
     let glyphs: Vec<Glyph> = text.chars().map(|c| glyph(font, c, size)).collect();
     let width = glyphs.iter().map(|g| g.0.advance_width).sum::<f32>().ceil() as u32 + 2;
     let top = glyphs
@@ -125,12 +131,34 @@ fn rasterize_with(font: &Font, text: &str, size: f32) -> Pixmap {
         }
         pen += metrics.advance_width;
     }
-    image
+    (image, top)
 }
 
 /// Texto de interfaz con la misma fuente que el reloj; `y` es el borde superior.
 pub fn draw_text(target: &mut Pixmap, text: &str, x: f32, y: f32, size: f32, opacity: f32) {
     blit_text(target, rasterize(text, size), x, y, opacity);
+}
+
+/// Como `draw_text`, pero apoyado en la línea base `baseline`: el texto no sube ni
+/// baja según las letras que lleve (p. ej. "a" frente a "A"), como al escribir.
+pub fn draw_text_on_baseline(
+    target: &mut Pixmap,
+    text: &str,
+    x: f32,
+    baseline: f32,
+    size: f32,
+    opacity: f32,
+) {
+    let (image, top) = rasterize_line(system_font(), text, size);
+    blit_text(target, image, x, baseline - top as f32, opacity);
+}
+
+/// Cuánto sube y baja una línea de Segoe UI respecto a su línea base.
+pub fn line_metrics(size: f32) -> (f32, f32) {
+    system_font()
+        .horizontal_line_metrics(size)
+        .map(|m| (m.ascent, -m.descent))
+        .unwrap_or((size * 1.08, size * 0.25))
 }
 
 /// Como `draw_text`, en Segoe UI Semibold.

@@ -22,6 +22,8 @@ mod launcher;
 mod pins;
 #[path = "../src/spring.rs"]
 mod spring;
+#[path = "../src/textfield.rs"]
+mod textfield;
 #[path = "../src/usage.rs"]
 mod usage;
 
