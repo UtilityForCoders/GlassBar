@@ -26,11 +26,11 @@ El botón de encendido del pie abre un menú como el del Inicio de Windows 11 co
 
 ## Vista previa de ventanas
 
-Al dejar el cursor sobre un programa con una ventana abierta aparece, encima de su icono, un panel con el título de la ventana y su miniatura en vivo (la dibuja Windows con DWM, como en su barra). Al pasar a otro programa la vista previa cambia al momento; un clic trae la ventana al frente y la **✕** le pide que se cierre. El panel se mantiene mientras el cursor va del icono hacia él y el dock no se oculta mientras está abierto. Los programas sin ventana siguen mostrando su nombre.
+Al dejar el cursor sobre un programa con ventanas abiertas aparece, encima de su icono, una tarjeta por ventana con su título y su miniatura en vivo (la dibuja Windows con DWM, como en su barra), en fila; si no caben en la pantalla se encogen. La tarjeta bajo el cursor se resalta y muestra su ✕. Al pasar a otro programa la vista previa cambia al momento; un clic trae la ventana al frente y la **✕** le pide que se cierre. El panel se mantiene mientras el cursor va del icono hacia él y el dock no se oculta mientras está abierto. Los programas sin ventana siguen mostrando su nombre.
 
 ## Idioma del teclado
 
-Con más de un teclado instalado, entre la flecha de iconos ocultos y el estado aparece el idioma de la ventana activa en tres letras ("ESP") y, debajo, la distribución si no es la normal de ese idioma ("INTL" para Estados Unidos-Internacional), como en la barra de Windows. Se actualiza al cambiar de ventana y con los atajos de idioma. El globo muestra el nombre completo y un clic abre un menú con los teclados instalados para cambiar el de la ventana activa.
+Con más de un teclado instalado, entre la flecha de iconos ocultos y el estado aparece el idioma de la ventana activa en tres letras ("ESP") y, debajo, la distribución si no es la normal de ese idioma ("INTL" para Estados Unidos-Internacional), como en la barra de Windows. Se actualiza al cambiar de ventana y con los atajos de idioma. El globo muestra el nombre completo. Un clic abre el panel de idioma de GlassBar, con el estilo del panel rápido: un teclado por fila (abreviatura, nombre y una marca en el actual) y **Más configuración de idioma**. El elegido se aplica a la ventana que estaba activa; también se recorre con las flechas y Enter, y Escape o un clic fuera lo cierran.
 
 ## Hora y fecha
 
