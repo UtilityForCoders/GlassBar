@@ -2,8 +2,11 @@
 //! Wi-Fi y Bluetooth, brillo y volumen, con el estilo del lanzador. "Más opciones"
 //! abre el panel de Windows para lo que este aún no tiene.
 use crate::apps::{fill_rounded, stroke_rounded};
-use crate::clock::{draw_icon_aligned, draw_text, draw_text_semibold, fit_text, text_width};
-use crate::status::{battery_glyph, volume_glyph, Battery, Volume};
+use crate::clock::{
+    draw_icon_aligned, draw_text, draw_text_on_baseline, draw_text_semibold, fit_text,
+    line_metrics, text_width,
+};
+use crate::status::{draw_battery, volume_glyph, Battery, Volume};
 use crate::system::{Radio, Snapshot};
 use tiny_skia::Pixmap;
 
@@ -21,7 +24,7 @@ const ROW_H: f32 = 40.0;
 const SLIDER_X: f32 = PAD + 40.0;
 const SLIDER_W: f32 = WIDTH - PAD - 44.0 - SLIDER_X;
 const FOOTER_Y: f32 = 196.0;
-const MORE_W: f32 = 128.0;
+const MORE_W: f32 = 112.0;
 const BACKGROUND: [u8; 4] = [32, 32, 34, 246];
 /// Azul de los controles activos, como el color de énfasis por defecto de Windows.
 const ACCENT: [u8; 4] = [76, 160, 255, 255];
@@ -330,25 +333,33 @@ impl QuickState {
 
     fn draw_footer(&self, image: &mut Pixmap, scale: f32) {
         let cy = FOOTER_Y + (HEIGHT - FOOTER_Y) / 2.0;
+        // Los textos del pie se apoyan en una línea base centrada en la fila, para que
+        // queden a la altura de los iconos sin importar las letras que lleven.
+        let size = 13.0 * scale;
+        let (ascent, descent) = line_metrics(size);
+        let baseline = cy * scale + (ascent - descent) / 2.0;
+        let (x, y, w, h) = more_rect();
         if let Some(battery) = self.battery {
-            draw_icon_aligned(
+            draw_battery(
                 image,
-                battery_glyph(battery),
+                battery,
                 (PAD + 12.0) * scale,
                 cy * scale,
                 16.0 * scale,
                 0.9,
             );
-            draw_text(
+            // Lo que no quepa antes del botón se acorta con "…".
+            let left = PAD + 28.0;
+            let text = format!("{} % · {}", battery.percent, battery.state());
+            draw_text_on_baseline(
                 image,
-                &format!("{} %", battery.percent),
-                (PAD + 28.0) * scale,
-                (cy - 9.0) * scale,
-                13.0 * scale,
+                &fit_text(&text, size, (x - 8.0 - left) * scale),
+                left * scale,
+                baseline,
+                size,
                 0.9,
             );
         }
-        let (x, y, w, h) = more_rect();
         if self.hovered == Some(Hit::More) {
             fill_rounded(
                 image,
@@ -361,16 +372,15 @@ impl QuickState {
             );
         }
         let label = "Más opciones";
-        let size = 13.0 * scale;
         let text_w = text_width(label, size);
-        // Texto y flecha "›" centrados en el botón.
+        // Texto y flecha "›" centrados en el botón y a la misma altura.
         let left = (x + w / 2.0) * scale - (text_w + 14.0 * scale) / 2.0;
-        draw_text(image, label, left, (y + 7.0) * scale, size, 0.9);
+        draw_text_on_baseline(image, label, left, baseline, size, 0.9);
         draw_icon_aligned(
             image,
             '\u{E76C}',
             left + text_w + 9.0 * scale,
-            (y + h / 2.0) * scale,
+            cy * scale,
             10.0 * scale,
             0.8,
         );

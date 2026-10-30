@@ -343,6 +343,17 @@ impl BarState {
             );
         }
         for (index, item) in self.status.items().into_iter().enumerate() {
+            if let (Item::Battery, Some(battery)) = (item, self.status.battery) {
+                crate::status::draw_battery(
+                    pixmap,
+                    battery,
+                    self.status_center(index, scale),
+                    cy,
+                    STATUS_ICON * scale,
+                    0.95,
+                );
+                continue;
+            }
             let (glyph, opacity) = self.status.glyph(item);
             draw_icon_aligned(
                 pixmap,
@@ -441,6 +452,8 @@ mod tests {
         bar.status.battery = Some(crate::status::Battery {
             percent: 80,
             plugged: false,
+            charging: false,
+            remaining: None,
         });
         for count in [0, 1, 5, 24] {
             bar.primary_apps = (0..count)

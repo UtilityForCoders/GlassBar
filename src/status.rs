@@ -19,8 +19,29 @@ pub struct Volume {
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct Battery {
     pub percent: u8,
-    /// Enchufado a la corriente (cargando o ya cargado).
+    /// Enchufado a la corriente, esté cargando o no.
     pub plugged: bool,
+    /// La batería está cargando ahora mismo (enchufada no basta: llena, o con el
+    /// límite de carga de algunos portátiles, no carga).
+    pub charging: bool,
+    /// Minutos que quedan con batería, si Windows los calcula.
+    pub remaining: Option<u32>,
+}
+
+impl Battery {
+    /// Estado en pocas palabras: "Cargando", "Cargada", "Quedan 3 h 20 min"…
+    pub fn state(&self) -> String {
+        match (self.plugged, self.charging, self.remaining) {
+            (_, true, _) => "Cargando".into(),
+            (true, false, _) if self.percent >= 100 => "Cargada".into(),
+            (true, false, _) => "Enchufada, sin cargar".into(),
+            (false, _, Some(minutes)) if minutes >= 60 => {
+                format!("Quedan {} h {} min", minutes / 60, minutes % 60)
+            }
+            (false, _, Some(minutes)) => format!("Quedan {minutes} min"),
+            (false, _, None) => "Con batería".into(),
+        }
+    }
 }
 
 #[derive(Clone, Copy, Debug, PartialEq)]
@@ -98,9 +119,7 @@ impl Status {
                 Some(v) => format!("Volumen: {} %", (v.level * 100.0).round() as u32),
             },
             Item::Battery => match self.battery {
-                Some(b) if b.plugged && b.percent >= 100 => "Batería: 100 % (cargada)".into(),
-                Some(b) if b.plugged => format!("Batería: {} % (cargando)", b.percent),
-                Some(b) => format!("Batería: {} %", b.percent),
+                Some(b) => format!("Batería: {} % ({})", b.percent, b.state().to_lowercase()),
                 None => String::new(),
             },
         }
@@ -117,16 +136,70 @@ pub fn volume_glyph(level: f32) -> char {
     }
 }
 
-/// Batería en once pasos (0 a 10), con rayo si está enchufada.
+/// Batería en once pasos (0 a 10). Si está enchufada, `draw_battery` le pone el rayo.
 pub fn battery_glyph(battery: Battery) -> char {
     let step = ((battery.percent.min(100) as u32 + 5) / 10).min(10);
-    if battery.plugged {
-        char::from_u32(0xEBA0 + step).unwrap_or('\u{EBAA}')
-    } else if step == 10 {
+    if step == 10 {
         '\u{E83F}'
     } else {
         char::from_u32(0xE850 + step).unwrap_or('\u{E850}')
     }
+}
+
+/// Icono de batería centrado en (`cx`, `cy`), con un rayo encima si está enchufada.
+/// El rayo se dibuja aparte, con un borde oscuro para que se vea también sobre la
+/// parte llena, en lugar de depender de los iconos de carga de cada versión de Windows.
+pub fn draw_battery(
+    pixmap: &mut tiny_skia::Pixmap,
+    battery: Battery,
+    cx: f32,
+    cy: f32,
+    size: f32,
+    opacity: f32,
+) {
+    crate::clock::draw_icon_aligned(pixmap, battery_glyph(battery), cx, cy, size, opacity);
+    if !battery.plugged {
+        return;
+    }
+    // Rayo en coordenadas de 0 a 1, de arriba abajo.
+    const BOLT: [(f32, f32); 7] = [
+        (0.62, 0.0),
+        (0.14, 0.56),
+        (0.46, 0.56),
+        (0.36, 1.0),
+        (0.86, 0.42),
+        (0.54, 0.42),
+        (0.68, 0.0),
+    ];
+    let height = size * 0.72;
+    let (left, top) = (cx - size * 0.06 - height * 0.5, cy - height / 2.0);
+    let mut pb = tiny_skia::PathBuilder::new();
+    for (i, (x, y)) in BOLT.iter().enumerate() {
+        let (px, py) = (left + x * height, top + y * height);
+        if i == 0 {
+            pb.move_to(px, py);
+        } else {
+            pb.line_to(px, py);
+        }
+    }
+    pb.close();
+    let Some(path) = pb.finish() else {
+        return;
+    };
+    let mut paint = tiny_skia::Paint {
+        anti_alias: true,
+        ..Default::default()
+    };
+    paint.set_color_rgba8(28, 28, 30, (230.0 * opacity) as u8);
+    let outline = tiny_skia::Stroke {
+        width: size * 0.16,
+        line_join: tiny_skia::LineJoin::Round,
+        ..Default::default()
+    };
+    let identity = tiny_skia::Transform::identity();
+    pixmap.stroke_path(&path, &paint, &outline, identity, None);
+    paint.set_color_rgba8(255, 255, 255, (245.0 * opacity) as u8);
+    pixmap.fill_path(&path, &paint, tiny_skia::FillRule::Winding, identity, None);
 }
 
 /// Lee el estado actual de red, audio y batería.
@@ -324,9 +397,16 @@ unsafe fn battery() -> Option<Battery> {
     if power.BatteryFlag & 128 != 0 || power.BatteryFlag == 255 || power.BatteryLifePercent > 100 {
         return None;
     }
+    // BatteryLifeTime: segundos restantes, o u32::MAX si Windows no los sabe
+    // (enchufada, o recién desenchufada mientras lo calcula).
+    let remaining = (power.ACLineStatus != 1 && power.BatteryLifeTime != u32::MAX)
+        .then(|| power.BatteryLifeTime / 60);
     Some(Battery {
         percent: power.BatteryLifePercent,
         plugged: power.ACLineStatus == 1,
+        // 8: cargando.
+        charging: power.BatteryFlag & 8 != 0,
+        remaining,
     })
 }
 
@@ -336,28 +416,41 @@ mod tests {
 
     #[test]
     fn battery_only_shows_when_present_and_icons_follow_the_state() {
+        let battery = |percent, plugged, charging, remaining| {
+            Some(Battery {
+                percent,
+                plugged,
+                charging,
+                remaining,
+            })
+        };
         let mut status = Status::default();
         assert_eq!(status.items(), [Item::Network, Item::Volume]);
-        status.battery = Some(Battery {
-            percent: 47,
-            plugged: false,
-        });
+        status.battery = battery(47, false, false, None);
         assert_eq!(status.items(), [Item::Network, Item::Volume, Item::Battery]);
 
-        // Batería: 47 % se redondea a 5 de 10; enchufada lleva rayo; llena, el icono completo.
+        // 47 % se redondea a 5 de 10; llena, el icono completo. El rayo de la carga se
+        // dibuja encima, así que el icono base es el mismo.
         assert_eq!(status.glyph(Item::Battery).0, '\u{E855}');
-        assert_eq!(status.label(Item::Battery), "Batería: 47 %");
-        status.battery = Some(Battery {
-            percent: 47,
-            plugged: true,
-        });
-        assert_eq!(status.glyph(Item::Battery).0, '\u{EBA5}');
+        assert_eq!(status.label(Item::Battery), "Batería: 47 % (con batería)");
+        status.battery = battery(47, true, true, None);
+        assert_eq!(status.glyph(Item::Battery).0, '\u{E855}');
         assert_eq!(status.label(Item::Battery), "Batería: 47 % (cargando)");
-        status.battery = Some(Battery {
-            percent: 100,
-            plugged: false,
-        });
+        status.battery = battery(100, false, false, None);
         assert_eq!(status.glyph(Item::Battery).0, '\u{E83F}');
+
+        // Los estados que se distinguen, como en Windows.
+        let state = |b: Option<Battery>| b.unwrap().state();
+        assert_eq!(state(battery(100, true, false, None)), "Cargada");
+        assert_eq!(
+            state(battery(80, true, false, None)),
+            "Enchufada, sin cargar"
+        );
+        assert_eq!(
+            state(battery(80, false, false, Some(200))),
+            "Quedan 3 h 20 min"
+        );
+        assert_eq!(state(battery(12, false, false, Some(25))), "Quedan 25 min");
 
         // Volumen: ondas según el nivel, y la cruz al silenciar.
         let volume = |level, muted| Some(Volume { level, muted });
