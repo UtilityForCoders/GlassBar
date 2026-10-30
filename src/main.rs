@@ -19,6 +19,7 @@ mod pins;
 mod priority;
 mod shell;
 mod spring;
+mod textfield;
 mod tray;
 mod usage;
 mod winkey;
@@ -455,6 +456,31 @@ unsafe fn clipboard_text(hwnd: HWND) -> Option<String> {
     text
 }
 
+/// Copia `text` al portapapeles como texto Unicode.
+unsafe fn set_clipboard_text(hwnd: HWND, text: &str) {
+    use windows::Win32::Foundation::{GlobalFree, HANDLE};
+    use windows::Win32::System::{DataExchange::*, Memory::*};
+    let wide: Vec<u16> = text.encode_utf16().chain(std::iter::once(0)).collect();
+    if OpenClipboard(Some(hwnd)).is_err() {
+        return;
+    }
+    let _ = EmptyClipboard();
+    if let Ok(global) = GlobalAlloc(GMEM_MOVEABLE, wide.len() * 2) {
+        let pointer = GlobalLock(global).cast::<u16>();
+        if pointer.is_null() {
+            let _ = GlobalFree(Some(global));
+        } else {
+            std::ptr::copy_nonoverlapping(wide.as_ptr(), pointer, wide.len());
+            let _ = GlobalUnlock(global);
+            // 13 = CF_UNICODETEXT. Si Windows lo acepta, la memoria pasa a ser suya.
+            if SetClipboardData(13, Some(HANDLE(global.0))).is_err() {
+                let _ = GlobalFree(Some(global));
+            }
+        }
+    }
+    let _ = CloseClipboard();
+}
+
 /// Bloquea, suspende, apaga o reinicia. Apagar y reiniciar piden a Windows el
 /// cierre normal, sin forzar el de las aplicaciones abiertas.
 fn run_power(option: launcher::Power) -> bool {
@@ -539,8 +565,9 @@ unsafe extern "system" fn launcher_wndproc(
                     }
                     if msg == WM_LBUTTONUP {
                         if menu.model.in_search(x, y) {
-                            menu.model.caret = menu.model.query.chars().count();
-                            menu.model.select_all = false;
+                            let shift =
+                                windows::Win32::UI::Input::KeyboardAndMouse::GetKeyState(0x10) < 0;
+                            menu.model.click_search(x, shift);
                             menu.model.selection = None;
                         }
                         if let Some(hit) = hit {
@@ -567,8 +594,9 @@ unsafe extern "system" fn launcher_wndproc(
         WM_CHAR => {
             with_app(|app| {
                 if let Some(menu) = app.launcher.as_mut().filter(|menu| menu.visible) {
-                    if let Some(ch) = char::from_u32(wparam.0 as u32) {
-                        menu.model.type_char(ch);
+                    // Retroceso (y Ctrl+Retroceso, que llega como 0x7F) se atiende en WM_KEYDOWN.
+                    if let Some(ch) = char::from_u32(wparam.0 as u32).filter(|c| !c.is_control()) {
+                        menu.model.insert_text(&ch.to_string());
                         menu.render();
                     }
                 }
@@ -577,59 +605,79 @@ unsafe extern "system" fn launcher_wndproc(
         WM_KEYDOWN => {
             with_app(|app| {
                 if let Some(menu) = app.launcher.as_mut().filter(|menu| menu.visible) {
-                    let ctrl = windows::Win32::UI::Input::KeyboardAndMouse::GetKeyState(0x11) < 0;
+                    use windows::Win32::UI::Input::KeyboardAndMouse::GetKeyState;
+                    let ctrl = GetKeyState(0x11) < 0;
+                    let shift = GetKeyState(0x10) < 0;
+                    let menu_open = menu.model.power_menu;
                     match wparam.0 {
                         0x1B => {
-                            if menu.model.power_menu {
+                            if menu_open {
                                 menu.model.power_menu = false;
                                 menu.render();
                             } else {
                                 menu.hide();
                             }
                         }
-                        0x0D if !menu.model.power_menu => {
+                        0x0D if !menu_open => {
                             if let Some(hit) = menu.model.first_match() {
                                 action = menu.model.activate(hit);
                             }
                         }
-                        0x41 if ctrl && !menu.model.power_menu => {
-                            menu.model.select_all = true;
+                        // Ctrl+A, Ctrl+C, Ctrl+X y Ctrl+V, como en cualquier cuadro de texto.
+                        0x41 if ctrl && !menu_open => {
+                            menu.model.edit(|field| field.select_all());
                             menu.render();
                         }
-                        0x56 if ctrl && !menu.model.power_menu => {
+                        0x43 if ctrl && !menu_open => {
+                            if let Some(text) = menu.model.query.selected_text() {
+                                set_clipboard_text(hwnd, &text);
+                            }
+                        }
+                        0x58 if ctrl && !menu_open => {
+                            if let Some(Some(text)) = menu.model.edit(|field| field.cut()) {
+                                set_clipboard_text(hwnd, &text);
+                                menu.render();
+                            }
+                        }
+                        0x56 if ctrl && !menu_open => {
                             if let Some(text) = clipboard_text(hwnd) {
                                 menu.model.insert_text(&text);
                                 menu.render();
                             }
                         }
-                        0x25 if !menu.model.power_menu => {
-                            if menu.model.selection.is_some() {
-                                menu.model.move_selection(-1, 0);
+                        // Retroceso y Supr; con Ctrl, palabra a palabra.
+                        0x08 if !menu_open => {
+                            menu.model.edit(|field| field.backspace(ctrl));
+                            menu.render();
+                        }
+                        0x2E if !menu_open => {
+                            menu.model.edit(|field| field.delete(ctrl));
+                            menu.render();
+                        }
+                        // Las flechas recorren los resultados si hay uno elegido; con Ctrl
+                        // o Mayús siempre mueven el cursor del texto.
+                        0x25 | 0x27 if !menu_open => {
+                            let forward = wparam.0 == 0x27;
+                            if menu.model.selection.is_some() && !ctrl && !shift {
+                                menu.model.move_selection(if forward { 1 } else { -1 }, 0);
                             } else {
-                                menu.model.move_caret(-1);
+                                menu.model.selection = None;
+                                menu.model.edit(|field| {
+                                    if forward {
+                                        field.right(ctrl, shift)
+                                    } else {
+                                        field.left(ctrl, shift)
+                                    }
+                                });
                             }
                             menu.render();
                         }
-                        0x27 if !menu.model.power_menu => {
-                            if menu.model.selection.is_some() {
-                                menu.model.move_selection(1, 0);
-                            } else {
-                                menu.model.move_caret(1);
-                            }
+                        0x24 if !menu_open => {
+                            menu.model.edit(|field| field.home(shift));
                             menu.render();
                         }
-                        0x24 if !menu.model.power_menu => {
-                            menu.model.caret = 0;
-                            menu.model.select_all = false;
-                            menu.render();
-                        }
-                        0x23 if !menu.model.power_menu => {
-                            menu.model.caret = menu.model.query.chars().count();
-                            menu.model.select_all = false;
-                            menu.render();
-                        }
-                        0x2E if !menu.model.power_menu => {
-                            menu.model.delete_forward();
+                        0x23 if !menu_open => {
+                            menu.model.edit(|field| field.end(shift));
                             menu.render();
                         }
                         0x28 if !menu.model.power_menu => {

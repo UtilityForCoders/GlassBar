@@ -3,7 +3,11 @@
 //! catálogo solo aparece al buscar.
 use crate::apps::{fill_rounded, stroke_rounded, AppEntry};
 use crate::catalog::Launch;
-use crate::clock::{draw_icon, draw_text, draw_text_semibold, fit_text, text_width};
+use crate::clock::{
+    draw_icon, draw_text, draw_text_on_baseline, draw_text_semibold, fit_text, line_metrics,
+    text_width,
+};
+use crate::textfield::TextField;
 use crate::usage::Usage;
 use std::cell::RefCell;
 use std::collections::HashMap;
@@ -15,6 +19,10 @@ pub const HEIGHT: f32 = 700.0;
 const PAD: f32 = 32.0;
 const SEARCH_Y: f32 = 24.0;
 const SEARCH_H: f32 = 38.0;
+/// Zona del texto dentro del campo, entre la lupa y el botón de limpiar.
+const SEARCH_TEXT_X: f32 = PAD + 44.0;
+const SEARCH_TEXT_W: f32 = CONTENT_W - 88.0;
+const SEARCH_FONT: f32 = 14.0;
 /// Zona desplazable entre la búsqueda y el pie.
 const VIEW_TOP: f32 = 82.0;
 const FOOTER_Y: f32 = HEIGHT - 64.0;
@@ -123,15 +131,16 @@ pub struct LauncherState {
     pub recent: Vec<AppEntry>,
     pub frequent: Vec<AppEntry>,
     pub pinned: Vec<AppEntry>,
-    pub query: String,
+    pub query: TextField,
     pub scroll: f32,
     pub hovered: Option<Hit>,
     pub power_menu: bool,
     /// Cuándo se abrió el menú de energía, para su animación de entrada.
     power_opened: Option<Instant>,
     pub selection: Option<Hit>,
-    pub caret: usize,
-    pub select_all: bool,
+    /// Desplazamiento horizontal del texto de búsqueda cuando no cabe, para que el
+    /// cursor siempre se vea.
+    search_offset: f32,
     user: String,
     icons: HashMap<String, Option<Pixmap>>,
     loaded: Instant,
@@ -145,14 +154,13 @@ impl LauncherState {
             recent: Vec::new(),
             frequent: Vec::new(),
             pinned: Vec::new(),
-            query: String::new(),
+            query: TextField::default(),
             scroll: 0.0,
             hovered: None,
             power_menu: false,
             power_opened: None,
             selection: None,
-            caret: 0,
-            select_all: false,
+            search_offset: 0.0,
             user: user_display_name(),
             icons: HashMap::new(),
             loaded: Instant::now(),
@@ -179,8 +187,6 @@ impl LauncherState {
         self.recent = recent;
         self.frequent = frequent;
         self.query.clear();
-        self.caret = 0;
-        self.select_all = false;
         self.power_menu = false;
         self.reset_results();
     }
@@ -204,16 +210,16 @@ impl LauncherState {
     fn filtered(&self) -> Vec<usize> {
         let mut cache = self.search_cache.borrow_mut();
         if let Some((query, hits)) = cache.as_ref() {
-            if *query == self.query {
+            if query == self.query.text() {
                 return hits.clone();
             }
         }
-        let hits = crate::catalog::search(&self.apps, &self.query);
-        *cache = Some((self.query.clone(), hits.clone()));
+        let hits = crate::catalog::search(&self.apps, self.query.text());
+        *cache = Some((self.query.text().to_string(), hits.clone()));
         hits
     }
     fn searching(&self) -> bool {
-        !self.query.trim().is_empty()
+        !self.query.text().trim().is_empty()
     }
 
     fn layout(&self) -> Layout {
@@ -317,53 +323,42 @@ impl LauncherState {
         }
     }
 
-    fn byte_at(&self, index: usize) -> usize {
-        self.query
-            .char_indices()
-            .nth(index)
-            .map(|(i, _)| i)
-            .unwrap_or(self.query.len())
+    /// Aplica una edición al campo de búsqueda; si cambia el texto, la vista vuelve
+    /// al principio de los resultados. Con el menú de energía abierto no se edita.
+    pub fn edit<R>(&mut self, change: impl FnOnce(&mut TextField) -> R) -> Option<R> {
+        if self.power_menu {
+            return None;
+        }
+        let before = self.query.text().to_string();
+        let result = change(&mut self.query);
+        if self.query.text() != before {
+            self.reset_results();
+        }
+        Some(result)
     }
     pub fn insert_text(&mut self, text: &str) {
-        if self.power_menu {
-            return;
-        }
-        if self.select_all {
-            self.query.clear();
-            self.caret = 0;
-            self.select_all = false;
-        }
-        self.caret = self.caret.min(self.query.chars().count());
-        let text: String = text
-            .chars()
-            .filter(|c| !c.is_control())
-            .take(100usize.saturating_sub(self.query.chars().count()))
-            .collect();
-        self.query.insert_str(self.byte_at(self.caret), &text);
-        self.caret += text.chars().count();
-        self.reset_results();
+        self.edit(|field| field.insert(text));
     }
     fn reset_results(&mut self) {
         self.scroll = 0.0;
         self.hovered = None;
         self.selection = None;
     }
-    pub fn move_caret(&mut self, delta: isize) {
-        self.caret = self
-            .caret
-            .saturating_add_signed(delta)
-            .min(self.query.chars().count());
-        self.select_all = false;
-    }
-    pub fn delete_forward(&mut self) {
-        if self.select_all {
-            self.query.clear();
-            self.caret = 0;
-            self.select_all = false;
-        } else if self.caret < self.query.chars().count() {
-            self.query.remove(self.byte_at(self.caret));
+    /// Clic en el campo de búsqueda: pone el cursor en la letra más cercana; con
+    /// Mayús amplía la selección hasta ahí.
+    pub fn click_search(&mut self, x: f32, extend: bool) {
+        let target = x - SEARCH_TEXT_X - 1.0 + self.search_offset;
+        let mut left = 0.0;
+        let mut index = 0;
+        for c in self.query.text().chars() {
+            let width = text_width(&c.to_string(), SEARCH_FONT);
+            if left + width / 2.0 > target {
+                break;
+            }
+            left += width;
+            index += 1;
         }
-        self.reset_results();
+        self.edit(|field| field.move_to(index, extend));
     }
     /// Mueve la selección con las flechas: izquierda/derecha siguen el orden de lectura;
     /// arriba/abajo saltan al elemento más cercano en esa dirección, entre secciones.
@@ -422,24 +417,6 @@ impl LauncherState {
         self.selection = Some(next);
         self.ensure_visible(next);
     }
-    pub fn type_char(&mut self, ch: char) {
-        if self.power_menu {
-            return;
-        }
-        if ch == '\u{8}' {
-            if self.select_all {
-                self.query.clear();
-                self.caret = 0;
-                self.select_all = false;
-            } else if self.caret > 0 {
-                self.caret -= 1;
-                self.query.remove(self.byte_at(self.caret));
-            }
-            self.reset_results();
-        } else if !ch.is_control() {
-            self.insert_text(&ch.to_string());
-        }
-    }
     fn entry(&self, hit: Hit) -> Option<&AppEntry> {
         match hit {
             Hit::Pinned(i) => self.pinned.get(i),
@@ -466,8 +443,6 @@ impl LauncherState {
             }
             Hit::ClearSearch => {
                 self.query.clear();
-                self.caret = 0;
-                self.select_all = false;
                 self.reset_results();
             }
             Hit::Power => {
@@ -583,7 +558,7 @@ impl LauncherState {
         }
     }
 
-    fn draw_search(&self, image: &mut Pixmap, scale: f32) {
+    fn draw_search(&mut self, image: &mut Pixmap, scale: f32) {
         let (x, y, w, h) = (PAD, SEARCH_Y, CONTENT_W, SEARCH_H);
         fill_rounded(
             image,
@@ -605,61 +580,88 @@ impl LauncherState {
             scale * 0.75,
         );
         draw_magnifier(image, (x + 22.0) * scale, (y + h / 2.0) * scale, scale);
-        let text_x = x + 44.0;
-        let text_w = w - 44.0 - 44.0;
-        let search = if self.query.is_empty() {
-            "Buscar aplicaciones".into()
-        } else {
-            fit_text(&self.query, 14.0 * scale, text_w * scale)
+
+        // El texto va en una capa del ancho de su zona: si no cabe, se desplaza para
+        // seguir al cursor y se recorta en los bordes en lugar de cortarse con "…".
+        let size = SEARCH_FONT * scale;
+        let (ascent, descent) = line_metrics(size);
+        let line_top = ((h * scale - (ascent + descent)) / 2.0).round();
+        let baseline = line_top + ascent.round();
+        let Some(mut layer) = Pixmap::new(
+            (SEARCH_TEXT_W * scale).ceil() as u32,
+            (h * scale).ceil() as u32,
+        ) else {
+            return;
         };
-        if self.select_all && !self.query.is_empty() {
-            fill_rounded(
-                image,
-                [90, 160, 245, 60],
-                text_x * scale,
-                (y + 9.0) * scale,
-                (text_width(&search, 14.0 * scale) / scale + 2.0) * scale,
-                20.0 * scale,
-                3.0 * scale,
-            );
+        let text = self.query.text();
+        let width_to = |chars: usize| {
+            let prefix: String = text.chars().take(chars).collect();
+            text_width(&prefix, size)
+        };
+        let caret = width_to(self.query.caret());
+        let room = layer.width() as f32 - 2.0 * scale;
+        let mut offset = self.search_offset * scale;
+        if caret - offset > room {
+            offset = caret - room;
         }
-        self.text(
-            image,
-            &search,
-            text_x,
-            y + 11.0,
-            14.0,
-            scale,
-            if self.query.is_empty() { 0.55 } else { 1.0 },
-        );
-        if !self.select_all && !self.power_menu {
-            let prefix: String = self.query.chars().take(self.caret).collect();
-            let cursor_x =
-                text_x * scale + text_width(&prefix, 14.0 * scale).min(text_w * scale) + scale;
+        offset = offset
+            .min(caret)
+            .min((text_width(text, size) - room).max(0.0))
+            .max(0.0);
+        self.search_offset = offset / scale;
+
+        if text.is_empty() {
+            draw_text_on_baseline(&mut layer, "Buscar aplicaciones", 0.0, baseline, size, 0.55);
+        } else {
+            if let Some((start, end)) = self.query.selection() {
+                let left = width_to(start) - offset + scale;
+                fill_rounded(
+                    &mut layer,
+                    [76, 160, 255, 110],
+                    left,
+                    line_top,
+                    width_to(end) - offset + scale - left,
+                    ascent + descent,
+                    2.0 * scale,
+                );
+            }
+            draw_text_on_baseline(&mut layer, text, -offset, baseline, size, 1.0);
+        }
+        if self.query.selection().is_none() && !self.power_menu {
             fill_rounded(
-                image,
-                [235, 240, 250, 200],
-                cursor_x,
-                (y + 9.0) * scale,
+                &mut layer,
+                [235, 240, 250, 220],
+                (caret - offset + scale).round(),
+                line_top,
                 scale.max(1.0),
-                20.0 * scale,
+                ascent + descent,
                 0.0,
             );
         }
+        image.draw_pixmap(
+            (SEARCH_TEXT_X * scale).round() as i32,
+            (y * scale).round() as i32,
+            layer.as_ref(),
+            &PixmapPaint::default(),
+            Transform::identity(),
+            None,
+        );
+
         if !self.query.is_empty() {
-            let bx = WIDTH - PAD - 40.0;
+            let (bx, cy) = (WIDTH - PAD - 20.0, y + h / 2.0);
             if self.hovered == Some(Hit::ClearSearch) {
                 fill_rounded(
                     image,
                     [255, 255, 255, 20],
-                    (bx + 6.0) * scale,
-                    (y + 5.0) * scale,
+                    (bx - 14.0) * scale,
+                    (cy - 14.0) * scale,
                     28.0 * scale,
                     28.0 * scale,
                     14.0 * scale,
                 );
             }
-            self.text(image, "×", bx + 15.0, y + 8.0, 17.0, scale, 0.8);
+            // "Cancelar" de Segoe Fluent Icons, la misma cruz que usa Windows.
+            draw_icon(image, '\u{E711}', bx * scale, cy * scale, 11.0 * scale, 0.8);
         }
     }
 
@@ -1244,14 +1246,13 @@ mod tests {
             recent: vec![],
             frequent: vec![],
             pinned: vec![],
-            query: String::new(),
+            query: TextField::default(),
             scroll: 0.0,
             hovered: None,
             power_menu: false,
             power_opened: None,
             selection: None,
-            caret: 0,
-            select_all: false,
+            search_offset: 0.0,
             user: "Usuario de prueba".into(),
             icons: HashMap::new(),
             loaded: Instant::now(),
@@ -1385,23 +1386,39 @@ mod tests {
     }
 
     #[test]
-    fn search_edits_unicode_at_the_caret_and_replaces_selection() {
+    fn search_edits_reset_the_results_but_moving_the_caret_does_not() {
         let mut menu = state();
-        menu.insert_text("Diseño");
-        menu.move_caret(-1);
-        menu.type_char('s');
-        assert_eq!(menu.query, "Diseñso");
-        menu.type_char('\u{8}');
-        assert_eq!(menu.query, "Diseño");
-        menu.delete_forward();
-        assert_eq!(menu.query, "Diseñ");
-        menu.select_all = true;
-        menu.insert_text("Spotify");
-        assert_eq!(menu.query, "Spotify");
-        assert_eq!(menu.caret, 7);
-        menu.select_all = true;
-        menu.type_char('\u{8}');
-        assert!(menu.query.is_empty());
+        menu.apps = many("App", 60);
+        menu.insert_text("app 1");
+        menu.scroll_by(50.0);
+        menu.selection = menu.first_match();
+        // Mover el cursor no cambia la búsqueda: se conservan desplazamiento y selección.
+        menu.edit(|field| field.left(true, false));
+        assert!(menu.selection.is_some());
+        // Ctrl+Retroceso cambia el texto y vuelve al principio de los resultados.
+        menu.edit(|field| field.end(false));
+        menu.edit(|field| field.backspace(true));
+        assert_eq!(menu.query.text(), "app ");
+        assert_eq!((menu.scroll, menu.selection), (0.0, None));
+        // Con el menú de energía abierto no se edita.
+        menu.power_menu = true;
+        assert!(menu.edit(|field| field.insert("x")).is_none());
+        assert_eq!(menu.query.text(), "app ");
+    }
+
+    #[test]
+    fn clicking_the_search_places_the_caret_and_shift_click_selects() {
+        let mut menu = state();
+        menu.insert_text("spotify");
+        let y = SEARCH_Y + SEARCH_H / 2.0;
+        assert!(menu.in_search(SEARCH_TEXT_X, y));
+        menu.click_search(SEARCH_TEXT_X, false);
+        assert_eq!(menu.query.caret(), 0);
+        let after_spot = SEARCH_TEXT_X + 1.0 + text_width("spot", SEARCH_FONT);
+        menu.click_search(after_spot, false);
+        assert_eq!(menu.query.caret(), 4);
+        menu.click_search(SEARCH_TEXT_X + SEARCH_TEXT_W, true);
+        assert_eq!(menu.query.selected_text().as_deref(), Some("ify"));
     }
 
     #[test]
