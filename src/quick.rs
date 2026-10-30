@@ -136,6 +136,8 @@ pub enum Hit {
     Password,
     JoinConfirm,
     JoinCancel,
+    /// Barra de desplazamiento de la lista.
+    Scrollbar,
 }
 
 #[derive(Default)]
@@ -149,6 +151,9 @@ pub struct QuickState {
     pub view: View,
     /// Desplazamiento de la lista.
     pub list_scroll: f32,
+    /// Arrastre de la barra de desplazamiento: dónde se agarró y el desplazamiento
+    /// que tenía la lista entonces.
+    pub scroll_drag: Option<(f32, f32)>,
     pub pending: Option<Pending>,
     /// Red nueva cuya contraseña se está escribiendo.
     pub join: Option<JoinEditor>,
@@ -325,6 +330,47 @@ impl QuickState {
         (self.row_top(self.rows()) - Self::list_height()).max(0.0)
     }
     /// Desplaza la lista (positivo: hacia abajo).
+    /// Tirador de la barra de desplazamiento (arriba y alto, en el panel); `None` si
+    /// todo cabe y no hace falta barra.
+    fn scroll_thumb(&self) -> Option<(f32, f32)> {
+        let max = self.max_list_scroll();
+        if self.view == View::Main || max <= 0.0 {
+            return None;
+        }
+        let track = Self::list_height() - 8.0;
+        let content = max + Self::list_height();
+        let height = (track * Self::list_height() / content).max(24.0);
+        Some((
+            LIST_Y + 4.0 + (track - height) * self.list_scroll / max,
+            height,
+        ))
+    }
+    /// Empieza a arrastrar la barra en `y`. Un clic fuera del tirador lo lleva antes
+    /// hasta ahí, como en Windows.
+    pub fn grab_scrollbar(&mut self, y: f32) {
+        let Some((top, height)) = self.scroll_thumb() else {
+            return;
+        };
+        if !(top..top + height).contains(&y) {
+            self.drag_scrollbar_from(top + height / 2.0, self.list_scroll, y);
+        }
+        self.scroll_drag = Some((y, self.list_scroll));
+    }
+    /// Sigue el arrastre de la barra con el cursor en `y`.
+    pub fn drag_scrollbar(&mut self, y: f32) {
+        if let Some((grab, start)) = self.scroll_drag {
+            self.drag_scrollbar_from(grab, start, y);
+        }
+    }
+    fn drag_scrollbar_from(&mut self, grab: f32, start: f32, y: f32) {
+        let Some((_, height)) = self.scroll_thumb() else {
+            return;
+        };
+        let room = (Self::list_height() - 8.0 - height).max(1.0);
+        let max = self.max_list_scroll();
+        self.list_scroll = (start + (y - grab) * max / room).clamp(0.0, max);
+    }
+
     pub fn scroll_list(&mut self, delta: f32) {
         self.list_scroll = (self.list_scroll + delta).clamp(0.0, self.max_list_scroll());
     }
@@ -463,6 +509,10 @@ impl QuickState {
             };
             if !enabled || !(LIST_Y..LIST_FOOTER_Y).contains(&y) {
                 return None;
+            }
+            // La barra ocupa el borde derecho, a lo alto de toda la lista.
+            if self.scroll_thumb().is_some() && x >= WIDTH - 14.0 {
+                return Some(Hit::Scrollbar);
             }
             let content = y - LIST_Y + self.list_scroll;
             let index = (0..self.rows()).find(|&i| {
@@ -793,6 +843,20 @@ impl QuickState {
                 &tiny_skia::PixmapPaint::default(),
                 tiny_skia::Transform::identity(),
                 None,
+            );
+        }
+        // Barra fina que se ensancha al pasar el cursor o arrastrarla, como en Windows.
+        if let Some((top, height)) = self.scroll_thumb() {
+            let active = self.hovered == Some(Hit::Scrollbar) || self.scroll_drag.is_some();
+            let width = if active { 6.0 } else { 3.0 };
+            fill_rounded(
+                image,
+                [255, 255, 255, if active { 140 } else { 90 }],
+                (WIDTH - 6.0 - width) * scale,
+                top * scale,
+                width * scale,
+                height * scale,
+                width / 2.0 * scale,
             );
         }
 
@@ -1935,5 +1999,49 @@ mod tests {
             Some(&AudioRow::Note("Esta versión de Windows no lo permite"))
         );
         assert!(!rows.iter().any(|r| matches!(r, AudioRow::App(_))));
+    }
+
+    #[test]
+    fn scrollbar_appears_when_the_list_overflows_and_can_be_dragged() {
+        let mut quick = state();
+        quick.view = View::Audio;
+        quick.system.audio = mixer();
+        // Todo cabe: no hay barra.
+        assert_eq!(quick.scroll_thumb(), None);
+        assert_ne!(
+            quick.hit_test(WIDTH - 8.0, LIST_Y + 10.0),
+            Some(Hit::Scrollbar)
+        );
+
+        // Con muchas aplicaciones la lista no cabe y aparece la barra a la derecha.
+        let many = (0..12).map(|i| crate::audio::App {
+            name: format!("App {i}"),
+            path: format!("C:\\app{i}.exe"),
+            pids: vec![i],
+            output: None,
+            icon: None,
+        });
+        quick.system.audio.apps.extend(many);
+        let (top, height) = quick.scroll_thumb().unwrap();
+        assert_eq!(top, LIST_Y + 4.0);
+        assert!(height < QuickState::list_height() - 8.0);
+        assert_eq!(
+            quick.hit_test(WIDTH - 8.0, LIST_Y + 10.0),
+            Some(Hit::Scrollbar)
+        );
+
+        // Arrastrar el tirador hasta abajo lleva la lista a su final, y no más allá.
+        quick.grab_scrollbar(top + 5.0);
+        quick.drag_scrollbar(top + 5.0 + 10_000.0);
+        assert_eq!(quick.list_scroll, quick.max_list_scroll());
+        let (bottom_top, _) = quick.scroll_thumb().unwrap();
+        assert!((bottom_top + height - (LIST_FOOTER_Y - 4.0)).abs() < 0.01);
+        quick.drag_scrollbar(-10_000.0);
+        assert_eq!(quick.list_scroll, 0.0);
+        quick.scroll_drag = None;
+
+        // Un clic en el carril, abajo, salta hasta ahí.
+        quick.grab_scrollbar(LIST_FOOTER_Y - 6.0);
+        assert!(quick.list_scroll > quick.max_list_scroll() * 0.8);
     }
 }

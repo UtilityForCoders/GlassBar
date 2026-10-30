@@ -652,6 +652,7 @@ unsafe extern "system" fn quick_wndproc(
             with_app(|app| {
                 if let Some(panel) = &mut app.quick {
                     panel.model.dragging = None;
+                    panel.model.scroll_drag = None;
                 }
             });
         }
@@ -681,6 +682,11 @@ unsafe extern "system" fn quick_wndproc(
                     panel.set_slider(slider, quick::QuickState::slider_value(x));
                     return;
                 }
+                if panel.model.scroll_drag.is_some() {
+                    panel.model.drag_scrollbar(y);
+                    panel.render();
+                    return;
+                }
                 let hit = panel.model.hit_test(x, y);
                 if hit != panel.model.hovered {
                     panel.model.hovered = hit;
@@ -694,10 +700,18 @@ unsafe extern "system" fn quick_wndproc(
                     return;
                 };
                 let (x, y) = point(panel.scale);
-                if let Some(quick::Hit::Slider(slider)) = panel.model.hit_test(x, y) {
-                    SetCapture(hwnd);
-                    panel.model.dragging = Some(slider);
-                    panel.set_slider(slider, quick::QuickState::slider_value(x));
+                match panel.model.hit_test(x, y) {
+                    Some(quick::Hit::Slider(slider)) => {
+                        SetCapture(hwnd);
+                        panel.model.dragging = Some(slider);
+                        panel.set_slider(slider, quick::QuickState::slider_value(x));
+                    }
+                    Some(quick::Hit::Scrollbar) => {
+                        SetCapture(hwnd);
+                        panel.model.grab_scrollbar(y);
+                        panel.render();
+                    }
+                    _ => {}
                 }
             });
         }
@@ -706,7 +720,8 @@ unsafe extern "system" fn quick_wndproc(
                 let Some(panel) = app.quick.as_mut().filter(|p| p.visible) else {
                     return;
                 };
-                if panel.model.dragging.take().is_some() {
+                if panel.model.dragging.take().is_some() || panel.model.scroll_drag.take().is_some()
+                {
                     let _ = ReleaseCapture();
                     panel.render();
                     return;
@@ -876,7 +891,7 @@ unsafe extern "system" fn quick_wndproc(
                 };
                 let steps = ((wparam.0 >> 16) & 0xffff) as i16 as f32 / 120.0;
                 // En las listas, la rueda las desplaza (algo más de una fila por muesca).
-                if matches!(panel.model.view, quick::View::List(_)) {
+                if panel.model.view != quick::View::Main {
                     panel.model.scroll_list(-steps * 60.0);
                     let (x, y) = {
                         let mut cursor = POINT::default();
