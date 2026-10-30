@@ -136,6 +136,7 @@ fn bluetooth_reader(results: Sender<Command>) -> Sender<()> {
         unsafe {
             let _ = CoInitializeEx(None, COINIT_MULTITHREADED);
         }
+        crate::profile::name_thread("Bluetooth");
         while queue.recv().is_ok() {
             // Las peticiones que llegaron mientras tanto quedan cubiertas por esta.
             queue.try_iter().for_each(drop);
