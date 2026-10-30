@@ -448,9 +448,11 @@ unsafe extern "system" fn host_wndproc(
 fn forward_later(sender: usize, bytes: Vec<u8>) {
     use std::sync::mpsc::{channel, Sender};
     use std::sync::{Mutex, OnceLock};
-    static QUEUE: OnceLock<Mutex<Sender<(usize, Vec<u8>)>>> = OnceLock::new();
+    /// Quién lo mandó y los datos del icono.
+    type Pending = (usize, Vec<u8>);
+    static QUEUE: OnceLock<Mutex<Sender<Pending>>> = OnceLock::new();
     let queue = QUEUE.get_or_init(|| {
-        let (send, receive) = channel::<(usize, Vec<u8>)>();
+        let (send, receive) = channel::<Pending>();
         std::thread::spawn(move || {
             use windows::Win32::System::DataExchange::COPYDATASTRUCT;
             for (sender, bytes) in receive {
