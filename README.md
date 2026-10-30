@@ -1,6 +1,6 @@
 # GlassBar
 
-Dock minimalista para Windows 10/11: iconos reales y hora en Segoe UI. Fondo plano con 51% de opacidad, borde tenue y sin sombras ni brillo superior. No incluye widgets, fecha ni indicadores de red ficticios.
+Dock minimalista para Windows 10/11: iconos reales, estado de red, volumen y batería, y hora en Segoe UI. Fondo plano con 51% de opacidad, borde tenue y sin sombras ni brillo superior. No incluye widgets ni fecha.
 
 ## Agregar programas
 
@@ -23,6 +23,25 @@ El pie muestra el nombre de la cuenta y el botón de apagado. El panel tiene 96%
 Escribe para buscar; la búsqueda ignora mayúsculas y tildes, admite varias palabras y prioriza las coincidencias exactas. Enter abre el elemento seleccionado o el primer resultado. El campo admite cursor, Inicio/Fin, Retroceso/Supr, Ctrl+A, Ctrl+V y un botón para limpiar. Las flechas mueven la selección por la cuadrícula y entre secciones (izquierda/derecha editan el texto mientras no haya selección). La rueda y Re Pág/Av Pág desplazan la vista. Escape o un clic fuera cierran el panel.
 
 El botón de encendido del pie abre un menú como el del Inicio de Windows 11 con **Bloquear**, **Suspender**, **Apagar** y **Reiniciar**, con los iconos del sistema (Segoe Fluent Icons). Aparece en 200 ms, desvaneciéndose y subiendo unos píxeles; si los efectos de animación de Windows están desactivados, aparece directamente. También se recorre con las flechas y Enter; Escape o un clic fuera lo cierran sin hacer nada. Apagar y reiniciar piden a Windows el cierre normal, sin forzar el de las aplicaciones abiertas.
+
+## Red, volumen y batería
+
+Entre la flecha de iconos ocultos y la hora, el dock muestra el estado del sistema con los iconos de Windows 11 (Segoe Fluent Icons):
+
+- **Red:** Wi-Fi o cable según el adaptador en uso (si hay los dos, el cable, como Windows); atenuado si Windows indica que no hay acceso a Internet, y un globo tachado sin conexión. La intensidad de la señal Wi-Fi no se muestra.
+- **Volumen:** de cero a tres ondas según el nivel de la salida predeterminada, y una cruz si está silenciada. La rueda del ratón sobre el icono lo sube o lo baja de 2 % en 2 %.
+- **Batería:** solo en equipos con batería; el nivel en once pasos, con rayo mientras está enchufada.
+
+El estado se lee una vez por segundo. Al pasar el cursor se muestra el detalle (p. ej. "Volumen: 45 %").
+
+Un clic en el grupo abre el panel rápido de GlassBar justo encima, con el estilo del lanzador:
+
+- **Wi-Fi** y **Bluetooth:** botones para encenderlos y apagarlos (API de radios de Windows); el de Wi-Fi muestra el nombre de la red conectada.
+- **Brillo:** barra para la pantalla donde está el dock (el monitor principal). Si es la integrada del portátil se usa WMI; si es un monitor externo, DDC/CI, el mismo canal que usa su menú (algunos monitores lo traen desactivado en sus ajustes). Si ninguna vía responde, la barra aparece como no disponible en lugar de cambiar el brillo de otra pantalla.
+- **Volumen:** barra de la salida predeterminada; el icono del altavoz silencia o quita el silencio.
+- **Pie:** nivel de batería (si la hay) y **Más opciones**, que abre el panel de Windows para lo demás.
+
+Las barras se arrastran o se mueven con la rueda de 2 % en 2 %. Leer y cambiar las radios y el brillo puede tardar, así que se hace en un hilo aparte y el panel no se bloquea. Escape o un clic fuera lo cierran.
 
 ## Tecla Windows
 

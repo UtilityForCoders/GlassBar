@@ -32,6 +32,38 @@ pub fn draw_icon(target: &mut Pixmap, icon: char, cx: f32, cy: f32, size: f32, o
     blit_text(target, image, cx - w / 2.0, cy - h / 2.0, opacity);
 }
 
+/// Como `draw_icon`, pero centra el cuadro de la fuente y no el dibujo de cada
+/// icono. Los iconos de Segoe Fluent están diseñados sobre ese cuadro, así que los
+/// de un mismo grupo (red, volumen, batería) quedan alineados como en Windows.
+pub fn draw_icon_aligned(
+    target: &mut Pixmap,
+    icon: char,
+    cx: f32,
+    cy: f32,
+    size: f32,
+    opacity: f32,
+) {
+    let Some(font) = icon_font() else {
+        return;
+    };
+    let (image, top) = rasterize_line(font, &icon.to_string(), size);
+    let advance = font.metrics(icon, size).advance_width;
+    let (ascent, descent) = font
+        .horizontal_line_metrics(size)
+        .map(|m| (m.ascent, m.descent))
+        .unwrap_or((size, 0.0));
+    // El cuadro va de `ascent` sobre la línea base a `descent` (negativo) bajo ella.
+    let baseline = cy + (ascent + descent) / 2.0;
+    // La imagen empieza un píxel antes de la pluma (ver `rasterize_line`).
+    blit_text(
+        target,
+        image,
+        (cx - advance / 2.0 - 1.0).round(),
+        (baseline - top as f32).round(),
+        opacity,
+    );
+}
+
 /// Segoe UI Semibold para encabezados; si falta, la normal.
 fn semibold_font() -> &'static Font {
     static FONT: OnceLock<Font> = OnceLock::new();
