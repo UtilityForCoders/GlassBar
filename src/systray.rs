@@ -225,7 +225,38 @@ pub fn callback_params(version: u32, id: u32, event: u32, at: POINT) -> (usize, 
 // La ventana `Shell_TrayWnd` propia.
 // ---------------------------------------------------------------------------
 
+/// Registro de lo que pasa en la bandeja propia (`%TEMP%\glassbar-tray.log`), para
+/// saber qué manda cada programa y qué clics recibe. Se empieza de cero al abrir.
+fn log(line: impl AsRef<str>) {
+    use std::io::Write;
+    let path = std::env::temp_dir().join("glassbar-tray.log");
+    // Sin crecer sin límite si GlassBar pasa días abierto.
+    if std::fs::metadata(&path).is_ok_and(|m| m.len() > 2_000_000) {
+        let _ = std::fs::remove_file(&path);
+    }
+    if let Ok(mut file) = std::fs::OpenOptions::new()
+        .create(true)
+        .append(true)
+        .open(path)
+    {
+        let _ = writeln!(file, "{}", line.as_ref());
+    }
+}
+
+fn process_name(window: HWND) -> String {
+    let mut pid = 0;
+    unsafe {
+        GetWindowThreadProcessId(window, Some(&mut pid));
+    }
+    crate::apps::process_info(pid)
+        .map(|(exe, _)| exe.rsplit('\\').next().unwrap_or_default().to_string())
+        .unwrap_or_else(|| format!("pid {pid}"))
+}
+
 thread_local! {
+    /// Reenviando un mensaje a Explorer: si este volviera a llamar a la bandeja
+    /// propia mientras tanto, no se reenvía otra vez (sería un bucle sin fin).
+    static FORWARDING: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
     static ICONS: std::cell::RefCell<Vec<Icon>> = const { std::cell::RefCell::new(Vec::new()) };
     /// Ventana a la que se avisa cuando cambian los iconos, y con qué mensaje.
     static NOTIFY: std::cell::Cell<(isize, u32)> = const { std::cell::Cell::new((0, 0)) };
@@ -244,6 +275,7 @@ impl Host {
     pub fn install(notify: HWND, message: u32) -> Option<Self> {
         use windows::Win32::System::LibraryLoader::GetModuleHandleW;
         NOTIFY.with(|n| n.set((notify.0 as isize, message)));
+        let _ = std::fs::remove_file(std::env::temp_dir().join("glassbar-tray.log"));
         unsafe {
             let instance = GetModuleHandleW(None).ok()?;
             let class = WNDCLASSEXW {
@@ -274,8 +306,10 @@ impl Host {
             let host = Self { hwnd };
             host.keep_in_front();
             if FindWindowW(w!("Shell_TrayWnd"), None).ok() != Some(hwnd) {
+                log("No se pudo poner la bandeja propia delante de la de Explorer");
                 return None;
             }
+            log("Bandeja propia lista; se pide a los programas sus iconos");
             announce();
             Some(host)
         }
@@ -346,6 +380,12 @@ unsafe extern "system" fn host_wndproc(
     use windows::Win32::System::DataExchange::COPYDATASTRUCT;
     let forward = || {
         let mut result = 0usize;
+        if FORWARDING.with(|f| f.replace(true)) {
+            log(format!(
+                "Mensaje 0x{msg:X} de vuelta mientras se reenviaba: no se reenvía"
+            ));
+            return LRESULT(0);
+        }
         if let Some(explorer) = crate::shell::explorer_tray() {
             let _ = SendMessageTimeoutW(
                 explorer,
@@ -357,6 +397,7 @@ unsafe extern "system" fn host_wndproc(
                 Some(&mut result),
             );
         }
+        FORWARDING.with(|f| f.set(false));
         LRESULT(result as isize)
     };
     if msg == WM_COPYDATA {
@@ -365,6 +406,16 @@ unsafe extern "system" fn host_wndproc(
         if data.dwData == 1 && !data.lpData.is_null() {
             let bytes = std::slice::from_raw_parts(data.lpData as *const u8, data.cbData as usize);
             if let Some((message, notify)) = parse(bytes) {
+                log(format!(
+                    "NIM {message} de {} (ventana 0x{:X}, id {}): flags 0x{:X}, mensaje 0x{:X}, versión {}, nombre {:?}",
+                    process_name(HWND(notify.owner as i32 as isize as *mut _)),
+                    notify.owner,
+                    notify.id,
+                    notify.flags,
+                    notify.callback,
+                    notify.version,
+                    notify.tip,
+                ));
                 let changed =
                     ICONS.with(|icons| apply(&mut icons.borrow_mut(), message, &notify, image_of));
                 if changed {
@@ -424,18 +475,33 @@ pub fn click(index: usize, click: Click, at: POINT) {
     let Some((window, callback, version, id)) = target else {
         return;
     };
+    let name = process_name(window);
     if callback == 0 {
+        log(format!(
+            "Clic {click:?} en {name}: no dio mensaje de aviso (NIF_MESSAGE), no se puede avisar"
+        ));
         return;
     }
     unsafe {
         // Para que el programa pueda traer su ventana o su menú al frente.
         let mut pid = 0;
         GetWindowThreadProcessId(window, Some(&mut pid));
-        let _ = AllowSetForegroundWindow(if pid != 0 { pid } else { ASFW_ANY });
+        let allowed = AllowSetForegroundWindow(if pid != 0 { pid } else { ASFW_ANY });
+        let mut sent = Vec::new();
         for event in click_messages(click, version) {
             let (w, l) = callback_params(version, id, event, at);
-            let _ = SendNotifyMessageW(window, callback, WPARAM(w), LPARAM(l));
+            let result = SendNotifyMessageW(window, callback, WPARAM(w), LPARAM(l));
+            sent.push(format!(
+                "0x{event:X}:{}",
+                if result.is_ok() { "ok" } else { "error" }
+            ));
         }
+        log(format!(
+            "Clic {click:?} en {name} (ventana 0x{:X}, id {id}, versión {version}, mensaje 0x{callback:X}): primer plano {}, enviados {}",
+            window.0 as usize,
+            if allowed.is_ok() { "permitido" } else { "no permitido" },
+            sent.join(" "),
+        ));
     }
 }
 

@@ -1332,6 +1332,9 @@ struct App {
     systray: Option<systray::Host>,
     /// Panel de las apps en segundo plano; se crea la primera vez que se abre.
     tray_panel: Option<TrayWindow>,
+    /// Cuándo se pulsó un icono de ese panel: el dock no se oculta mientras su
+    /// programa abre la ventana o el menú.
+    tray_clicked: Option<Instant>,
     launcher: Option<LauncherWindow>,
     /// Panel rápido; se crea la primera vez que se abre.
     quick: Option<QuickWindow>,
@@ -1405,6 +1408,7 @@ impl App {
             tray,
             systray,
             tray_panel: None,
+            tray_clicked: None,
             launcher: None,
             quick: None,
             language: None,
@@ -2216,7 +2220,13 @@ unsafe extern "system" fn wndproc(hwnd: HWND, msg: u32, wparam: WPARAM, lparam: 
                             || app.preview.as_ref().is_some_and(|p| p.visible)
                             // El panel de iconos ocultos abierto sobre la flecha; se mira
                             // al final porque recorre las ventanas, y solo con el dock fuera.
-                            || (app.visibility.expanded && shell::overflow_window().is_some()),
+                            || (app.visibility.expanded && shell::overflow_window().is_some())
+                            // Un menú abierto (p. ej. el de un icono de la bandeja) o un
+                            // icono recién pulsado, que puede tardar en abrir el suyo.
+                            || (app.visibility.expanded && menu_open())
+                            || app
+                                .tray_clicked
+                                .is_some_and(|at| at.elapsed() < Duration::from_millis(1500)),
                         Instant::now(),
                     );
                     if app.visibility.active() {
@@ -2490,6 +2500,15 @@ unsafe extern "system" fn language_wndproc(
     LRESULT(0)
 }
 
+/// Hay un menú emergente abierto (clase `#32768`), de cualquier programa.
+fn menu_open() -> bool {
+    unsafe {
+        windows::Win32::UI::WindowsAndMessaging::FindWindowW(w!("#32768"), None).is_ok_and(|menu| {
+            windows::Win32::UI::WindowsAndMessaging::IsWindowVisible(menu).as_bool()
+        })
+    }
+}
+
 /// Panel de las apps en segundo plano (ver `traypanel` y `systray`).
 struct TrayWindow {
     hwnd: HWND,
@@ -2652,6 +2671,7 @@ unsafe extern "system" fn tray_wndproc(
                 if let Some(tip) = &mut app.tooltip {
                     tip.hide();
                 }
+                app.tray_clicked = Some(Instant::now());
                 systray::click(index, click, cursor());
             }
         });
@@ -3136,6 +3156,22 @@ mod autohide_tests {
 }
 
 fn main() -> Result<()> {
+    // Si GlassBar falla, deja el motivo en %TEMP%\glassbar-crash.log.
+    std::panic::set_hook(Box::new(|info| {
+        use std::io::Write;
+        let path = std::env::temp_dir().join("glassbar-crash.log");
+        if let Ok(mut file) = std::fs::OpenOptions::new()
+            .create(true)
+            .append(true)
+            .open(path)
+        {
+            let _ = writeln!(
+                file,
+                "{info}\n{}\n",
+                std::backtrace::Backtrace::force_capture()
+            );
+        }
+    }));
     if guard::run(&std::env::args().collect::<Vec<_>>()) {
         return Ok(());
     }

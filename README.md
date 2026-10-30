@@ -32,7 +32,7 @@ Al dejar el cursor sobre un programa con ventanas abiertas aparece, encima de su
 
 La flecha **^** del dock abre el panel de GlassBar con los iconos de la bandeja de los demás programas (Spotify, Discord, Steam, la seguridad de Windows…), en filas de cinco como en Windows 11. Al pasar el cursor se ve el nombre de cada uno; un clic, un doble clic o un clic derecho le llegan al programa igual que desde la bandeja de Windows, que abre su ventana o su menú. Escape o un clic fuera cierran el panel.
 
-Windows no deja leer los iconos de la bandeja de Explorer, así que GlassBar los recibe directamente, como RetroBar: crea su propia ventana de bandeja delante de la de Explorer, guarda cada icono que registran los programas y reenvía el mensaje a Explorer, cuya bandeja sigue igual. Al abrirse pide a los programas que vuelvan a registrar sus iconos, y al cerrarse, que se los den otra vez a Explorer. Si no puede, la flecha abre el panel nativo como antes.
+Windows no deja leer los iconos de la bandeja de Explorer, así que GlassBar los recibe directamente, como RetroBar: crea su propia ventana de bandeja delante de la de Explorer, guarda cada icono que registran los programas y reenvía el mensaje a Explorer, cuya bandeja sigue igual. Al abrirse pide a los programas que vuelvan a registrar sus iconos, y al cerrarse, que se los den otra vez a Explorer. Si no puede, la flecha abre el panel nativo como antes. Mientras el programa abre su menú, el dock no se oculta. Lo que manda cada programa y los clics que recibe quedan en `%TEMP%\glassbar-tray.log`.
 
 ## Idioma del teclado
 
