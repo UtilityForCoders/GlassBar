@@ -30,8 +30,10 @@ mod shell;
 mod spring;
 mod status;
 mod system;
+mod systray;
 mod textfield;
 mod tray;
+mod traypanel;
 mod usage;
 mod wifi;
 mod winkey;
@@ -79,6 +81,8 @@ const WM_FOREGROUND: u32 = windows::Win32::UI::WindowsAndMessaging::WM_APP + 3;
 const WM_DWMCOLORIZATIONCOLORCHANGED: u32 = 0x0320;
 /// El hilo de sistema terminó de leer Wi-Fi, Bluetooth, brillo y red.
 const WM_QUICK_UPDATE: u32 = windows::Win32::UI::WindowsAndMessaging::WM_APP + 4;
+/// Cambiaron los iconos de la bandeja de otros programas (ver `systray`).
+const WM_TRAY_ICONS: u32 = windows::Win32::UI::WindowsAndMessaging::WM_APP + 6;
 /// El hilo de iconos del lanzador cargó alguno nuevo.
 const WM_LAUNCHER_ICONS: u32 = windows::Win32::UI::WindowsAndMessaging::WM_APP + 5;
 
@@ -1323,6 +1327,11 @@ struct App {
     bar: BarState,
     shell: TaskbarReplacer,
     tray: Tray,
+    /// Bandeja propia que recibe los iconos de los demás programas; `None` si no se
+    /// pudo crear (entonces la flecha abre el panel nativo).
+    systray: Option<systray::Host>,
+    /// Panel de las apps en segundo plano; se crea la primera vez que se abre.
+    tray_panel: Option<TrayWindow>,
     launcher: Option<LauncherWindow>,
     /// Panel rápido; se crea la primera vez que se abre.
     quick: Option<QuickWindow>,
@@ -1373,6 +1382,8 @@ impl App {
         let mut shell = TaskbarReplacer::new();
         shell.hide();
 
+        // Antes que el icono propio, para que también llegue a la bandeja propia.
+        let systray = systray::Host::install(hwnd, WM_TRAY_ICONS);
         let tray = Tray::new(hwnd);
         let pinned: Vec<_> = bar.primary_apps.iter().map(|a| a.entry.clone()).collect();
 
@@ -1392,6 +1403,8 @@ impl App {
             bar,
             shell,
             tray,
+            systray,
+            tray_panel: None,
             launcher: None,
             quick: None,
             language: None,
@@ -1496,6 +1509,35 @@ impl App {
 
     /// Abre o cierra el panel de idioma sobre el indicador. El teclado elegido se
     /// aplica a la ventana que estaba activa al abrirlo.
+    /// Abre o cierra el panel de las apps en segundo plano sobre la flecha.
+    fn toggle_tray_panel(&mut self) {
+        if let Some(panel) = self.tray_panel.as_mut().filter(|p| p.visible) {
+            panel.hide();
+            return;
+        }
+        if let Some(menu) = &mut self.launcher {
+            menu.hide();
+        }
+        if let Some(panel) = &mut self.quick {
+            panel.hide();
+        }
+        if let Some(panel) = &mut self.language {
+            panel.hide();
+        }
+        if self.tray_panel.is_none() {
+            match TrayWindow::new(self.hwnd) {
+                Ok(panel) => self.tray_panel = Some(panel),
+                Err(_) => return,
+            }
+        }
+        let anchor = self.pos.x + self.bar.overflow_center(self.scale).round() as i32;
+        let (top, bounds) = (self.y_shown, (self.screen_left, self.screen_right));
+        if let Some(panel) = &mut self.tray_panel {
+            panel.show(anchor, top, bounds);
+        }
+        self.expand();
+    }
+
     fn toggle_language(&mut self) {
         if let Some(panel) = self.language.as_mut().filter(|p| p.visible) {
             panel.hide();
@@ -1619,7 +1661,10 @@ impl App {
             return;
         };
         // El nombre de la flecha o del estado taparía el panel que ellos mismos abren.
-        if target == HoverTarget::Overflow && shell::overflow_window().is_some() {
+        if target == HoverTarget::Overflow
+            && (shell::overflow_window().is_some()
+                || self.tray_panel.as_ref().is_some_and(|p| p.visible))
+        {
             return;
         }
         if matches!(target, HoverTarget::Status(_))
@@ -1788,6 +1833,14 @@ unsafe extern "system" fn wndproc(hwnd: HWND, msg: u32, wparam: WPARAM, lparam: 
                 }
             });
             DefWindowProcW(hwnd, msg, wparam, lparam)
+        }
+        WM_TRAY_ICONS => {
+            with_app(|app| {
+                if let Some(panel) = app.tray_panel.as_mut().filter(|p| p.visible) {
+                    panel.refresh();
+                }
+            });
+            LRESULT(0)
         }
         WM_FOREGROUND => {
             with_app(|app| {
@@ -1986,12 +2039,16 @@ unsafe extern "system" fn wndproc(hwnd: HWND, msg: u32, wparam: WPARAM, lparam: 
                             if let Some(tip) = &mut app.tooltip {
                                 tip.hide();
                             }
-                            shell::toggle_overflow(
-                                app.pos.x + app.bar.overflow_center(app.scale).round() as i32,
-                                app.y_shown,
-                                app.screen_left,
-                                app.screen_right,
-                            );
+                            if app.systray.is_some() {
+                                app.toggle_tray_panel();
+                            } else {
+                                shell::toggle_overflow(
+                                    app.pos.x + app.bar.overflow_center(app.scale).round() as i32,
+                                    app.y_shown,
+                                    app.screen_left,
+                                    app.screen_right,
+                                );
+                            }
                         }
                         HoverTarget::Status(_) => {
                             if let Some(tip) = &mut app.tooltip {
@@ -2139,6 +2196,10 @@ unsafe extern "system" fn wndproc(hwnd: HWND, msg: u32, wparam: WPARAM, lparam: 
                         app.scale,
                     );
                     app.check_preview(pt, Instant::now());
+                    // Que los iconos de los demás programas sigan llegando a la bandeja propia.
+                    if let Some(host) = &app.systray {
+                        host.keep_in_front();
+                    }
                     let inside = app.visibility.expanded
                         && pt.x >= app.pos.x
                         && pt.x < app.pos.x + app.surface.width as i32
@@ -2151,6 +2212,7 @@ unsafe extern "system" fn wndproc(hwnd: HWND, msg: u32, wparam: WPARAM, lparam: 
                             || app.launcher.as_ref().is_some_and(|l| l.visible)
                             || app.quick.as_ref().is_some_and(|q| q.visible)
                             || app.language.as_ref().is_some_and(|l| l.visible)
+                            || app.tray_panel.as_ref().is_some_and(|p| p.visible)
                             || app.preview.as_ref().is_some_and(|p| p.visible)
                             // El panel de iconos ocultos abierto sobre la flecha; se mira
                             // al final porque recorre las ventanas, y solo con el dock fuera.
@@ -2422,6 +2484,248 @@ unsafe extern "system" fn language_wndproc(
                     _ => {}
                 }
             });
+        }
+        _ => return DefWindowProcW(hwnd, msg, wparam, lparam),
+    }
+    LRESULT(0)
+}
+
+/// Panel de las apps en segundo plano (ver `traypanel` y `systray`).
+struct TrayWindow {
+    hwnd: HWND,
+    surface: Option<Surface>,
+    pos: POINT,
+    scale: f32,
+    model: traypanel::TrayPanel,
+    visible: bool,
+    transition: launcher::Transition,
+    /// Dónde abrirlo: centro de la flecha, borde superior del dock y bordes de la pantalla.
+    anchor: (i32, i32, (i32, i32)),
+}
+impl TrayWindow {
+    fn new(owner: HWND) -> Result<Self> {
+        let hwnd = unsafe {
+            CreateWindowExW(
+                WS_EX_LAYERED | WS_EX_TOPMOST | WS_EX_TOOLWINDOW,
+                w!("GlassBarTray"),
+                w!("GlassBar — Apps en segundo plano"),
+                WS_POPUP,
+                0,
+                0,
+                1,
+                1,
+                Some(owner),
+                None,
+                Some(GetModuleHandleW(None)?.into()),
+                None,
+            )?
+        };
+        Ok(Self {
+            hwnd,
+            surface: None,
+            pos: POINT::default(),
+            scale: 1.0,
+            model: traypanel::TrayPanel::default(),
+            visible: false,
+            transition: launcher::Transition::hidden(),
+            anchor: (0, 0, (0, 0)),
+        })
+    }
+    fn show(&mut self, anchor_x: i32, dock_top: i32, bounds: (i32, i32)) {
+        self.anchor = (anchor_x, dock_top, bounds);
+        let (_, dpi) = monitors::get_info(monitors::primary());
+        self.scale = dpi.max(0.3);
+        self.visible = true;
+        self.transition.open(Instant::now());
+        self.refresh();
+        take_focus(self.hwnd);
+    }
+    /// Vuelve a leer los iconos (al abrirlo, o si un programa cambió el suyo) y
+    /// ajusta el tamaño a cuántos hay.
+    fn refresh(&mut self) {
+        self.model.icons = systray::shown()
+            .into_iter()
+            .map(|icon| traypanel::TrayIcon {
+                image: icon.image,
+                tip: icon.tip,
+            })
+            .collect();
+        if self
+            .model
+            .hovered
+            .is_some_and(|i| i >= self.model.icons.len())
+        {
+            self.model.hovered = None;
+        }
+        let (w, h) = self.model.size();
+        let (width, height) = (
+            (w * self.scale).ceil() as u32,
+            (h * self.scale).ceil() as u32,
+        );
+        if self
+            .surface
+            .as_ref()
+            .is_none_or(|s| s.width != width || s.height != height)
+        {
+            match Surface::new(width, height) {
+                Ok(surface) => self.surface = Some(surface),
+                Err(_) => return,
+            }
+        }
+        let (anchor_x, dock_top, (left, right)) = self.anchor;
+        let margin = (12.0 * self.scale).round() as i32;
+        self.pos = POINT {
+            x: (anchor_x - width as i32 / 2).clamp(
+                left + margin,
+                (right - width as i32 - margin).max(left + margin),
+            ),
+            y: dock_top - height as i32 - margin,
+        };
+        self.render();
+    }
+    fn render(&mut self) {
+        if let Some(surface) = &mut self.surface {
+            self.model.draw(&mut surface.pixmap, self.scale);
+            surface.copy_to_dib();
+        }
+        self.present();
+    }
+    fn present(&mut self) {
+        if let Some(surface) = &self.surface {
+            present_popup(
+                self.hwnd,
+                surface,
+                self.pos,
+                self.scale,
+                &self.transition,
+                self.visible,
+                false,
+            );
+        }
+    }
+    fn hide(&mut self) {
+        if !self.visible {
+            return;
+        }
+        self.visible = false;
+        self.model.hovered = None;
+        self.transition.close(Instant::now());
+        self.present();
+    }
+}
+impl Drop for TrayWindow {
+    fn drop(&mut self) {
+        unsafe {
+            let _ = windows::Win32::UI::WindowsAndMessaging::DestroyWindow(self.hwnd);
+        }
+    }
+}
+
+unsafe extern "system" fn tray_wndproc(
+    hwnd: HWND,
+    msg: u32,
+    wparam: WPARAM,
+    lparam: LPARAM,
+) -> LRESULT {
+    use windows::Win32::UI::WindowsAndMessaging::{
+        WA_INACTIVE, WM_ACTIVATE, WM_KEYDOWN, WM_LBUTTONDBLCLK,
+    };
+    let point = |scale: f32| {
+        (
+            (lparam.0 & 0xffff) as i16 as f32 / scale,
+            ((lparam.0 >> 16) & 0xffff) as i16 as f32 / scale,
+        )
+    };
+    let cursor = || {
+        let mut at = POINT::default();
+        let _ = GetCursorPos(&mut at);
+        at
+    };
+    // Pulsación sobre un icono: se la manda a su programa.
+    let press = |click: systray::Click| {
+        with_app(|app| {
+            let Some(panel) = app.tray_panel.as_mut().filter(|p| p.visible) else {
+                return;
+            };
+            let (x, y) = point(panel.scale);
+            if let Some(index) = panel.model.hit_test(x, y) {
+                if let Some(tip) = &mut app.tooltip {
+                    tip.hide();
+                }
+                systray::click(index, click, cursor());
+            }
+        });
+    };
+    match msg {
+        WM_ACTIVATE if (wparam.0 & 0xffff) as u32 == WA_INACTIVE => {
+            with_app(|app| {
+                if let Some(tip) = &mut app.tooltip {
+                    tip.hide();
+                }
+                app.tray_panel.as_mut().map(TrayWindow::hide)
+            });
+        }
+        WM_TIMER if wparam.0 == TIMER_ANIM => {
+            with_app(|app| app.tray_panel.as_mut().map(TrayWindow::present));
+        }
+        WM_MOUSEMOVE => {
+            with_app(|app| {
+                let Some(panel) = app.tray_panel.as_mut().filter(|p| p.visible) else {
+                    return;
+                };
+                let mut track = TRACKMOUSEEVENT {
+                    cbSize: std::mem::size_of::<TRACKMOUSEEVENT>() as u32,
+                    dwFlags: TME_LEAVE,
+                    hwndTrack: hwnd,
+                    dwHoverTime: 0,
+                };
+                let _ = TrackMouseEvent(&mut track);
+                let (x, y) = point(panel.scale);
+                let hit = panel.model.hit_test(x, y);
+                if hit == panel.model.hovered {
+                    return;
+                }
+                panel.model.hovered = hit;
+                panel.render();
+                // El nombre del icono encima de él, como en Windows.
+                let scale = panel.scale;
+                let label = hit.map(|index| {
+                    let (cx, cy) = panel.model.cell(index);
+                    (
+                        panel.model.icons[index].tip.clone(),
+                        panel.pos.x + ((cx + 20.0) * scale).round() as i32,
+                        panel.pos.y + ((cy - 4.0) * scale).round() as i32,
+                    )
+                });
+                if let Some(index) = hit {
+                    systray::hover(index, cursor());
+                }
+                let (left, right) = (app.screen_left, app.screen_right);
+                if let Some(tip) = &mut app.tooltip {
+                    match label.filter(|(text, _, _)| !text.trim().is_empty()) {
+                        Some((text, cx, bottom)) => tip.show(&text, cx, bottom, left, right, scale),
+                        None => tip.hide(),
+                    }
+                }
+            });
+        }
+        WM_MOUSELEAVE => {
+            with_app(|app| {
+                if let Some(tip) = &mut app.tooltip {
+                    tip.hide();
+                }
+                if let Some(panel) = app.tray_panel.as_mut().filter(|p| p.visible) {
+                    if panel.model.hovered.take().is_some() {
+                        panel.render();
+                    }
+                }
+            });
+        }
+        WM_LBUTTONUP => press(systray::Click::Left),
+        WM_LBUTTONDBLCLK => press(systray::Click::Double),
+        WM_RBUTTONUP => press(systray::Click::Right),
+        WM_KEYDOWN if wparam.0 == 0x1B => {
+            with_app(|app| app.tray_panel.as_mut().map(TrayWindow::hide));
         }
         _ => return DefWindowProcW(hwnd, msg, wparam, lparam),
     }
@@ -2929,6 +3233,20 @@ fn main() -> Result<()> {
             ..Default::default()
         };
         if RegisterClassExW(&quick_class) == 0 {
+            return Err(windows::core::Error::from_thread());
+        }
+
+        let tray_class = WNDCLASSEXW {
+            cbSize: std::mem::size_of::<WNDCLASSEXW>() as u32,
+            // Doble clic: algunos programas abren su ventana así desde la bandeja.
+            style: windows::Win32::UI::WindowsAndMessaging::CS_DBLCLKS,
+            lpfnWndProc: Some(tray_wndproc),
+            hInstance: instance.into(),
+            hCursor: LoadCursorW(None, IDC_ARROW)?,
+            lpszClassName: w!("GlassBarTray"),
+            ..Default::default()
+        };
+        if RegisterClassExW(&tray_class) == 0 {
             return Err(windows::core::Error::from_thread());
         }
 

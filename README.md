@@ -28,6 +28,12 @@ El botón de encendido del pie abre un menú como el del Inicio de Windows 11 co
 
 Al dejar el cursor sobre un programa con ventanas abiertas aparece, encima de su icono, una tarjeta por ventana con su título y su miniatura en vivo (la dibuja Windows con DWM, como en su barra), en fila; si no caben en la pantalla se encogen. La tarjeta bajo el cursor se resalta y muestra su ✕. Al pasar a otro programa la vista previa cambia al momento; un clic trae la ventana al frente y la **✕** le pide que se cierre. El panel se mantiene mientras el cursor va del icono hacia él y el dock no se oculta mientras está abierto. Los programas sin ventana siguen mostrando su nombre.
 
+## Apps en segundo plano
+
+La flecha **^** del dock abre el panel de GlassBar con los iconos de la bandeja de los demás programas (Spotify, Discord, Steam, la seguridad de Windows…), en filas de cinco como en Windows 11. Al pasar el cursor se ve el nombre de cada uno; un clic, un doble clic o un clic derecho le llegan al programa igual que desde la bandeja de Windows, que abre su ventana o su menú. Escape o un clic fuera cierran el panel.
+
+Windows no deja leer los iconos de la bandeja de Explorer, así que GlassBar los recibe directamente, como RetroBar: crea su propia ventana de bandeja delante de la de Explorer, guarda cada icono que registran los programas y reenvía el mensaje a Explorer, cuya bandeja sigue igual. Al abrirse pide a los programas que vuelvan a registrar sus iconos, y al cerrarse, que se los den otra vez a Explorer. Si no puede, la flecha abre el panel nativo como antes.
+
 ## Idioma del teclado
 
 Con más de un teclado instalado, entre la flecha de iconos ocultos y el estado aparece el idioma de la ventana activa en tres letras ("ESP") y, debajo, la distribución si no es la normal de ese idioma ("INTL" para Estados Unidos-Internacional), como en la barra de Windows. Se actualiza al cambiar de ventana y con los atajos de idioma. El globo muestra el nombre completo. Un clic abre el panel de idioma de GlassBar, con el estilo del panel rápido: un teclado por fila (abreviatura, nombre y una marca en el actual) y **Más configuración de idioma**. El elegido se aplica a la ventana que estaba activa; también se recorre con las flechas y Enter, y Escape o un clic fuera lo cierran.
