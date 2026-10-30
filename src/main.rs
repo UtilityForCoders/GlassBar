@@ -17,9 +17,11 @@ mod launcher;
 mod monitors;
 mod pins;
 mod priority;
+mod quick;
 mod shell;
 mod spring;
 mod status;
+mod system;
 mod textfield;
 mod tray;
 mod usage;
@@ -64,6 +66,8 @@ const WM_MOUSELEAVE: u32 = 0x02A3;
 const WM_SHOW_LAUNCHER: u32 = windows::Win32::UI::WindowsAndMessaging::WM_APP + 2;
 /// Cambió la ventana activa: el dock comprueba si debe ponerse encima o apartarse.
 const WM_FOREGROUND: u32 = windows::Win32::UI::WindowsAndMessaging::WM_APP + 3;
+/// El hilo de sistema terminó de leer Wi-Fi, Bluetooth, brillo y red.
+const WM_QUICK_UPDATE: u32 = windows::Win32::UI::WindowsAndMessaging::WM_APP + 4;
 
 const TIMER_ANIM: usize = 1;
 const TIMER_TICK: usize = 2;
@@ -349,73 +353,23 @@ impl LauncherWindow {
             self.present();
         }
     }
-    /// Pone el contenido ya dibujado en pantalla con la opacidad y la posición de la
-    /// transición. Mientras algo se mueve, un temporizador pide el siguiente fotograma.
     fn present(&mut self) {
-        let now = Instant::now();
-        let shown = self.transition.shown(now);
-        let running = self.transition.running(now);
-        unsafe {
-            if running || (self.visible && self.model.animating()) {
-                let _ = SetTimer(Some(self.hwnd), TIMER_ANIM, FRAME_MS, None);
-            } else {
-                let _ = KillTimer(Some(self.hwnd), TIMER_ANIM);
-            }
-            if !self.visible && !running {
-                let _ = ShowWindow(self.hwnd, windows::Win32::UI::WindowsAndMessaging::SW_HIDE);
-                return;
-            }
-        }
-        let pos = POINT {
-            x: self.pos.x,
-            y: self.pos.y + (self.transition.offset(now) * self.scale).round() as i32,
-        };
-        let blend = BLENDFUNCTION {
-            BlendOp: AC_SRC_OVER as u8,
-            SourceConstantAlpha: (shown * 255.0).round() as u8,
-            AlphaFormat: AC_SRC_ALPHA as u8,
-            ..Default::default()
-        };
-        unsafe {
-            let _ = UpdateLayeredWindow(
-                self.hwnd,
-                None,
-                Some(&pos),
-                Some(&SIZE {
-                    cx: self.surface.width as i32,
-                    cy: self.surface.height as i32,
-                }),
-                Some(self.surface.dc),
-                Some(&POINT { x: 0, y: 0 }),
-                COLORREF(0),
-                Some(&blend),
-                ULW_ALPHA,
-            );
-        }
+        let animating = self.visible && self.model.animating();
+        present_popup(
+            self.hwnd,
+            &self.surface,
+            self.pos,
+            self.scale,
+            &self.transition,
+            self.visible,
+            animating,
+        );
     }
     fn show(&mut self) {
         self.visible = true;
         self.transition.open(Instant::now());
         self.render();
-        unsafe {
-            use windows::Win32::System::Threading::{AttachThreadInput, GetCurrentThreadId};
-            use windows::Win32::UI::WindowsAndMessaging::{
-                GetForegroundWindow, GetWindowThreadProcessId, SetForegroundWindow, SW_SHOW,
-            };
-            let _ = ShowWindow(self.hwnd, SW_SHOW);
-            // Abierto con la tecla Windows no hubo clic en GlassBar y Windows puede
-            // negar el foco; compartir la entrada con la ventana activa lo permite.
-            let current = GetCurrentThreadId();
-            let foreground = GetWindowThreadProcessId(GetForegroundWindow(), None);
-            let attached = foreground != 0
-                && foreground != current
-                && AttachThreadInput(current, foreground, true).as_bool();
-            let _ = SetForegroundWindow(self.hwnd);
-            let _ = windows::Win32::UI::Input::KeyboardAndMouse::SetFocus(Some(self.hwnd));
-            if attached {
-                let _ = AttachThreadInput(current, foreground, false);
-            }
-        }
+        take_focus(self.hwnd);
     }
     /// Empieza el cierre; la ventana se oculta cuando termina de desvanecerse.
     fn hide(&mut self) {
@@ -433,6 +387,358 @@ impl Drop for LauncherWindow {
             let _ = windows::Win32::UI::WindowsAndMessaging::DestroyWindow(self.hwnd);
         }
     }
+}
+
+/// Pone en pantalla un panel emergente (lanzador o panel rápido) ya dibujado, con la
+/// opacidad y la posición de su transición. Mientras algo se mueve, un temporizador
+/// pide el siguiente fotograma; al terminar de cerrarse, oculta la ventana.
+fn present_popup(
+    hwnd: HWND,
+    surface: &Surface,
+    pos: POINT,
+    scale: f32,
+    transition: &launcher::Transition,
+    visible: bool,
+    animating: bool,
+) {
+    let now = Instant::now();
+    let shown = transition.shown(now);
+    let running = transition.running(now);
+    unsafe {
+        if running || animating {
+            let _ = SetTimer(Some(hwnd), TIMER_ANIM, FRAME_MS, None);
+        } else {
+            let _ = KillTimer(Some(hwnd), TIMER_ANIM);
+        }
+        if !visible && !running {
+            let _ = ShowWindow(hwnd, SW_HIDE);
+            return;
+        }
+    }
+    let pos = POINT {
+        x: pos.x,
+        y: pos.y + (transition.offset(now) * scale).round() as i32,
+    };
+    let blend = BLENDFUNCTION {
+        BlendOp: AC_SRC_OVER as u8,
+        SourceConstantAlpha: (shown * 255.0).round() as u8,
+        AlphaFormat: AC_SRC_ALPHA as u8,
+        ..Default::default()
+    };
+    unsafe {
+        let _ = UpdateLayeredWindow(
+            hwnd,
+            None,
+            Some(&pos),
+            Some(&SIZE {
+                cx: surface.width as i32,
+                cy: surface.height as i32,
+            }),
+            Some(surface.dc),
+            Some(&POINT { x: 0, y: 0 }),
+            COLORREF(0),
+            Some(&blend),
+            ULW_ALPHA,
+        );
+    }
+}
+
+/// Muestra un panel emergente y le da el foco, para que se cierre al hacer clic fuera.
+fn take_focus(hwnd: HWND) {
+    unsafe {
+        use windows::Win32::System::Threading::{AttachThreadInput, GetCurrentThreadId};
+        use windows::Win32::UI::WindowsAndMessaging::{
+            GetForegroundWindow, GetWindowThreadProcessId, SetForegroundWindow, SW_SHOW,
+        };
+        let _ = ShowWindow(hwnd, SW_SHOW);
+        // Abierto con la tecla Windows no hubo clic en GlassBar y Windows puede
+        // negar el foco; compartir la entrada con la ventana activa lo permite.
+        let current = GetCurrentThreadId();
+        let foreground = GetWindowThreadProcessId(GetForegroundWindow(), None);
+        let attached = foreground != 0
+            && foreground != current
+            && AttachThreadInput(current, foreground, true).as_bool();
+        let _ = SetForegroundWindow(hwnd);
+        let _ = windows::Win32::UI::Input::KeyboardAndMouse::SetFocus(Some(hwnd));
+        if attached {
+            let _ = AttachThreadInput(current, foreground, false);
+        }
+    }
+}
+
+/// Panel rápido (Wi-Fi, Bluetooth, brillo y volumen) sobre los iconos de estado.
+struct QuickWindow {
+    hwnd: HWND,
+    surface: Surface,
+    pos: POINT,
+    scale: f32,
+    model: quick::QuickState,
+    visible: bool,
+    transition: launcher::Transition,
+    backend: system::Backend,
+}
+impl QuickWindow {
+    fn new(owner: HWND) -> Result<Self> {
+        let (_, dpi) = monitors::get_info(monitors::primary());
+        let scale = dpi.max(0.3);
+        let width = (quick::WIDTH * scale).ceil() as u32;
+        let height = (quick::HEIGHT * scale).ceil() as u32;
+        let surface = Surface::new(width, height)?;
+        let hwnd = unsafe {
+            CreateWindowExW(
+                WS_EX_LAYERED | WS_EX_TOPMOST | WS_EX_TOOLWINDOW,
+                w!("GlassBarQuick"),
+                w!("GlassBar — Configuración rápida"),
+                WS_POPUP,
+                0,
+                0,
+                width as i32,
+                height as i32,
+                Some(owner),
+                None,
+                Some(GetModuleHandleW(None)?.into()),
+                None,
+            )?
+        };
+        Ok(Self {
+            hwnd,
+            surface,
+            pos: POINT::default(),
+            scale,
+            model: quick::QuickState::default(),
+            visible: false,
+            transition: launcher::Transition::hidden(),
+            backend: system::Backend::start(hwnd, WM_QUICK_UPDATE),
+        })
+    }
+    /// Encima de los iconos de estado (`anchor_x`), sin salirse de la pantalla.
+    fn place(&mut self, anchor_x: i32, dock_top: i32) {
+        let (screen, _) = monitors::get_info(monitors::primary());
+        let width = self.surface.width as i32;
+        let margin = (12.0 * self.scale).round() as i32;
+        self.pos = POINT {
+            x: (anchor_x - width / 2).clamp(
+                screen.left + margin,
+                (screen.right - width - margin).max(screen.left + margin),
+            ),
+            y: dock_top - self.surface.height as i32 - margin,
+        };
+    }
+    fn render(&mut self) {
+        self.model.draw(&mut self.surface.pixmap, self.scale);
+        self.surface.copy_to_dib();
+        self.present();
+    }
+    fn present(&mut self) {
+        present_popup(
+            self.hwnd,
+            &self.surface,
+            self.pos,
+            self.scale,
+            &self.transition,
+            self.visible,
+            false,
+        );
+    }
+    fn show(&mut self) {
+        self.visible = true;
+        // Lo último conocido mientras el hilo de sistema vuelve a leerlo.
+        self.model.system = self.backend.snapshot();
+        self.backend.refresh();
+        self.transition.open(Instant::now());
+        self.render();
+        take_focus(self.hwnd);
+    }
+    fn hide(&mut self) {
+        if !self.visible {
+            return;
+        }
+        self.visible = false;
+        self.model.dragging = None;
+        self.model.hovered = None;
+        self.transition.close(Instant::now());
+        self.present();
+    }
+    /// Lleva una barra al valor `value` (de 0 a 1) y lo aplica al sistema.
+    fn set_slider(&mut self, slider: quick::Slider, value: f32) {
+        match slider {
+            quick::Slider::Volume => {
+                let muted = self.model.volume.is_some_and(|v| v.muted) && value == 0.0;
+                self.model.volume = Some(status::Volume {
+                    level: value,
+                    muted,
+                });
+                status::set_volume(value);
+            }
+            quick::Slider::Brightness => {
+                let percent = (value * 100.0).round() as u8;
+                self.model.system.brightness = Some(percent);
+                self.backend.set_brightness(percent);
+            }
+        }
+        self.render();
+    }
+}
+impl Drop for QuickWindow {
+    fn drop(&mut self) {
+        unsafe {
+            let _ = windows::Win32::UI::WindowsAndMessaging::DestroyWindow(self.hwnd);
+        }
+    }
+}
+
+unsafe extern "system" fn quick_wndproc(
+    hwnd: HWND,
+    msg: u32,
+    wparam: WPARAM,
+    lparam: LPARAM,
+) -> LRESULT {
+    use windows::Win32::UI::WindowsAndMessaging::{
+        WA_INACTIVE, WM_ACTIVATE, WM_CAPTURECHANGED, WM_CLOSE, WM_KEYDOWN, WM_MOUSEWHEEL,
+    };
+    // Coordenadas lógicas del panel a partir de las del mensaje.
+    let point = |scale: f32| {
+        (
+            (lparam.0 & 0xffff) as i16 as f32 / scale,
+            ((lparam.0 >> 16) & 0xffff) as i16 as f32 / scale,
+        )
+    };
+    match msg {
+        WM_ACTIVATE if (wparam.0 & 0xffff) as u32 == WA_INACTIVE => {
+            with_app(|app| app.quick.as_mut().map(QuickWindow::hide));
+        }
+        WM_CLOSE => {
+            with_app(|app| app.quick.as_mut().map(QuickWindow::hide));
+        }
+        WM_TIMER if wparam.0 == TIMER_ANIM => {
+            with_app(|app| app.quick.as_mut().map(QuickWindow::present));
+        }
+        WM_QUICK_UPDATE => {
+            with_app(|app| {
+                if let Some(panel) = &mut app.quick {
+                    panel.model.system = panel.backend.snapshot();
+                    if panel.visible {
+                        panel.render();
+                    }
+                }
+            });
+        }
+        WM_CAPTURECHANGED => {
+            with_app(|app| {
+                if let Some(panel) = &mut app.quick {
+                    panel.model.dragging = None;
+                }
+            });
+        }
+        WM_MOUSELEAVE => {
+            with_app(|app| {
+                if let Some(panel) = app.quick.as_mut().filter(|p| p.visible) {
+                    if panel.model.hovered.take().is_some() {
+                        panel.render();
+                    }
+                }
+            });
+        }
+        WM_MOUSEMOVE => {
+            with_app(|app| {
+                let Some(panel) = app.quick.as_mut().filter(|p| p.visible) else {
+                    return;
+                };
+                let mut track = TRACKMOUSEEVENT {
+                    cbSize: std::mem::size_of::<TRACKMOUSEEVENT>() as u32,
+                    dwFlags: TME_LEAVE,
+                    hwndTrack: hwnd,
+                    dwHoverTime: 0,
+                };
+                let _ = TrackMouseEvent(&mut track);
+                let (x, y) = point(panel.scale);
+                if let Some(slider) = panel.model.dragging {
+                    panel.set_slider(slider, quick::QuickState::slider_value(x));
+                    return;
+                }
+                let hit = panel.model.hit_test(x, y);
+                if hit != panel.model.hovered {
+                    panel.model.hovered = hit;
+                    panel.render();
+                }
+            });
+        }
+        WM_LBUTTONDOWN => {
+            with_app(|app| {
+                let Some(panel) = app.quick.as_mut().filter(|p| p.visible) else {
+                    return;
+                };
+                let (x, y) = point(panel.scale);
+                if let Some(quick::Hit::Slider(slider)) = panel.model.hit_test(x, y) {
+                    SetCapture(hwnd);
+                    panel.model.dragging = Some(slider);
+                    panel.set_slider(slider, quick::QuickState::slider_value(x));
+                }
+            });
+        }
+        WM_LBUTTONUP => {
+            with_app(|app| {
+                let Some(panel) = app.quick.as_mut().filter(|p| p.visible) else {
+                    return;
+                };
+                if panel.model.dragging.take().is_some() {
+                    let _ = ReleaseCapture();
+                    panel.render();
+                    return;
+                }
+                let (x, y) = point(panel.scale);
+                match panel.model.hit_test(x, y) {
+                    Some(quick::Hit::Tile(radio)) => {
+                        // Se ve al instante; el hilo de sistema lo confirma al terminar.
+                        let state = match radio {
+                            system::Radio::Wifi => &mut panel.model.system.wifi,
+                            system::Radio::Bluetooth => &mut panel.model.system.bluetooth,
+                        };
+                        if let Some(on) = state {
+                            *on = !*on;
+                            panel.backend.set_radio(radio, *on);
+                        }
+                        panel.render();
+                    }
+                    Some(quick::Hit::Mute) => {
+                        if let Some(volume) = &mut panel.model.volume {
+                            volume.muted = !volume.muted;
+                            status::set_mute(volume.muted);
+                        }
+                        panel.render();
+                    }
+                    Some(quick::Hit::More) => {
+                        panel.hide();
+                        status::open_quick_settings();
+                    }
+                    _ => {}
+                }
+            });
+        }
+        // La rueda sobre una barra la mueve de 2 % en 2 %.
+        WM_MOUSEWHEEL => {
+            with_app(|app| {
+                let Some(panel) = app.quick.as_mut().filter(|p| p.visible) else {
+                    return;
+                };
+                let slider = match panel.model.hovered {
+                    Some(quick::Hit::Slider(slider)) => slider,
+                    Some(quick::Hit::Mute) => quick::Slider::Volume,
+                    _ => return,
+                };
+                if let Some(value) = panel.model.value(slider) {
+                    let steps = ((wparam.0 >> 16) & 0xffff) as i16 as f32 / 120.0;
+                    let value = ((value * 50.0).round() + steps).clamp(0.0, 50.0) / 50.0;
+                    panel.set_slider(slider, value);
+                }
+            });
+        }
+        WM_KEYDOWN if wparam.0 == 0x1B => {
+            with_app(|app| app.quick.as_mut().map(QuickWindow::hide));
+        }
+        _ => return DefWindowProcW(hwnd, msg, wparam, lparam),
+    }
+    LRESULT(0)
 }
 
 unsafe fn clipboard_text(hwnd: HWND) -> Option<String> {
@@ -750,6 +1056,8 @@ struct App {
     shell: TaskbarReplacer,
     tray: Tray,
     launcher: Option<LauncherWindow>,
+    /// Panel rápido; se crea la primera vez que se abre.
+    quick: Option<QuickWindow>,
     /// Lanzador preparado en segundo plano al iniciar (catálogo e iconos), para que
     /// la primera apertura no tenga que esperar a leerlos.
     prepared: Option<std::sync::mpsc::Receiver<launcher::LauncherState>>,
@@ -807,6 +1115,7 @@ impl App {
             shell,
             tray,
             launcher: None,
+            quick: None,
             prepared: Some(prepare_launcher(&pinned)),
             tooltip: Tooltip::new(hwnd).ok(),
             animating: false,
@@ -815,12 +1124,40 @@ impl App {
         })
     }
 
+    /// Abre o cierra el panel rápido sobre los iconos de red, volumen y batería.
+    fn toggle_quick(&mut self) {
+        if let Some(panel) = self.quick.as_mut().filter(|p| p.visible) {
+            panel.hide();
+            return;
+        }
+        if let Some(menu) = &mut self.launcher {
+            menu.hide();
+        }
+        if self.quick.is_none() {
+            match QuickWindow::new(self.hwnd) {
+                Ok(panel) => self.quick = Some(panel),
+                Err(_) => return,
+            }
+        }
+        let anchor = self.pos.x + self.bar.status_group_center(self.scale).round() as i32;
+        if let Some(panel) = &mut self.quick {
+            panel.model.volume = self.bar.status.volume;
+            panel.model.battery = self.bar.status.battery;
+            panel.place(anchor, self.y_shown);
+            panel.show();
+        }
+        self.expand();
+    }
+
     fn toggle_launcher(&mut self) {
         if self.launcher.as_ref().is_some_and(|menu| menu.visible) {
             if let Some(menu) = &mut self.launcher {
                 menu.hide();
             }
             return;
+        }
+        if let Some(panel) = &mut self.quick {
+            panel.hide();
         }
         let pinned: Vec<_> = self
             .bar
@@ -932,8 +1269,13 @@ impl App {
         let Some(target) = self.bar.hovered else {
             return;
         };
-        // El nombre de la flecha taparía el panel que ella misma abre.
+        // El nombre de la flecha o del estado taparía el panel que ellos mismos abren.
         if target == HoverTarget::Overflow && shell::overflow_window().is_some() {
+            return;
+        }
+        if matches!(target, HoverTarget::Status(_))
+            && self.quick.as_ref().is_some_and(|q| q.visible)
+        {
             return;
         }
         let Some((name, cx)) = self.bar.item_label(target, self.scale) else {
@@ -1201,13 +1543,10 @@ unsafe extern "system" fn wndproc(hwnd: HWND, msg: u32, wparam: WPARAM, lparam: 
                             );
                         }
                         HoverTarget::Status(_) => {
-                            if let Some(menu) = &mut app.launcher {
-                                menu.hide();
-                            }
                             if let Some(tip) = &mut app.tooltip {
                                 tip.hide();
                             }
-                            status::open_quick_settings();
+                            app.toggle_quick();
                         }
                         HoverTarget::Clock => {
                             let _ = std::process::Command::new("explorer.exe")
@@ -1295,6 +1634,16 @@ unsafe extern "system" fn wndproc(hwnd: HWND, msg: u32, wparam: WPARAM, lparam: 
                     let status = status::read();
                     let resized = status.items().len() != app.bar.status.items().len();
                     app.bar.status = status;
+                    // El volumen puede cambiar con las teclas o desde otra app.
+                    if let Some(panel) = app.quick.as_mut().filter(|p| p.visible) {
+                        let changed = panel.model.volume != status.volume
+                            || panel.model.battery != status.battery;
+                        if changed && panel.model.dragging.is_none() {
+                            panel.model.volume = status.volume;
+                            panel.model.battery = status.battery;
+                            panel.render();
+                        }
+                    }
                     if apps::update_running_apps(&mut app.bar.primary_apps, &mut app.bar.open_apps)
                         || resized
                     {
@@ -1334,6 +1683,7 @@ unsafe extern "system" fn wndproc(hwnd: HWND, msg: u32, wparam: WPARAM, lparam: 
                             || inside
                             || app.bar.drag.is_some()
                             || app.launcher.as_ref().is_some_and(|l| l.visible)
+                            || app.quick.as_ref().is_some_and(|q| q.visible)
                             // El panel de iconos ocultos abierto sobre la flecha; se mira
                             // al final porque recorre las ventanas, y solo con el dock fuera.
                             || (app.visibility.expanded && shell::overflow_window().is_some()),
@@ -1543,6 +1893,18 @@ fn main() -> Result<()> {
             ..Default::default()
         };
         if RegisterClassExW(&launcher_class) == 0 {
+            return Err(windows::core::Error::from_thread());
+        }
+
+        let quick_class = WNDCLASSEXW {
+            cbSize: std::mem::size_of::<WNDCLASSEXW>() as u32,
+            lpfnWndProc: Some(quick_wndproc),
+            hInstance: instance.into(),
+            hCursor: LoadCursorW(None, IDC_ARROW)?,
+            lpszClassName: w!("GlassBarQuick"),
+            ..Default::default()
+        };
+        if RegisterClassExW(&quick_class) == 0 {
             return Err(windows::core::Error::from_thread());
         }
 

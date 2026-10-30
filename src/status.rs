@@ -108,7 +108,7 @@ impl Status {
 }
 
 /// Volumen0 a Volumen3, como Windows: sin ondas, una, dos o tres.
-fn volume_glyph(level: f32) -> char {
+pub fn volume_glyph(level: f32) -> char {
     match level {
         l if l <= 0.0 => '\u{E992}',
         l if l < 0.34 => '\u{E993}',
@@ -118,7 +118,7 @@ fn volume_glyph(level: f32) -> char {
 }
 
 /// Batería en once pasos (0 a 10), con rayo si está enchufada.
-fn battery_glyph(battery: Battery) -> char {
+pub fn battery_glyph(battery: Battery) -> char {
     let step = ((battery.percent.min(100) as u32 + 5) / 10).min(10);
     if battery.plugged {
         char::from_u32(0xEBA0 + step).unwrap_or('\u{EBAA}')
@@ -166,6 +166,38 @@ pub fn change_volume(steps: f32) {
                     let _ = volume.SetMute(false, std::ptr::null());
                 }
             }
+        }
+        if initialized {
+            CoUninitialize();
+        }
+    }
+}
+
+/// Pone el volumen en `level` (de 0 a 1) desde el panel rápido; quita el silencio
+/// si se sube por encima de cero, como el control de Windows.
+pub fn set_volume(level: f32) {
+    use windows::Win32::System::Com::{CoInitializeEx, CoUninitialize, COINIT_APARTMENTTHREADED};
+    unsafe {
+        let initialized = CoInitializeEx(None, COINIT_APARTMENTTHREADED).is_ok();
+        if let Some(volume) = endpoint() {
+            let level = level.clamp(0.0, 1.0);
+            let _ = volume.SetMasterVolumeLevelScalar(level, std::ptr::null());
+            if level > 0.0 {
+                let _ = volume.SetMute(false, std::ptr::null());
+            }
+        }
+        if initialized {
+            CoUninitialize();
+        }
+    }
+}
+
+pub fn set_mute(muted: bool) {
+    use windows::Win32::System::Com::{CoInitializeEx, CoUninitialize, COINIT_APARTMENTTHREADED};
+    unsafe {
+        let initialized = CoInitializeEx(None, COINIT_APARTMENTTHREADED).is_ok();
+        if let Some(volume) = endpoint() {
+            let _ = volume.SetMute(muted, std::ptr::null());
         }
         if initialized {
             CoUninitialize();

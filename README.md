@@ -32,7 +32,16 @@ Entre la flecha de iconos ocultos y la hora, el dock muestra el estado del siste
 - **Volumen:** de cero a tres ondas según el nivel de la salida predeterminada, y una cruz si está silenciada. La rueda del ratón sobre el icono lo sube o lo baja de 2 % en 2 %.
 - **Batería:** solo en equipos con batería; el nivel en once pasos, con rayo mientras está enchufada.
 
-El estado se lee una vez por segundo. Al pasar el cursor se muestra el detalle (p. ej. "Volumen: 45 %"), y un clic en el grupo abre la configuración rápida de Windows (Win+A).
+El estado se lee una vez por segundo. Al pasar el cursor se muestra el detalle (p. ej. "Volumen: 45 %").
+
+Un clic en el grupo abre el panel rápido de GlassBar justo encima, con el estilo del lanzador:
+
+- **Wi-Fi** y **Bluetooth:** botones para encenderlos y apagarlos (API de radios de Windows); el de Wi-Fi muestra el nombre de la red conectada.
+- **Brillo:** barra para la pantalla del portátil (WMI). Los monitores externos no lo admiten por esta vía y la barra aparece como no disponible.
+- **Volumen:** barra de la salida predeterminada; el icono del altavoz silencia o quita el silencio.
+- **Pie:** nivel de batería (si la hay) y **Más opciones**, que abre el panel de Windows para lo demás.
+
+Las barras se arrastran o se mueven con la rueda de 2 % en 2 %. Leer y cambiar las radios y el brillo puede tardar, así que se hace en un hilo aparte y el panel no se bloquea. Escape o un clic fuera lo cierran.
 
 ## Tecla Windows
 

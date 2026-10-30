@@ -86,6 +86,11 @@ impl BarState {
         (SHADOW_PAD_X + self.status_left() + STATUS_PAD + (index as f32 + 0.5) * STATUS_STEP)
             * scale
     }
+    /// Centro horizontal del grupo de estado, en píxeles de la ventana: el panel
+    /// rápido se abre sobre él.
+    pub fn status_group_center(&self, scale: f32) -> f32 {
+        (SHADOW_PAD_X + self.status_left() + self.status_width() / 2.0) * scale
+    }
     /// Qué muestra el icono de estado `index` (red, volumen o batería).
     pub fn status_item(&self, index: usize) -> Option<Item> {
         self.status.items().get(index).copied()
