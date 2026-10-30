@@ -37,7 +37,7 @@ El estado se lee una vez por segundo. Al pasar el cursor se muestra el detalle (
 Un clic en el grupo abre el panel rápido de GlassBar justo encima, con el estilo del lanzador:
 
 - **Wi-Fi** y **Bluetooth:** botones para encenderlos y apagarlos (API de radios de Windows); el de Wi-Fi muestra el nombre de la red conectada.
-- **Brillo:** barra para la pantalla del portátil (WMI). Los monitores externos no lo admiten por esta vía y la barra aparece como no disponible.
+- **Brillo:** barra para la pantalla donde está el dock (el monitor principal). Si es la integrada del portátil se usa WMI; si es un monitor externo, DDC/CI, el mismo canal que usa su menú (algunos monitores lo traen desactivado en sus ajustes). Si ninguna vía responde, la barra aparece como no disponible en lugar de cambiar el brillo de otra pantalla.
 - **Volumen:** barra de la salida predeterminada; el icono del altavoz silencia o quita el silencio.
 - **Pie:** nivel de batería (si la hay) y **Más opciones**, que abre el panel de Windows para lo demás.
 

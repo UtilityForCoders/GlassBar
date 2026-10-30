@@ -20,6 +20,7 @@ features = [
     "Devices_Radios",
     "Foundation",
     "Foundation_Collections",
+    "Win32_Devices_Display",
     "Win32_Foundation",
     "Win32_Storage_FileSystem",
     "Win32_Storage_EnhancedStorage",
