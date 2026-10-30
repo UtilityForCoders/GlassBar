@@ -16,6 +16,8 @@ const EMPTY_H: f32 = 48.0;
 const EMPTY_TEXT: &str = "No hay apps en segundo plano";
 
 pub struct TrayIcon {
+    /// Para que el clic llegue a este icono aunque la lista cambie mientras tanto.
+    pub key: crate::systray::Key,
     pub image: Option<Pixmap>,
     pub tip: String,
 }
@@ -139,6 +141,7 @@ mod tests {
         TrayPanel {
             icons: (0..count)
                 .map(|i| TrayIcon {
+                    key: Default::default(),
                     image: None,
                     tip: format!("App {i}"),
                 })

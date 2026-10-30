@@ -1,0 +1,113 @@
+GlassBar 0.1.0 — banco de pruebas (--bench)
+Duración: 5 s · núcleos lógicos: 12 · compilación: release
+
+== SECCIONES (ordenadas por tiempo total) ==
+Los tiempos de una sección incluyen los de las secciones que llama. µs = microsegundos.
+sección                                       llamadas       /s   total ms  %pared  media µs    p50 µs    p95 µs    p99 µs     máx µs   asig/ll      KB/ll
+launcher.catalog_load (LauncherState::new)           4     0.73    2065.94 37.869%  516483.9  512651.6  566493.8  566493.8   566493.8    7045.0     533.19
+bench.launcher.catalog_load (desde cero)             3     0.55    1499.59 27.487%  499862.9  496631.7  512670.4  512670.4   512670.4    7045.0     533.19
+icons.load                                          54     9.90    1208.37 22.150%   22377.3   18755.5   45784.9   62745.8    72693.3       7.5     129.68
+launcher.render                                    127    23.28    1077.06 19.743%    8480.8    7962.9   13080.9   16486.5    16630.9     462.1     508.34
+launcher.draw                                      127    23.28     890.59 16.325%    7012.5    6557.7   10897.6   14042.8    15157.9     462.1     508.31
+bench.launcher.render                              100    18.33     859.89 15.762%    8598.9    8068.9   13088.9   16487.5    16631.7     412.2     484.46
+bench.launcher.primera_apertura                      1     0.18     674.24 12.359%  674244.8  674244.8  674244.8  674244.8   674244.8    5007.0    6933.22
+launcher.toggle                                      1     0.18     674.23 12.359%  674233.3  674233.3  674233.3  674233.3   674233.3    5006.0    6933.19
+quick.render                                       251    46.01     587.23 10.764%    2339.6    2288.4    2997.8    3536.2     3823.0     108.5     775.50
+quick.draw                                         251    46.01     514.37  9.428%    2049.3    2037.9    2581.7    2920.4     3277.1     108.5     775.46
+bluetooth.devices                                    4     0.73     506.67  9.287%  126667.4   87558.1  252316.1  252316.1   252316.1      54.0       2.72
+audio.read                                          12     2.20     459.00  8.413%   38249.6   28934.5   51151.2  120697.8   120697.8     853.2     155.85
+launcher.preload_icons                               1     0.18     435.80  7.988%  435801.1  435801.1  435801.1  435801.1   435801.1     175.0    2446.81
+bench.system.audio_read                             10     1.83     287.19  5.264%   28719.4   28672.7   30414.7   30414.7    30414.7     799.3      82.90
+bench.system.bluetooth_devices                       3     0.55     254.36  4.662%   84786.1   84056.6   87559.9   87559.9    87559.9      54.0       2.72
+startup.app_new                                      1     0.18     251.74  4.614%  251739.5  251739.5  251739.5  251739.5   251739.5     271.0    1292.46
+apps.update_running_apps                            51     9.35     219.85  4.030%    4310.8     320.9     506.7  203570.5   203570.5      46.0      21.41
+bench.quick.render (principal)                     100    18.33     214.19  3.926%    2141.9    2091.0    2721.7    2892.8     3289.4     190.1     639.54
+surface.copy_to_dib                               1301   238.47     167.51  3.071%     128.8      41.2     632.0    1152.1     1746.8       0.0       0.00
+system.read_all                                      2     0.37     163.48  2.997%   81742.1  163325.9  163325.9  163325.9   163325.9     598.0     263.48
+bench.launcher.scroll+render                        20     3.67     156.63  2.871%    7831.6    7772.8    8513.7    8607.8     8607.8     424.8     502.72
+bench.quick.render (lista Wi-Fi)                    50     9.17     140.53  2.576%    2810.7    2756.2    3537.9    3823.6     3823.6      49.5     864.09
+popup.present                                      482    88.35     140.09  2.568%     290.6     150.7     963.6    1345.1     2417.6       0.0       0.00
+dock.render                                        321    58.84     129.32  2.370%     402.9     351.3     605.7    1089.6     2923.4     186.0     103.64
+bench.quick.render (lista Bluetooth)                50     9.17     115.94  2.125%    2318.8    2305.0    2522.6    2781.0     2781.0      50.8     865.72
+bench.dock.render (draw+copia+envío)               300    54.99     115.21  2.112%     384.0     350.6     499.3    1006.0     1407.6     182.2      98.74
+bench.quick.render (audio)                          50     9.17     113.84  2.087%    2276.9    2233.9    2511.2    2654.9     2654.9      53.9     870.22
+bench.system.radios                                 10     1.83     105.13  1.927%   10513.1    8756.4   24201.2   24201.2    24201.2       1.0       0.02
+dock.draw                                          321    58.84     101.37  1.858%     315.8     283.2     395.4     776.0     2485.7     185.9     103.56
+dock.draw.glass                                    621   113.83      92.28  1.691%     148.6     141.8     163.6     326.3      512.1      17.0       8.39
+bench.dock.draw                                    300    54.99      85.18  1.561%     283.9     276.6     318.2     399.1      418.7     182.0      98.64
+bench.system.wifi_networks                          10     1.83      83.33  1.527%    8333.3    8249.0    9475.6    9475.6     9475.6      56.0       5.48
+language.render                                    101    18.51      80.07  1.468%     792.7     752.7     954.0    1293.3     1559.4     108.3     119.07
+bench.language.render                              100    18.33      78.80  1.444%     788.0     752.8     929.2    1293.7     1560.1     107.1     118.76
+status.read                                         51     9.35      57.15  1.048%    1120.6     777.9    1711.4   11038.6    11038.6       1.3       0.44
+dock.draw.apps                                     621   113.83      55.72  1.021%      89.7      84.3      99.2     197.0      862.5     109.5      66.46
+bench.system.audio_read (primera, sin iconos)         1     0.18      51.15  0.938%   51151.8   51151.8   51151.8   51151.8    51151.8    1124.0     520.73
+status.read.volume                                  51     9.35      48.18  0.883%     944.7     775.9    1705.4    4312.3     4312.3       1.0       0.05
+bench.tick.status_read                              50     9.17      46.13  0.846%     922.6     778.0    1467.3    4319.6     4319.6       1.2       0.11
+bench.launcher.buscar+render                         6     1.10      44.72  0.820%    7452.7    7421.6    7971.8    7971.8     7971.8     969.7     335.38
+bench.system.brightness_get                         10     1.83      43.19  0.792%    4318.9    4458.2    5171.4    5171.4     5171.4       5.0       0.32
+dock.update_layered                                621   113.83      38.35  0.703%      61.8      46.7     154.5     243.9      343.7       0.0       0.00
+bench.edge.overflow_window                         300    54.99      34.91  0.640%     116.4      60.0     391.5     810.1     1621.4      51.0       0.78
+preview.render                                     101    18.51      33.15  0.608%     328.2     320.7     365.1     412.1      672.0      23.3      20.97
+system.wmi_connect                                   1     0.18      32.67  0.599%   32674.3   32674.3   32674.3   32674.3    32674.3       7.0       0.34
+bench.preview.render                               100    18.33      32.50  0.596%     325.0     320.8     356.5     394.1      412.7      23.1      20.94
+text.rasterize_line                              10586  1940.41      31.10  0.570%       2.9       2.0       8.0      18.3      155.6       3.2       4.55
+dock.draw.status+idioma                            621   113.83      29.11  0.534%      46.9      39.4      71.2     144.1     1226.6      52.3      26.15
+bench.system.network_name                           20     3.67      25.37  0.465%    1268.3    1244.9    1642.4    2059.7     2059.7       2.0       0.02
+bench.dock.update_layered                          300    54.99      24.50  0.449%      81.7      66.8     162.9     239.7      332.6       0.0       0.03
+system.wifi_networks                                 1     0.18      22.87  0.419%   22874.4   22874.4   22874.4   22874.4    22874.4      56.0       5.48
+apps.open_windows (EnumWindows)                     51     9.35      17.03  0.312%     333.9     318.1     502.2     914.9      914.9      25.2       2.54
+bench.tooltip.show                                 100    18.33      16.67  0.306%     166.7     153.4     222.8     339.1      775.9      21.1      40.97
+tooltip.show                                       100    18.33      16.64  0.305%     166.4     153.1     222.1     338.4      774.4      21.0      40.95
+bench.tick.update_running_apps                      50     9.17      16.29  0.299%     325.8     321.1     490.4     731.3      731.3      43.3       3.48
+bench.dock.relayout                                 20     3.67      15.23  0.279%     761.3     725.9     918.1     964.3      964.3     187.2     322.68
+dock.relayout                                       20     3.67      15.22  0.279%     760.8     725.7     917.0     963.7      963.7     187.0     322.66
+apps.process_info                                  507    92.93      13.56  0.249%      26.8      19.7      61.2      91.4      148.5       2.4       0.10
+system.radios                                        1     0.18      12.36  0.227%   12365.0   12365.0   12365.0   12365.0    12365.0       1.0       0.02
+bench.dock.copy_to_dib                             300    54.99      11.76  0.215%      39.2      38.2      44.0      48.4       49.2       0.0       0.03
+bench.quick.primera_apertura                         1     0.18      10.70  0.196%   10702.9   10702.9   10702.9   10702.9    10702.9     545.0    1209.29
+quick.toggle                                         1     0.18      10.68  0.196%   10677.5   10677.5   10677.5   10677.5    10677.5     544.0    1209.26
+bench.language.primera_apertura                      1     0.18       8.59  0.157%    8588.1    8588.1    8588.1    8588.1     8588.1     339.0     630.47
+language.toggle                                      1     0.18       8.58  0.157%    8584.6    8584.6    8584.6    8584.6     8584.6     338.0     630.44
+apps.file_description                               29     5.32       8.03  0.147%     276.9     209.0     850.1     884.1      884.1       7.7       1.66
+bench.system.wmi_connect                             1     0.18       7.56  0.139%    7564.7    7564.7    7564.7    7564.7     7564.7       7.0       0.34
+dock.draw.clock                                    621   113.83       6.56  0.120%      10.6       9.7      14.9      27.1       88.6       5.2       0.08
+keyboard.current                                   201    36.84       5.69  0.104%      28.3      18.8      96.9     201.6      614.4       4.1       0.10
+status.read.link                                     1     0.18       5.68  0.104%    5683.3    5683.3    5683.3    5683.3     5683.3       1.0      16.00
+apps.downscale_icon                                 54     9.90       5.38  0.099%      99.7      82.6     171.4     179.3      188.4      89.8      14.05
+bench.tick.keyboard_current                        200    36.66       5.12  0.094%      25.6      19.1      82.6     190.3      256.0       4.1       0.11
+system.brightness_get                                1     0.18       3.73  0.068%    3731.4    3731.4    3731.4    3731.4     3731.4       5.0       0.32
+system.network_name                                  1     0.18       3.62  0.066%    3616.6    3616.6    3616.6    3616.6     3616.6       2.0       0.02
+status.read.internet                                 1     0.18       3.07  0.056%    3071.8    3071.8    3071.8    3071.8     3071.8       0.0       0.00
+keyboard.read_layout (registro)                      3     0.55       2.65  0.049%     883.9     487.5    2036.2    2036.2     2036.2      36.7       0.55
+bench.system.wlan_open                               1     0.18       2.16  0.040%    2162.9    2162.9    2162.9    2162.9     2162.9       0.0       0.00
+keyboard.installed                                 202    37.03       1.68  0.031%       8.3       0.7      45.2      95.8      187.4       1.0       0.02
+bench.preview.show                                  20     3.67       1.53  0.028%      76.6       0.5       2.3    1519.0     1519.0       9.3      15.21
+preview.show                                        20     3.67       1.53  0.028%      76.4       0.4       2.1    1517.9     1517.9       9.2      15.19
+bench.tick.check_priority                          200    36.66       1.32  0.024%       6.6       0.8      34.1      47.5       65.3       2.1       0.07
+app.check_priority                                 200    36.66       1.29  0.024%       6.5       0.7      33.6      47.2       64.3       2.0       0.05
+priority.fullscreen_app                            200    36.66       1.26  0.023%       6.3       0.6      33.0      46.9       64.2       2.0       0.03
+shell.maintain                                     201    36.84       1.22  0.022%       6.1       1.4      32.7      56.9      164.3       1.0       0.03
+bench.tick.shell_maintain                          200    36.66       1.22  0.022%       6.1       1.5      31.1      57.2      164.6       1.0       0.05
+text.glyph_rasterize (fallo de caché)              234    42.89       1.07  0.020%       4.6       3.7      11.1      18.5       24.0      11.7       2.17
+system.display_find                                  1     0.18       0.60  0.011%     596.1     596.1     596.1     596.1      596.1       2.0       0.20
+bench.accent.refresh                                50     9.17       0.33  0.006%       6.5       5.9       7.3      28.0       28.0       0.1       0.02
+accent.read (registro)                              50     9.17       0.32  0.006%       6.3       5.7       7.0      27.0       27.0       0.0       0.00
+status.read.battery                                 51     9.35       0.13  0.002%       2.5       1.7       5.9       8.7        8.7       0.0       0.00
+bench.system.display_find                            5     0.92       0.09  0.002%      17.3       4.8      67.7      67.7       67.7       2.0       0.20
+
+== MEDIDORES (último valor) ==
+memoria al iniciar                           working set 37.09 MB · privada 9.76 MB · heap Rust 2.14 MB
+memoria: abrir el lanzador (Δ)               working set +24.59 MB · privada +13.70 MB · heap Rust +5.88 MB
+memoria: abrir el panel rápido (Δ)           working set +1.85 MB · privada +1.36 MB · heap Rust +0.50 MB
+memoria: vista previa abierta (Δ)            working set +0.85 MB · privada +0.62 MB · heap Rust +0.27 MB
+superficie: dock                             820x70 px · 0.44 MB (pixmap + DIB)
+superficie: lanzador                         800x875 px · 5.34 MB (pixmap + DIB)
+lanzador: catálogo e iconos                  294 programas · 24 iconos · 0.15 MB
+superficie: panel rápido                     425x305 px · 0.99 MB (pixmap + DIB)
+superficie: idioma                           400x305 px · 0.93 MB (pixmap + DIB)
+superficie: vista previa                     320x221 px · 0.54 MB (pixmap + DIB)
+dock: iconos de programas                    8 programas · 0.54 MB
+dock: ventanas abiertas                      9
+caché de glifos (hilo UI)                    234 glifos · 0.02 MB
+memoria al terminar                          working set 83.42 MB · privada 35.63 MB · heap Rust 9.76 MB
+

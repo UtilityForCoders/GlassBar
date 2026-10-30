@@ -8,7 +8,7 @@
 //! icono, se lo guarda y reenvía el mensaje a Explorer, cuya bandeja sigue igual.
 use tiny_skia::Pixmap;
 use windows::core::w;
-use windows::Win32::Foundation::{HWND, LPARAM, LRESULT, POINT, WPARAM};
+use windows::Win32::Foundation::{HWND, LPARAM, LRESULT, POINT, RECT, WPARAM};
 use windows::Win32::UI::WindowsAndMessaging::*;
 
 /// Mensajes de `Shell_NotifyIcon` (NIM_*).
@@ -95,6 +95,16 @@ pub fn parse(bytes: &[u8]) -> Option<(u32, Notify)> {
     ))
 }
 
+/// Identidad de un icono: su GUID o, sin él, la ventana dueña y su número. El panel
+/// la guarda con cada icono para que un clic llegue a ese y no al que ocupe ahora
+/// su posición.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub struct Key {
+    owner: u32,
+    id: u32,
+    guid: Option<u128>,
+}
+
 /// Un icono guardado.
 pub struct Icon {
     pub owner: u32,
@@ -117,6 +127,13 @@ impl Icon {
     fn window(&self) -> HWND {
         // Los identificadores de ventana de 32 bits se extienden con signo.
         HWND(self.owner as i32 as isize as *mut _)
+    }
+    fn key(&self) -> Key {
+        Key {
+            owner: self.owner,
+            id: self.id,
+            guid: self.guid,
+        }
     }
 }
 
@@ -166,6 +183,12 @@ pub fn apply(
                 }
             };
             let icon = &mut icons[index];
+            // Un registro nuevo empieza en la versión 0 aunque el icono ya se conociera
+            // (p. ej. por un NIM_MODIFY previo, al que se le supuso la 4): si es de la 4,
+            // el programa la vuelve a fijar con NIM_SETVERSION justo después.
+            if message == NIM_ADD {
+                icon.version = 0;
+            }
             if notify.flags & NIF_MESSAGE != 0 {
                 icon.callback = notify.callback;
             }
@@ -227,10 +250,23 @@ pub fn callback_params(version: u32, id: u32, event: u32, at: POINT) -> (usize, 
 // La ventana `Shell_TrayWnd` propia.
 // ---------------------------------------------------------------------------
 
+/// El registro de la bandeja solo se escribe si se pide con la variable de entorno
+/// `GLASSBAR_TRAY_LOG=1`: guarda los nombres de los iconos, que pueden llevar datos
+/// personales (p. ej. de quién son los mensajes), y no conviene escribir en disco
+/// con cada cambio de un icono.
+fn logging() -> bool {
+    static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *ON.get_or_init(|| std::env::var_os("GLASSBAR_TRAY_LOG").is_some_and(|v| v != "0"))
+}
+
 /// Registro de lo que pasa en la bandeja propia (`%TEMP%\glassbar-tray.log`), para
 /// saber qué manda cada programa y qué clics recibe. Se empieza de cero al abrir.
-fn log(line: impl AsRef<str>) {
+/// La línea solo se construye si el registro está activado.
+fn log(line: impl FnOnce() -> String) {
     use std::io::Write;
+    if !logging() {
+        return;
+    }
     let path = std::env::temp_dir().join("glassbar-tray.log");
     // Sin crecer sin límite si GlassBar pasa días abierto.
     if std::fs::metadata(&path).is_ok_and(|m| m.len() > 2_000_000) {
@@ -241,7 +277,7 @@ fn log(line: impl AsRef<str>) {
         .append(true)
         .open(path)
     {
-        let _ = writeln!(file, "{}", line.as_ref());
+        let _ = writeln!(file, "{}", line());
     }
 }
 
@@ -255,20 +291,36 @@ fn process_name(window: HWND) -> String {
         .unwrap_or_else(|| format!("pid {pid}"))
 }
 
+/// Iconos recibidos. Los escribe el hilo de la bandeja y los lee el del dock.
+static ICONS: std::sync::Mutex<Vec<Icon>> = std::sync::Mutex::new(Vec::new());
+/// Ventana a la que se avisa cuando cambian los iconos, y con qué mensaje.
+static NOTIFY_WINDOW: std::sync::atomic::AtomicIsize = std::sync::atomic::AtomicIsize::new(0);
+static NOTIFY_MESSAGE: std::sync::atomic::AtomicU32 = std::sync::atomic::AtomicU32::new(0);
+
+fn icons() -> std::sync::MutexGuard<'static, Vec<Icon>> {
+    ICONS.lock().unwrap_or_else(|e| e.into_inner())
+}
+
 thread_local! {
     /// Reenvíos a Explorer en curso. Mientras se espera su respuesta llegan los de
     /// otros programas, que también se reenvían; solo un anidamiento muy profundo
     /// sería un bucle (Explorer llamando a la bandeja propia una y otra vez).
     static FORWARDING: std::cell::Cell<u32> = const { std::cell::Cell::new(0) };
-    static ICONS: std::cell::RefCell<Vec<Icon>> = const { std::cell::RefCell::new(Vec::new()) };
-    /// Ventana a la que se avisa cuando cambian los iconos, y con qué mensaje.
-    static NOTIFY: std::cell::Cell<(isize, u32)> = const { std::cell::Cell::new((0, 0)) };
 }
 
+/// Tiempo mínimo entre dos peticiones de iconos a todos los programas cuando la
+/// bandeja de Explorer se pone delante: cada petición llega a todas las ventanas
+/// del sistema y algunos programas borran y vuelven a crear su icono.
+const ANNOUNCE_EVERY: std::time::Duration = std::time::Duration::from_secs(60);
+
 /// La bandeja propia mientras existe; al soltarla, los programas vuelven a hablar
-/// solo con Explorer.
+/// solo con Explorer. Vive en un hilo propio: los programas esperan su respuesta al
+/// registrar un icono, y ella espera a Explorer al reenviarle los demás mensajes,
+/// sin que nada de eso frene el dock.
 pub struct Host {
     hwnd: HWND,
+    thread: u32,
+    handle: Option<std::thread::JoinHandle<()>>,
     /// Cuándo se pidieron los iconos a los programas por última vez.
     announced: std::cell::Cell<std::time::Instant>,
 }
@@ -278,56 +330,81 @@ impl Host {
     /// Avisa a `notify` con `message` cada vez que cambian. `None` si no se pudo
     /// poner delante de la de Explorer.
     pub fn install(notify: HWND, message: u32) -> Option<Self> {
-        use windows::Win32::System::LibraryLoader::GetModuleHandleW;
-        NOTIFY.with(|n| n.set((notify.0 as isize, message)));
-        let _ = std::fs::remove_file(std::env::temp_dir().join("glassbar-tray.log"));
-        unsafe {
-            let instance = GetModuleHandleW(None).ok()?;
-            let class = WNDCLASSEXW {
-                cbSize: std::mem::size_of::<WNDCLASSEXW>() as u32,
-                lpfnWndProc: Some(host_wndproc),
-                hInstance: instance.into(),
-                lpszClassName: w!("Shell_TrayWnd"),
-                ..Default::default()
-            };
-            if RegisterClassExW(&class) == 0 {
-                return None;
-            }
-            let hwnd = CreateWindowExW(
-                WS_EX_TOOLWINDOW | WS_EX_TOPMOST,
-                w!("Shell_TrayWnd"),
-                None,
-                WS_POPUP,
-                0,
-                0,
-                0,
-                0,
-                None,
-                None,
-                Some(instance.into()),
-                None,
-            )
-            .ok()?;
-            let host = Self {
-                hwnd,
-                announced: std::cell::Cell::new(std::time::Instant::now()),
-            };
-            host.keep_in_front();
-            if FindWindowW(w!("Shell_TrayWnd"), None).ok() != Some(hwnd) {
-                log("No se pudo poner la bandeja propia delante de la de Explorer");
-                return None;
-            }
-            log("Bandeja propia lista; se pide a los programas sus iconos");
-            announce();
-            Some(host)
+        use std::sync::atomic::Ordering;
+        NOTIFY_WINDOW.store(notify.0 as isize, Ordering::Relaxed);
+        NOTIFY_MESSAGE.store(message, Ordering::Relaxed);
+        if logging() {
+            let _ = std::fs::remove_file(std::env::temp_dir().join("glassbar-tray.log"));
         }
+        let (ready, created) = std::sync::mpsc::channel();
+        let handle = std::thread::spawn(move || unsafe {
+            let hwnd = create_window();
+            let thread = windows::Win32::System::Threading::GetCurrentThreadId();
+            let _ = ready.send(hwnd.map(|h| (h.0 as isize, thread)));
+            let Some(hwnd) = hwnd else {
+                return;
+            };
+            let mut msg = MSG::default();
+            while GetMessageW(&mut msg, None, 0, 0).as_bool() {
+                DispatchMessageW(&msg);
+            }
+            let _ = DestroyWindow(hwnd);
+            if let Ok(instance) = windows::Win32::System::LibraryLoader::GetModuleHandleW(None) {
+                let _ = UnregisterClassW(w!("Shell_TrayWnd"), Some(instance.into()));
+            }
+        });
+        let Some((hwnd, thread)) = created.recv().ok().flatten() else {
+            let _ = handle.join();
+            return None;
+        };
+        let host = Self {
+            hwnd: HWND(hwnd as *mut _),
+            thread,
+            handle: Some(handle),
+            announced: std::cell::Cell::new(std::time::Instant::now()),
+        };
+        // Al arrancar, Explorer reordena su barra mientras GlassBar la oculta y puede
+        // quedar delante justo después: se reintenta medio segundo antes de rendirse.
+        let in_front = (0..20).any(|attempt| {
+            if attempt > 0 {
+                std::thread::sleep(std::time::Duration::from_millis(25));
+            }
+            host.keep_in_front();
+            unsafe { FindWindowW(w!("Shell_TrayWnd"), None) }.ok() == Some(host.hwnd)
+        });
+        if !in_front {
+            log(|| "No se pudo poner la bandeja propia delante de la de Explorer".into());
+            return None;
+        }
+        log(|| "Bandeja propia lista; se pide a los programas sus iconos".into());
+        announce();
+        Some(host)
     }
 
-    /// Vuelve a ponerse delante si Explorer pasó la suya por encima.
-    /// Mientras la de Explorer estuvo delante, los programas le mandaron a ella sus
-    /// iconos: se le vuelven a pedir (como mucho cada 5 s, por si Explorer insiste).
+    /// Mantiene la bandeja propia como la de Explorer: con su mismo tamaño y
+    /// posición (hay programas que miran la de `FindWindow("Shell_TrayWnd")` para
+    /// colocar sus ventanas) y delante, para seguir recibiendo los iconos. Si
+    /// Explorer pasó la suya por encima, los programas le mandaron a ella sus
+    /// iconos: se les vuelven a pedir, como mucho una vez por minuto.
     pub fn keep_in_front(&self) {
         unsafe {
+            if let Some(explorer) = crate::shell::explorer_tray() {
+                let (mut theirs, mut ours) = (RECT::default(), RECT::default());
+                if GetWindowRect(explorer, &mut theirs).is_ok()
+                    && GetWindowRect(self.hwnd, &mut ours).is_ok()
+                    && theirs != ours
+                {
+                    let _ = SetWindowPos(
+                        self.hwnd,
+                        None,
+                        theirs.left,
+                        theirs.top,
+                        theirs.right - theirs.left,
+                        theirs.bottom - theirs.top,
+                        SWP_NOACTIVATE | SWP_NOZORDER,
+                    );
+                }
+            }
             if FindWindowW(w!("Shell_TrayWnd"), None).ok() == Some(self.hwnd) {
                 return;
             }
@@ -341,8 +418,10 @@ impl Host {
                 SWP_NOACTIVATE | SWP_NOMOVE | SWP_NOSIZE,
             );
         }
-        if self.announced.get().elapsed() >= std::time::Duration::from_secs(5) {
-            log("La bandeja de Explorer se puso delante: se vuelve a poner la propia y se piden los iconos");
+        if self.announced.get().elapsed() >= ANNOUNCE_EVERY {
+            log(|| {
+                "La bandeja de Explorer se puso delante: se vuelve a poner la propia y se piden los iconos".into()
+            });
             self.announce_again();
         }
     }
@@ -350,24 +429,53 @@ impl Host {
     /// Vuelve a pedir a los programas que registren sus iconos.
     pub fn announce_again(&self) {
         self.announced.set(std::time::Instant::now());
-        log("Se vuelven a pedir los iconos a los programas");
+        log(|| "Se vuelven a pedir los iconos a los programas".into());
         announce();
     }
 }
 
 impl Drop for Host {
     fn drop(&mut self) {
-        use windows::Win32::System::LibraryLoader::GetModuleHandleW;
         unsafe {
-            let _ = DestroyWindow(self.hwnd);
-            if let Ok(instance) = GetModuleHandleW(None) {
-                let _ = UnregisterClassW(w!("Shell_TrayWnd"), Some(instance.into()));
-            }
-            // Que vuelvan a registrarlos con Explorer, por si alguno no le llegó.
-            announce();
+            let _ = PostThreadMessageW(self.thread, WM_QUIT, WPARAM(0), LPARAM(0));
         }
-        ICONS.with(|icons| icons.borrow_mut().clear());
+        if let Some(handle) = self.handle.take() {
+            let _ = handle.join();
+        }
+        // Que vuelvan a registrarlos con Explorer, por si alguno no le llegó.
+        announce();
+        icons().clear();
     }
+}
+
+/// La ventana `Shell_TrayWnd` propia, en el hilo que la atiende.
+unsafe fn create_window() -> Option<HWND> {
+    let instance = windows::Win32::System::LibraryLoader::GetModuleHandleW(None).ok()?;
+    let class = WNDCLASSEXW {
+        cbSize: std::mem::size_of::<WNDCLASSEXW>() as u32,
+        lpfnWndProc: Some(host_wndproc),
+        hInstance: instance.into(),
+        lpszClassName: w!("Shell_TrayWnd"),
+        ..Default::default()
+    };
+    if RegisterClassExW(&class) == 0 {
+        return None;
+    }
+    CreateWindowExW(
+        WS_EX_TOOLWINDOW | WS_EX_TOPMOST,
+        w!("Shell_TrayWnd"),
+        None,
+        WS_POPUP,
+        0,
+        0,
+        0,
+        0,
+        None,
+        None,
+        Some(instance.into()),
+        None,
+    )
+    .ok()
 }
 
 /// Avisa a todos los programas de que la barra se creó: vuelven a registrar sus
@@ -405,9 +513,7 @@ unsafe extern "system" fn host_wndproc(
     let forward = || {
         let mut result = 0usize;
         if FORWARDING.with(|f| f.get()) >= 8 {
-            log(format!(
-                "Mensaje 0x{msg:X}: demasiados reenvíos anidados, no se reenvía"
-            ));
+            log(|| format!("Mensaje 0x{msg:X}: demasiados reenvíos anidados, no se reenvía"));
             return LRESULT(0);
         }
         FORWARDING.with(|f| f.set(f.get() + 1));
@@ -431,22 +537,27 @@ unsafe extern "system" fn host_wndproc(
         if data.dwData == 1 && !data.lpData.is_null() {
             let bytes = std::slice::from_raw_parts(data.lpData as *const u8, data.cbData as usize);
             if let Some((message, notify)) = parse(bytes) {
-                log(format!(
-                    "NIM {message} de {} (ventana 0x{:X}, id {}): flags 0x{:X}, mensaje 0x{:X}, versión {}, nombre {:?}",
-                    process_name(HWND(notify.owner as i32 as isize as *mut _)),
-                    notify.owner,
-                    notify.id,
-                    notify.flags,
-                    notify.callback,
-                    notify.version,
-                    notify.tip,
-                ));
-                let changed =
-                    ICONS.with(|icons| apply(&mut icons.borrow_mut(), message, &notify, image_of));
-                if changed {
-                    let (target, message) = NOTIFY.with(|n| n.get());
-                    let _ =
-                        PostMessageW(Some(HWND(target as *mut _)), message, WPARAM(0), LPARAM(0));
+                log(|| {
+                    format!(
+                        "NIM {message} de {} (ventana 0x{:X}, id {}): flags 0x{:X}, mensaje 0x{:X}, versión {}, nombre {:?}",
+                        process_name(HWND(notify.owner as i32 as isize as *mut _)),
+                        notify.owner,
+                        notify.id,
+                        notify.flags,
+                        notify.callback,
+                        notify.version,
+                        notify.tip,
+                    )
+                });
+                if apply(&mut icons(), message, &notify, image_of) {
+                    use std::sync::atomic::Ordering;
+                    let target = NOTIFY_WINDOW.load(Ordering::Relaxed);
+                    let _ = PostMessageW(
+                        Some(HWND(target as *mut _)),
+                        NOTIFY_MESSAGE.load(Ordering::Relaxed),
+                        WPARAM(0),
+                        LPARAM(0),
+                    );
                 }
             }
             // A Explorer se le pasa desde otro hilo y sin esperar: si se le esperase
@@ -512,8 +623,9 @@ fn visible(icon: &Icon) -> bool {
         && (icon.callback != 0 || !process_name(icon.window()).eq_ignore_ascii_case("explorer.exe"))
 }
 
-/// Icono que se muestra en el panel: su imagen y su nombre.
+/// Icono que se muestra en el panel: quién es, su imagen y su nombre.
 pub struct Shown {
+    pub key: Key,
     pub image: Option<Pixmap>,
     pub tip: String,
 }
@@ -521,40 +633,41 @@ pub struct Shown {
 /// Iconos visibles, en el orden en que se registraron. Quita los de programas que
 /// ya terminaron sin borrarlos.
 pub fn shown() -> Vec<Shown> {
-    ICONS.with(|icons| {
-        let mut icons = icons.borrow_mut();
-        icons.retain(|i| unsafe { IsWindow(Some(i.window())).as_bool() });
-        icons
-            .iter()
-            .filter(|i| visible(i))
-            .map(|i| Shown {
-                image: i.image.clone(),
-                tip: i.tip.clone(),
-            })
-            .collect()
-    })
+    let mut icons = icons();
+    icons.retain(|i| unsafe { IsWindow(Some(i.window())).as_bool() });
+    icons
+        .iter()
+        .filter(|i| visible(i))
+        .map(|i| Shown {
+            key: i.key(),
+            image: i.image.clone(),
+            tip: i.tip.clone(),
+        })
+        .collect()
 }
 
-/// Pulsa el icono `index` de los visibles, como en la bandeja de Windows: el
-/// programa recibe el clic y puede abrir su ventana o su menú. `at` es el punto de
-/// la pantalla donde se pulsó.
-pub fn click(index: usize, click: Click, at: POINT) {
-    let target = ICONS.with(|icons| {
-        icons
-            .borrow()
-            .iter()
-            .filter(|i| visible(i))
-            .nth(index)
-            .map(|i| (i.window(), i.callback, i.version, i.id))
-    });
-    let Some((window, callback, version, id)) = target else {
+/// Ventana, mensaje de aviso, versión y número del icono `key`, si sigue registrado.
+fn target(key: Key) -> Option<(HWND, u32, u32, u32)> {
+    icons()
+        .iter()
+        .find(|i| i.key() == key)
+        .map(|i| (i.window(), i.callback, i.version, i.id))
+}
+
+/// Pulsa el icono `key`, como en la bandeja de Windows: el programa recibe el clic
+/// y puede abrir su ventana o su menú. `at` es el punto de la pantalla donde se
+/// pulsó.
+pub fn click(key: Key, click: Click, at: POINT) {
+    let Some((window, callback, version, id)) = target(key) else {
         return;
     };
-    let name = process_name(window);
     if callback == 0 {
-        log(format!(
-            "Clic {click:?} en {name}: no dio mensaje de aviso (NIF_MESSAGE), no se puede avisar"
-        ));
+        log(|| {
+            format!(
+                "Clic {click:?} en {}: no dio mensaje de aviso (NIF_MESSAGE), no se puede avisar",
+                process_name(window)
+            )
+        });
         return;
     }
     unsafe {
@@ -575,28 +688,23 @@ pub fn click(index: usize, click: Click, at: POINT) {
                 if result.is_ok() { "ok" } else { "error" }
             ));
         }
-        log(format!(
-            "Clic {click:?} en {name} (ventana 0x{:X}, id {id}, versión {version}, mensaje 0x{callback:X}): primer plano {}, puesta delante {}, enviados {}",
-            window.0 as usize,
-            if allowed.is_ok() { "permitido" } else { "no permitido" },
-            if focused { "sí" } else { "no" },
-            sent.join(" "),
-        ));
+        log(|| {
+            format!(
+                "Clic {click:?} en {} (ventana 0x{:X}, id {id}, versión {version}, mensaje 0x{callback:X}): primer plano {}, puesta delante {}, enviados {}",
+                process_name(window),
+                window.0 as usize,
+                if allowed.is_ok() { "permitido" } else { "no permitido" },
+                if focused { "sí" } else { "no" },
+                sent.join(" "),
+            )
+        });
     }
 }
 
 /// Avisa al programa de que el cursor pasa por su icono (algunos ponen al día su
 /// nombre entonces).
-pub fn hover(index: usize, at: POINT) {
-    let target = ICONS.with(|icons| {
-        icons
-            .borrow()
-            .iter()
-            .filter(|i| visible(i))
-            .nth(index)
-            .map(|i| (i.window(), i.callback, i.version, i.id))
-    });
-    if let Some((window, callback, version, id)) = target.filter(|t| t.1 != 0) {
+pub fn hover(key: Key, at: POINT) {
+    if let Some((window, callback, version, id)) = target(key).filter(|t| t.1 != 0) {
         let (w, l) = callback_params(version, id, WM_MOUSEMOVE, at);
         unsafe {
             let _ = PostMessageW(Some(window), callback, WPARAM(w), LPARAM(l));
@@ -690,6 +798,38 @@ mod tests {
         assert!(apply(&mut icons, NIM_DELETE, &gone, image));
         assert_eq!(icons.len(), 1);
         assert!(!apply(&mut icons, NIM_DELETE, &gone, image));
+    }
+
+    #[test]
+    fn a_new_registration_starts_again_at_version_zero() {
+        let mut icons = Vec::new();
+        let image = |_| None;
+        // Cambio de un icono registrado antes de abrir GlassBar: se le supone la 4.
+        let (_, early) = parse(&message(NIM_MODIFY, 1, 1, NIF_TIP, "Antiguo", 0)).unwrap();
+        apply(&mut icons, NIM_MODIFY, &early, image);
+        assert_eq!(icons[0].version, 4);
+        // Al volver a registrarse sin NIM_SETVERSION es de la 0, y el clic derecho le
+        // llega en el formato antiguo (WM_RBUTTONUP), con el que abre su menú.
+        let (_, again) = parse(&message(NIM_ADD, 1, 1, NIF_MESSAGE, "Antiguo", 0)).unwrap();
+        apply(&mut icons, NIM_ADD, &again, image);
+        assert_eq!(icons.len(), 1);
+        assert_eq!(icons[0].version, 0);
+        assert_eq!(
+            click_messages(Click::Right, icons[0].version),
+            [WM_RBUTTONDOWN, WM_RBUTTONUP]
+        );
+        // Si es de la 4, lo dice justo después.
+        let (_, version) = parse(&message(NIM_SETVERSION, 1, 1, 0, "", 0)).unwrap();
+        apply(&mut icons, NIM_SETVERSION, &version, image);
+        assert_eq!(icons[0].version, 4);
+        assert_eq!(
+            icons[0].key(),
+            Key {
+                owner: 1,
+                id: 1,
+                guid: None
+            }
+        );
     }
 
     #[test]

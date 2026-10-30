@@ -1513,8 +1513,6 @@ impl App {
         }
     }
 
-    /// Abre o cierra el panel de idioma sobre el indicador. El teclado elegido se
-    /// aplica a la ventana que estaba activa al abrirlo.
     /// Abre o cierra el panel de las apps en segundo plano sobre la flecha.
     fn toggle_tray_panel(&mut self) {
         if let Some(panel) = self.tray_panel.as_mut().filter(|p| p.visible) {
@@ -1544,6 +1542,8 @@ impl App {
         self.expand();
     }
 
+    /// Abre o cierra el panel de idioma sobre el indicador. El teclado elegido se
+    /// aplica a la ventana que estaba activa al abrirlo.
     fn toggle_language(&mut self) {
         if let Some(panel) = self.language.as_mut().filter(|p| p.visible) {
             panel.hide();
@@ -1869,8 +1869,7 @@ unsafe extern "system" fn wndproc(hwnd: HWND, msg: u32, wparam: WPARAM, lparam: 
                 let tray_menu = app.tray_panel.as_ref().is_some_and(|p| p.menu.is_some())
                     || app
                         .tray_clicked
-                        .is_some_and(|at| at.elapsed() < Duration::from_millis(1500))
-                    || menu_open();
+                        .is_some_and(|at| at.elapsed() < Duration::from_millis(1500));
                 app.check_priority(!tray_menu);
                 app.update_keyboard();
             });
@@ -2246,9 +2245,10 @@ unsafe extern "system" fn wndproc(hwnd: HWND, msg: u32, wparam: WPARAM, lparam: 
                             // El panel de iconos ocultos abierto sobre la flecha; se mira
                             // al final porque recorre las ventanas, y solo con el dock fuera.
                             || (app.visibility.expanded && shell::overflow_window().is_some())
-                            // Un menú abierto (p. ej. el de un icono de la bandeja) o un
-                            // icono recién pulsado, que puede tardar en abrir el suyo.
-                            || (app.visibility.expanded && menu_open())
+                            // El menú de un icono de la bandeja abierto, o un icono recién
+                            // pulsado, que puede tardar en abrir el suyo. Los menús de
+                            // otros programas no cuentan.
+                            || app.tray_panel.as_ref().is_some_and(|p| p.menu.is_some())
                             || app
                                 .tray_clicked
                                 .is_some_and(|at| at.elapsed() < Duration::from_millis(1500)),
@@ -2556,6 +2556,10 @@ struct TrayWindow {
     /// Clic derecho en un icono: cuándo, y si ya se vio su menú abierto. Mientras
     /// tanto el panel sigue abierto aunque el menú se lleve el foco.
     menu: Option<(Instant, bool)>,
+    /// Tras un clic izquierdo el panel espera el tiempo de doble clic de Windows
+    /// antes de cerrarse: si llega el segundo clic, se le manda al programa como
+    /// doble clic (algunos solo abren su ventana así).
+    close_after: Option<Instant>,
 }
 impl TrayWindow {
     fn new(owner: HWND) -> Result<Self> {
@@ -2585,6 +2589,7 @@ impl TrayWindow {
             transition: launcher::Transition::hidden(),
             anchor: (0, 0, (0, 0)),
             menu: None,
+            close_after: None,
         })
     }
     fn show(&mut self, anchor_x: i32, dock_top: i32, bounds: (i32, i32)) {
@@ -2602,6 +2607,7 @@ impl TrayWindow {
         self.model.icons = systray::shown()
             .into_iter()
             .map(|icon| traypanel::TrayIcon {
+                key: icon.key,
                 image: icon.image,
                 tip: icon.tip,
             })
@@ -2665,14 +2671,21 @@ impl TrayWindow {
         }
         self.visible = false;
         self.menu = None;
+        self.close_after = None;
         self.model.hovered = None;
         self.transition.close(Instant::now());
         self.present();
     }
-    /// Sigue el menú abierto con clic derecho (cada 40 ms). Al cerrarse: si el
-    /// programa abrió una ventana o se pulsó fuera, el panel se cierra; si no
-    /// (Escape, o de vuelta al panel), recupera el foco para cerrarse como siempre.
+    /// Se mira cada 40 ms con el panel abierto. Cierra el panel cuando pasó el
+    /// tiempo de doble clic tras un clic izquierdo, y sigue el menú abierto con clic
+    /// derecho: al cerrarse, si el programa abrió una ventana o se pulsó fuera, el
+    /// panel se cierra; si no (Escape, o de vuelta al panel), recupera el foco para
+    /// cerrarse como siempre.
     fn watch_menu(&mut self) {
+        if self.close_after.is_some_and(|at| Instant::now() >= at) {
+            self.hide();
+            return;
+        }
         let Some((since, seen)) = self.menu else {
             return;
         };
@@ -2741,14 +2754,22 @@ unsafe extern "system" fn tray_wndproc(
                     tip.hide();
                 }
                 app.tray_clicked = Some(Instant::now());
-                // Con clic derecho sigue abierto mientras está el menú del icono; con
-                // los demás se cierra, porque el programa suele abrir su ventana.
-                if click == systray::Click::Right {
-                    panel.menu = Some((Instant::now(), false));
-                } else {
-                    panel.hide();
+                let key = panel.model.icons[index].key;
+                match click {
+                    // Sigue abierto mientras está el menú del icono.
+                    systray::Click::Right => panel.menu = Some((Instant::now(), false)),
+                    // Espera un posible segundo clic; si el programa abre su ventana,
+                    // el panel pierde el foco y se cierra antes.
+                    systray::Click::Left => {
+                        let double = unsafe {
+                            windows::Win32::UI::Input::KeyboardAndMouse::GetDoubleClickTime()
+                        };
+                        panel.close_after =
+                            Some(Instant::now() + Duration::from_millis(double as u64));
+                    }
+                    systray::Click::Double => panel.hide(),
                 }
-                systray::click(index, click, cursor());
+                systray::click(key, click, cursor());
             }
         });
     };
@@ -2798,7 +2819,7 @@ unsafe extern "system" fn tray_wndproc(
                     )
                 });
                 if let Some(index) = hit {
-                    systray::hover(index, cursor());
+                    systray::hover(panel.model.icons[index].key, cursor());
                 }
                 let (left, right) = (app.screen_left, app.screen_right);
                 if let Some(tip) = &mut app.tooltip {
