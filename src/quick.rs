@@ -959,10 +959,11 @@ impl QuickState {
     }
 
     fn draw_device(&self, image: &mut Pixmap, index: usize, device: &Device, top: f32, scale: f32) {
-        // Auriculares, teclado, teléfono o el símbolo de Bluetooth.
+        // Auriculares, teclado, ratón, teléfono o el símbolo de Bluetooth.
         let glyph = match device.kind {
             Kind::Audio => '\u{E7F6}',
-            Kind::Input => '\u{E765}',
+            Kind::Keyboard => '\u{E765}',
+            Kind::Mouse => '\u{E962}',
             Kind::Phone => '\u{E8EA}',
             Kind::Other => '\u{E702}',
         };
@@ -1350,7 +1351,7 @@ mod tests {
             Device {
                 name: "Teclado".into(),
                 address: 0xCCDD,
-                kind: Kind::Input,
+                kind: Kind::Keyboard,
                 connected: false,
                 audio: false,
             },
