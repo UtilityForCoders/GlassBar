@@ -143,6 +143,12 @@ pub struct LauncherState {
     search_offset: f32,
     user: String,
     icons: HashMap<String, Option<Pixmap>>,
+    /// Con ventana, los iconos que faltan se cargan en otro hilo (ver `IconLoader`);
+    /// `requested` son los ya pedidos.
+    loader: Option<IconLoader>,
+    requested: std::collections::HashSet<String>,
+    /// Capa de la zona desplazable, reutilizada entre fotogramas.
+    view_layer: Option<Pixmap>,
     loaded: Instant,
     /// Última búsqueda y sus resultados: la vista se recalcula en cada movimiento del ratón.
     search_cache: RefCell<Option<(String, Vec<usize>)>>,
@@ -163,6 +169,9 @@ impl LauncherState {
             search_offset: 0.0,
             user: user_display_name(),
             icons: HashMap::new(),
+            loader: None,
+            requested: Default::default(),
+            view_layer: None,
             loaded: Instant::now(),
             search_cache: RefCell::new(None),
         };
@@ -189,6 +198,22 @@ impl LauncherState {
         self.query.clear();
         self.power_menu = false;
         self.reset_results();
+    }
+    /// Desde ahora los iconos que falten se cargan en segundo plano.
+    pub fn load_icons_with(&mut self, loader: IconLoader) {
+        self.loader = Some(loader);
+    }
+    /// Guarda los iconos que ya llegaron del hilo de carga.
+    fn take_loaded_icons(&mut self) {
+        if let Some(loader) = &self.loader {
+            loader
+                .notified
+                .store(false, std::sync::atomic::Ordering::Relaxed);
+            for (command, icon) in loader.loaded.try_iter() {
+                self.requested.remove(&command);
+                self.icons.insert(command, icon);
+            }
+        }
     }
     /// Carga de antemano los iconos de la vista inicial (anclados, recientes y más
     /// usadas), que es lo que más tarda la primera vez que se abre el lanzador.
@@ -530,6 +555,7 @@ impl LauncherState {
     }
 
     pub fn draw(&mut self, image: &mut Pixmap, scale: f32) {
+        self.take_loaded_icons();
         image.fill(tiny_skia::Color::TRANSPARENT);
         fill_rounded(
             image,
@@ -669,8 +695,19 @@ impl LauncherState {
     fn draw_view(&mut self, image: &mut Pixmap, scale: f32) {
         let width = (WIDTH * scale).round() as u32;
         let height = (VIEW_H * scale).round() as u32;
-        let Some(mut view) = Pixmap::new(width.max(1), height.max(1)) else {
-            return;
+        let reused = self
+            .view_layer
+            .take()
+            .filter(|v| v.width() == width.max(1) && v.height() == height.max(1));
+        let mut view = match reused {
+            Some(mut view) => {
+                view.fill(tiny_skia::Color::TRANSPARENT);
+                view
+            }
+            None => match Pixmap::new(width.max(1), height.max(1)) {
+                Some(view) => view,
+                None => return,
+            },
         };
         let layout = self.layout();
         let scroll = self.scroll;
@@ -792,6 +829,7 @@ impl LauncherState {
             Transform::identity(),
             None,
         );
+        self.view_layer = Some(view);
     }
 
     fn draw_footer(&self, image: &mut Pixmap, scale: f32) {
@@ -993,6 +1031,16 @@ impl LauncherState {
 
     fn icon(&mut self, image: &mut Pixmap, entry: &AppEntry, x: f32, y: f32, scale: f32) {
         let size = (ICON * scale).round().max(1.0) as u32;
+        if !self.icons.contains_key(&entry.command) {
+            // Cargar un icono tarda decenas de ms: con hilo de carga se pide y se
+            // dibuja cuando llegue, sin detener el panel.
+            if let Some(loader) = &self.loader {
+                if self.requested.insert(entry.command.clone()) {
+                    let _ = loader.requests.send(entry.command.clone());
+                }
+                return;
+            }
+        }
         let icon = self
             .icons
             .entry(entry.command.clone())
@@ -1017,6 +1065,57 @@ impl LauncherState {
                 transform,
                 None,
             );
+        }
+    }
+}
+
+/// Hilo que carga los iconos del lanzador. Al terminar cada uno avisa a la ventana
+/// con `message`, una sola vez hasta que el lanzador recoja los que llegaron.
+pub struct IconLoader {
+    requests: std::sync::mpsc::Sender<String>,
+    loaded: std::sync::mpsc::Receiver<(String, Option<Pixmap>)>,
+    notified: std::sync::Arc<std::sync::atomic::AtomicBool>,
+}
+
+impl IconLoader {
+    /// Los iconos se guardan ya reducidos al tamaño en que se dibujan a `scale`.
+    pub fn start(scale: f32, window: isize, message: u32) -> Self {
+        use std::sync::atomic::Ordering::Relaxed;
+        use windows::Win32::Foundation::{HWND, LPARAM, WPARAM};
+        use windows::Win32::UI::WindowsAndMessaging::PostMessageW;
+        let side = (ICON * scale).round().max(1.0) as u32;
+        let (requests, queue) = std::sync::mpsc::channel::<String>();
+        let (done, loaded) = std::sync::mpsc::channel();
+        let notified = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
+        let flag = notified.clone();
+        std::thread::spawn(move || {
+            for command in queue {
+                let icon = crate::icons::load(&command).map(|icon| {
+                    if icon.width() > side {
+                        crate::apps::downscale(&icon, side)
+                    } else {
+                        icon
+                    }
+                });
+                if done.send((command, icon)).is_err() {
+                    return;
+                }
+                if !flag.swap(true, Relaxed) {
+                    unsafe {
+                        let _ = PostMessageW(
+                            Some(HWND(window as *mut _)),
+                            message,
+                            WPARAM(0),
+                            LPARAM(0),
+                        );
+                    }
+                }
+            }
+        });
+        Self {
+            requests,
+            loaded,
+            notified,
         }
     }
 }
@@ -1255,6 +1354,9 @@ mod tests {
             search_offset: 0.0,
             user: "Usuario de prueba".into(),
             icons: HashMap::new(),
+            loader: None,
+            requested: Default::default(),
+            view_layer: None,
             loaded: Instant::now(),
             search_cache: RefCell::new(None),
         }

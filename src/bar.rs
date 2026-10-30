@@ -250,6 +250,10 @@ impl BarState {
         }
         moving
     }
+    /// El reloj muestra un minuto que ya pasó.
+    pub fn clock_outdated(&self) -> bool {
+        self.clock.outdated()
+    }
     pub fn update_hover(&mut self, target: Option<HoverTarget>) {
         self.hovered = target;
         self.launcher_hover

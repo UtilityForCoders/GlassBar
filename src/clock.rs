@@ -1,5 +1,5 @@
 //! Hora y fecha con Segoe UI del sistema y antialias en escala de grises.
-use fontdue::{Font, FontSettings};
+use crate::font::Font;
 use std::{cell::RefCell, sync::OnceLock};
 use tiny_skia::{Pixmap, PixmapPaint, Transform};
 use windows::Win32::System::SystemInformation::GetLocalTime;
@@ -7,7 +7,7 @@ use windows::Win32::System::SystemInformation::GetLocalTime;
 fn font_file(name: &str) -> Option<Font> {
     let windows = std::env::var_os("WINDIR").unwrap_or_else(|| "C:\\Windows".into());
     let path = std::path::PathBuf::from(windows).join("Fonts").join(name);
-    Font::from_bytes(std::fs::read(path).ok()?, FontSettings::default()).ok()
+    Font::from_bytes(std::fs::read(path).ok()?)
 }
 
 fn system_font() -> &'static Font {
@@ -88,6 +88,12 @@ impl ClockRenderer {
             cached: RefCell::new(None),
         }
     }
+    /// Si la hora mostrada ya no es la actual (cambió el minuto) y hay que redibujar.
+    pub fn outdated(&self) -> bool {
+        let now = unsafe { GetLocalTime() };
+        let time = format!("{:02}:{:02}", now.wHour, now.wMinute);
+        self.cached.borrow().as_ref().is_none_or(|c| c.time != time)
+    }
     pub fn draw(&self, target: &mut Pixmap, cx: f32, cy: f32, scale: f32) {
         let now = unsafe { GetLocalTime() };
         let time = format!("{:02}:{:02}", now.wHour, now.wMinute);
@@ -162,7 +168,7 @@ fn rasterize(text: &str, size: f32) -> Pixmap {
     rasterize_with(system_font(), text, size)
 }
 
-type Glyph = std::rc::Rc<(fontdue::Metrics, Vec<u8>)>;
+type Glyph = std::rc::Rc<(crate::font::Metrics, Vec<u8>)>;
 
 /// Rasterizar un glifo es lo más caro de pintar texto; el lanzador redibuja
 /// decenas de nombres en cada cambio, así que cada glifo se rasteriza una vez.
@@ -289,22 +295,20 @@ pub fn text_width(text: &str, size: f32) -> f32 {
 }
 pub fn fit_text(text: &str, size: f32, width: f32) -> String {
     let font = system_font();
-    let measure = |s: &str| {
-        s.chars()
-            .map(|c| font.metrics(c, size).advance_width)
-            .sum::<f32>()
-    };
-    if measure(text) <= width {
+    let advance = |c: char| font.metrics(c, size).advance_width;
+    if text.chars().map(advance).sum::<f32>() <= width {
         return text.into();
     }
-    let mut short = String::new();
-    for c in text.chars() {
-        let candidate = format!("{short}{c}…");
-        if measure(&candidate) > width {
-            break;
-        }
-        short.push(c);
-    }
+    // Las letras que quepan junto con "…", sumando anchos sin crear textos de prueba.
+    let room = width - advance('…');
+    let mut used = 0.0;
+    let mut short: String = text
+        .chars()
+        .take_while(|&c| {
+            used += advance(c);
+            used <= room
+        })
+        .collect();
     short.push('…');
     short
 }
