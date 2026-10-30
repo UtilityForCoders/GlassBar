@@ -78,6 +78,8 @@ const WM_FOREGROUND: u32 = windows::Win32::UI::WindowsAndMessaging::WM_APP + 3;
 const WM_DWMCOLORIZATIONCOLORCHANGED: u32 = 0x0320;
 /// El hilo de sistema terminó de leer Wi-Fi, Bluetooth, brillo y red.
 const WM_QUICK_UPDATE: u32 = windows::Win32::UI::WindowsAndMessaging::WM_APP + 4;
+/// El hilo de iconos del lanzador cargó alguno nuevo.
+const WM_LAUNCHER_ICONS: u32 = windows::Win32::UI::WindowsAndMessaging::WM_APP + 5;
 
 const TIMER_ANIM: usize = 1;
 const TIMER_TICK: usize = 2;
@@ -305,7 +307,7 @@ struct LauncherWindow {
 impl LauncherWindow {
     fn new(
         owner: HWND,
-        model: launcher::LauncherState,
+        mut model: launcher::LauncherState,
         dock_left: i32,
         dock_top: i32,
     ) -> Result<Self> {
@@ -339,6 +341,11 @@ impl LauncherWindow {
                 None,
             )?
         };
+        model.load_icons_with(launcher::IconLoader::start(
+            scale,
+            hwnd.0 as isize,
+            WM_LAUNCHER_ICONS,
+        ));
         Ok(Self {
             hwnd,
             surface,
@@ -1104,6 +1111,13 @@ unsafe extern "system" fn launcher_wndproc(
             with_app(|app| {
                 if let Some(menu) = &mut app.launcher {
                     menu.hide();
+                }
+            });
+        }
+        WM_LAUNCHER_ICONS => {
+            with_app(|app| {
+                if let Some(menu) = app.launcher.as_mut().filter(|m| m.visible) {
+                    menu.render();
                 }
             });
         }

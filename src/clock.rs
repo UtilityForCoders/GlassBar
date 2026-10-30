@@ -289,22 +289,20 @@ pub fn text_width(text: &str, size: f32) -> f32 {
 }
 pub fn fit_text(text: &str, size: f32, width: f32) -> String {
     let font = system_font();
-    let measure = |s: &str| {
-        s.chars()
-            .map(|c| font.metrics(c, size).advance_width)
-            .sum::<f32>()
-    };
-    if measure(text) <= width {
+    let advance = |c: char| font.metrics(c, size).advance_width;
+    if text.chars().map(advance).sum::<f32>() <= width {
         return text.into();
     }
-    let mut short = String::new();
-    for c in text.chars() {
-        let candidate = format!("{short}{c}…");
-        if measure(&candidate) > width {
-            break;
-        }
-        short.push(c);
-    }
+    // Las letras que quepan junto con "…", sumando anchos sin crear textos de prueba.
+    let room = width - advance('…');
+    let mut used = 0.0;
+    let mut short: String = text
+        .chars()
+        .take_while(|&c| {
+            used += advance(c);
+            used <= room
+        })
+        .collect();
     short.push('…');
     short
 }
