@@ -1639,7 +1639,7 @@ impl App {
         }
     }
 
-    /// Muestra la vista previa de la ventana del programa `target`, si tiene una.
+    /// Muestra la vista previa de las ventanas del programa `target`, si tiene alguna.
     fn show_preview(&mut self, target: HoverTarget) -> bool {
         if !matches!(target, HoverTarget::PrimaryApp(_) | HoverTarget::OpenApp(_)) {
             return false;
@@ -1647,18 +1647,33 @@ impl App {
         let Some((name, cx)) = self.bar.item_label(target, self.scale) else {
             return false;
         };
-        let Some(window) = self.bar.item_mut(target).and_then(|a| a.window) else {
+        let windows = self
+            .bar
+            .item_mut(target)
+            .map(|a| a.windows.clone())
+            .unwrap_or_default();
+        if windows.is_empty() {
             return false;
-        };
-        let title = Some(window_title(window))
-            .filter(|t| !t.trim().is_empty())
-            .unwrap_or(name);
+        }
+        // Cada tarjeta con el título de su ventana; sin título, el del programa.
+        let sources: Vec<(isize, String)> = windows
+            .into_iter()
+            .map(|w| {
+                let title = window_title(w);
+                let title = if title.trim().is_empty() {
+                    name.clone()
+                } else {
+                    title
+                };
+                (w, title)
+            })
+            .collect();
         let (anchor, top, scale) = (self.pos.x + cx.round() as i32, self.y_shown, self.scale);
         let bounds = (self.screen_left, self.screen_right);
         let Some(preview) = &mut self.preview else {
             return false;
         };
-        let shown = preview.show(window, title, target, anchor, top, bounds, scale);
+        let shown = preview.show(&sources, target, anchor, top, bounds, scale);
         if shown {
             self.preview_away = None;
             if let Some(tip) = &mut self.tooltip {
@@ -2136,24 +2151,24 @@ unsafe extern "system" fn wndproc(hwnd: HWND, msg: u32, wparam: WPARAM, lparam: 
     }
 }
 
-/// Vista previa de la ventana de un programa del dock. El marco y el título se
-/// dibujan como el resto de GlassBar; la miniatura en vivo la pone Windows (DWM)
-/// encima, en el hueco que se le indica.
+/// Vista previa de las ventanas de un programa del dock: una tarjeta por ventana.
+/// El marco y los títulos se dibujan como el resto de GlassBar; las miniaturas en
+/// vivo las pone Windows (DWM) encima, en el hueco de cada tarjeta.
 struct PreviewWindow {
     hwnd: HWND,
     surface: Option<Surface>,
     pos: POINT,
     scale: f32,
     visible: bool,
-    /// Miniatura registrada en DWM (0 si no hay).
-    thumbnail: isize,
-    /// Ventana que se muestra.
-    source: isize,
-    /// Programa del dock al que pertenece.
+    /// Ventanas que se muestran, con su miniatura registrada en DWM y su título.
+    sources: Vec<isize>,
+    thumbnails: Vec<isize>,
+    titles: Vec<String>,
+    /// Programa del dock al que pertenecen.
     target: Option<HoverTarget>,
-    geometry: preview::Geometry,
-    title: String,
-    close_hovered: bool,
+    layout: preview::Layout,
+    hovered: Option<usize>,
+    close_hovered: Option<usize>,
 }
 impl PreviewWindow {
     fn new(owner: HWND) -> Result<Self> {
@@ -2179,63 +2194,80 @@ impl PreviewWindow {
             pos: POINT::default(),
             scale: 1.0,
             visible: false,
-            thumbnail: 0,
-            source: 0,
+            sources: Vec::new(),
+            thumbnails: Vec::new(),
+            titles: Vec::new(),
             target: None,
-            geometry: preview::geometry((1.0, 1.0), 1.0),
-            title: String::new(),
-            close_hovered: false,
+            layout: preview::Layout::default(),
+            hovered: None,
+            close_hovered: None,
         })
     }
 
-    /// Muestra la ventana `source` sobre `anchor_x`, encima del dock. Devuelve
-    /// `false` si Windows no da su miniatura (entonces se usa el globo con el nombre).
+    fn unregister(&mut self) {
+        for thumbnail in self.thumbnails.drain(..) {
+            unsafe {
+                let _ = windows::Win32::Graphics::Dwm::DwmUnregisterThumbnail(thumbnail);
+            }
+        }
+    }
+
+    /// Muestra las ventanas `sources` (con sus títulos) sobre `anchor_x`, encima del
+    /// dock. Devuelve `false` si Windows no da ninguna miniatura (entonces se usa el
+    /// globo con el nombre).
     #[allow(clippy::too_many_arguments)]
     fn show(
         &mut self,
-        source: isize,
-        title: String,
+        sources: &[(isize, String)],
         target: HoverTarget,
         anchor_x: i32,
         dock_top: i32,
         (left, right): (i32, i32),
         scale: f32,
     ) -> bool {
-        use windows::Win32::Graphics::Dwm::{
-            DwmQueryThumbnailSourceSize, DwmRegisterThumbnail, DwmUnregisterThumbnail,
-        };
-        if self.visible && self.source == source {
+        use windows::Win32::Graphics::Dwm::{DwmQueryThumbnailSourceSize, DwmRegisterThumbnail};
+        let ids: Vec<isize> = sources.iter().map(|(w, _)| *w).collect();
+        if self.visible && self.sources == ids {
             self.target = Some(target);
             return true;
         }
-        unsafe {
-            if self.thumbnail != 0 {
-                let _ = DwmUnregisterThumbnail(self.thumbnail);
-                self.thumbnail = 0;
+        self.unregister();
+        self.sources.clear();
+        self.titles.clear();
+        let mut sizes = Vec::new();
+        for (window, title) in sources {
+            unsafe {
+                let Ok(thumbnail) = DwmRegisterThumbnail(self.hwnd, HWND(*window as *mut _)) else {
+                    continue;
+                };
+                let Ok(size) = DwmQueryThumbnailSourceSize(thumbnail) else {
+                    let _ = windows::Win32::Graphics::Dwm::DwmUnregisterThumbnail(thumbnail);
+                    continue;
+                };
+                self.thumbnails.push(thumbnail);
+                self.sources.push(*window);
+                self.titles.push(title.clone());
+                sizes.push((size.cx as f32, size.cy as f32));
             }
-            let Ok(thumbnail) = DwmRegisterThumbnail(self.hwnd, HWND(source as *mut _)) else {
-                return false;
-            };
-            let Ok(size) = DwmQueryThumbnailSourceSize(thumbnail) else {
-                let _ = DwmUnregisterThumbnail(thumbnail);
-                return false;
-            };
-            self.thumbnail = thumbnail;
-            self.geometry = preview::geometry((size.cx as f32, size.cy as f32), scale);
         }
+        if sizes.is_empty() {
+            self.hide();
+            return false;
+        }
+        let margin = (8.0 * scale).round() as i32;
+        let room = (right - left - margin * 2) as f32 / scale;
+        self.layout = preview::layout(&sizes, scale, room);
         self.scale = scale;
-        self.source = source;
         self.target = Some(target);
-        self.title = title;
-        self.close_hovered = false;
-        let width = (self.geometry.width * scale).ceil() as u32;
-        let height = (self.geometry.height * scale).ceil() as u32;
+        self.hovered = None;
+        self.close_hovered = None;
+        let width = (self.layout.width * scale).ceil() as u32;
+        let height = (self.layout.height * scale).ceil() as u32;
         let Ok(surface) = Surface::new(width, height) else {
             self.hide();
             return false;
         };
         self.surface = Some(surface);
-        let margin = (8.0 * scale).round() as i32;
         self.pos = POINT {
             x: (anchor_x - width as i32 / 2).clamp(
                 left + margin,
@@ -2248,33 +2280,35 @@ impl PreviewWindow {
             let _ = ShowWindow(self.hwnd, SW_SHOWNOACTIVATE);
         }
         self.visible = true;
-        self.place_thumbnail();
+        self.place_thumbnails();
         true
     }
 
-    /// Le dice a Windows dónde pintar la miniatura dentro del panel.
-    fn place_thumbnail(&self) {
+    /// Le dice a Windows dónde pintar cada miniatura dentro de su tarjeta.
+    fn place_thumbnails(&self) {
         use windows::Win32::Graphics::Dwm::{
             DwmUpdateThumbnailProperties, DWM_THUMBNAIL_PROPERTIES,
         };
         // DWM_TNP_RECTDESTINATION | DWM_TNP_OPACITY | DWM_TNP_VISIBLE.
         const FLAGS: u32 = 0x1 | 0x4 | 0x8;
-        let (x, y, w, h) = self.geometry.thumb;
         let s = self.scale;
-        let properties = DWM_THUMBNAIL_PROPERTIES {
-            dwFlags: FLAGS,
-            rcDestination: windows::Win32::Foundation::RECT {
-                left: (x * s).round() as i32,
-                top: (y * s).round() as i32,
-                right: ((x + w) * s).round() as i32,
-                bottom: ((y + h) * s).round() as i32,
-            },
-            opacity: 255,
-            fVisible: true.into(),
-            ..Default::default()
-        };
-        unsafe {
-            let _ = DwmUpdateThumbnailProperties(self.thumbnail, &properties);
+        for (thumbnail, card) in self.thumbnails.iter().zip(&self.layout.cards) {
+            let (x, y, w, h) = card.thumb;
+            let properties = DWM_THUMBNAIL_PROPERTIES {
+                dwFlags: FLAGS,
+                rcDestination: windows::Win32::Foundation::RECT {
+                    left: (x * s).round() as i32,
+                    top: (y * s).round() as i32,
+                    right: ((x + w) * s).round() as i32,
+                    bottom: ((y + h) * s).round() as i32,
+                },
+                opacity: 255,
+                fVisible: true.into(),
+                ..Default::default()
+            };
+            unsafe {
+                let _ = DwmUpdateThumbnailProperties(*thumbnail, &properties);
+            }
         }
     }
 
@@ -2284,8 +2318,9 @@ impl PreviewWindow {
         };
         preview::draw(
             &mut surface.pixmap,
-            &self.geometry,
-            &self.title,
+            &self.layout,
+            &self.titles,
+            self.hovered,
             self.close_hovered,
             self.scale,
         );
@@ -2315,19 +2350,17 @@ impl PreviewWindow {
     }
 
     fn hide(&mut self) {
-        if !self.visible && self.thumbnail == 0 {
+        if !self.visible && self.thumbnails.is_empty() {
             return;
         }
+        self.unregister();
         unsafe {
-            if self.thumbnail != 0 {
-                let _ = windows::Win32::Graphics::Dwm::DwmUnregisterThumbnail(self.thumbnail);
-                self.thumbnail = 0;
-            }
             let _ = ShowWindow(self.hwnd, SW_HIDE);
         }
         self.visible = false;
         self.target = None;
-        self.source = 0;
+        self.sources.clear();
+        self.titles.clear();
     }
 
     /// El cursor (en pantalla) está sobre el panel.
@@ -2387,8 +2420,10 @@ unsafe extern "system" fn preview_wndproc(
                 };
                 let _ = TrackMouseEvent(&mut track);
                 let (x, y) = point(panel.scale);
-                let close = panel.geometry.in_close(x, y);
-                if close != panel.close_hovered {
+                let hovered = panel.layout.card_at(x, y);
+                let close = panel.layout.close_at(x, y);
+                if (hovered, close) != (panel.hovered, panel.close_hovered) {
+                    panel.hovered = hovered;
                     panel.close_hovered = close;
                     panel.render();
                 }
@@ -2397,25 +2432,29 @@ unsafe extern "system" fn preview_wndproc(
         }
         WM_MOUSELEAVE => {
             with_app(|app| {
-                if let Some(panel) = app.preview.as_mut().filter(|p| p.close_hovered) {
-                    panel.close_hovered = false;
+                if let Some(panel) = app.preview.as_mut().filter(|p| p.visible) {
+                    panel.hovered = None;
+                    panel.close_hovered = None;
                     panel.render();
                 }
             });
             LRESULT(0)
         }
-        // Clic: trae la ventana al frente; en la ✕, la cierra (como en Windows, le pide
-        // que se cierre, así que puede preguntar si guardar).
+        // Clic en una tarjeta: trae su ventana al frente; en su ✕, la cierra (como en
+        // Windows, le pide que se cierre, así que puede preguntar si guardar).
         WM_LBUTTONUP => {
             with_app(|app| {
                 let Some(panel) = app.preview.as_mut().filter(|p| p.visible) else {
                     return;
                 };
                 let (x, y) = point(panel.scale);
-                let source = panel.source;
-                let close = panel.geometry.in_close(x, y);
+                let close = panel.layout.close_at(x, y);
+                let Some(index) = close.or_else(|| panel.layout.card_at(x, y)) else {
+                    return;
+                };
+                let source = panel.sources[index];
                 panel.hide();
-                if close {
+                if close.is_some() {
                     let _ = windows::Win32::UI::WindowsAndMessaging::PostMessageW(
                         Some(HWND(source as *mut _)),
                         windows::Win32::UI::WindowsAndMessaging::WM_CLOSE,

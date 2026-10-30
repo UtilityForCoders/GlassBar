@@ -37,6 +37,8 @@ pub struct AppItem {
     pub is_running: bool,
     /// Ventana abierta más reciente del programa, si tiene alguna.
     pub window: Option<isize>,
+    /// Todas sus ventanas abiertas, de la más reciente a la más antigua.
+    pub windows: Vec<isize>,
     pub hover_spring: Spring,
     pub press_spring: Spring,
     /// Desplazamiento horizontal mientras se reordena la barra.
@@ -59,6 +61,7 @@ impl AppItem {
             scaled: RefCell::new(None),
             is_running: false,
             window: None,
+            windows: Vec::new(),
             hover_spring: Spring::new(1.0, 260.0, 18.0),
             press_spring: Spring::new(1.0, 340.0, 20.0),
             slide: Spring::new(0.0, 420.0, 36.0),
@@ -95,6 +98,7 @@ impl AppItem {
             scaled: RefCell::new(None),
             is_running: true,
             window: Some(window.hwnd),
+            windows: vec![window.hwnd],
             hover_spring: Spring::new(1.0, 260.0, 18.0),
             press_spring: Spring::new(1.0, 340.0, 20.0),
             slide: Spring::new(0.0, 420.0, 36.0),
@@ -254,9 +258,11 @@ pub fn update_running_apps(pinned: &mut [AppItem], open: &mut Vec<AppItem>) -> b
     let mut claimed = vec![false; windows.len()];
     for app in pinned.iter_mut() {
         app.window = None;
+        app.windows.clear();
         for (i, w) in windows.iter().enumerate() {
             if w.belongs_to(app) {
                 app.window.get_or_insert(w.hwnd);
+                app.windows.push(w.hwnd);
                 claimed[i] = true;
             }
         }
@@ -271,16 +277,13 @@ pub fn update_running_apps(pinned: &mut [AppItem], open: &mut Vec<AppItem>) -> b
 
     let before: Vec<String> = open.iter().map(|a| a.entry.command.clone()).collect();
     open.retain_mut(|a| {
-        match unclaimed
+        a.windows = unclaimed
             .iter()
-            .find(|w| w.exe.eq_ignore_ascii_case(&a.entry.command))
-        {
-            Some(w) => {
-                a.window = Some(w.hwnd);
-                true
-            }
-            None => false,
-        }
+            .filter(|w| w.exe.eq_ignore_ascii_case(&a.entry.command))
+            .map(|w| w.hwnd)
+            .collect();
+        a.window = a.windows.first().copied();
+        a.window.is_some()
     });
     for w in unclaimed {
         if open
