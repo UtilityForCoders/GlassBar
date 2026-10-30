@@ -1,4 +1,4 @@
-//! Hora con Segoe UI del sistema y antialias en escala de grises.
+//! Hora y fecha con Segoe UI del sistema y antialias en escala de grises.
 use fontdue::{Font, FontSettings};
 use std::{cell::RefCell, sync::OnceLock};
 use tiny_skia::{Pixmap, PixmapPaint, Transform};
@@ -70,8 +70,17 @@ fn semibold_font() -> &'static Font {
     FONT.get_or_init(|| font_file("seguisb.ttf").unwrap_or_else(|| system_font().clone()))
 }
 
+/// Hora y, debajo, la fecha corta, como la barra de Windows. Las dos líneas se
+/// rasterizan solo cuando cambian (una vez por minuto).
 pub struct ClockRenderer {
-    cached: RefCell<Option<(String, u32, Pixmap)>>,
+    cached: RefCell<Option<Clock>>,
+}
+struct Clock {
+    time: String,
+    date: String,
+    pixels: u32,
+    /// Cada línea con cuánto sube sobre su línea base.
+    lines: [(Pixmap, i32); 2],
 }
 impl ClockRenderer {
     pub fn new() -> Self {
@@ -80,20 +89,39 @@ impl ClockRenderer {
         }
     }
     pub fn draw(&self, target: &mut Pixmap, cx: f32, cy: f32, scale: f32) {
-        let time = unsafe { GetLocalTime() };
-        let text = format!("{:02}:{:02}", time.wHour, time.wMinute);
-        let pixels = (13.0 * scale).round().max(8.0) as u32;
+        let now = unsafe { GetLocalTime() };
+        let time = format!("{:02}:{:02}", now.wHour, now.wMinute);
+        let date = format_date(&now, false);
+        let pixels = (12.0 * scale).round().max(8.0) as u32;
         let mut cached = self.cached.borrow_mut();
         if !cached
             .as_ref()
-            .is_some_and(|(old, size, _)| old == &text && *size == pixels)
+            .is_some_and(|c| c.time == time && c.date == date && c.pixels == pixels)
         {
-            *cached = Some((text.clone(), pixels, rasterize(&text, pixels as f32)));
+            let size = pixels as f32;
+            let lines = [
+                rasterize_line(system_font(), &time, size),
+                rasterize_line(system_font(), &date, size),
+            ];
+            *cached = Some(Clock {
+                time,
+                date,
+                pixels,
+                lines,
+            });
         }
-        if let Some((_, _, image)) = &*cached {
+        let Some(clock) = &*cached else {
+            return;
+        };
+        // Dos líneas seguidas centradas en `cy`, cada una sobre su línea base.
+        let (ascent, descent) = line_metrics(clock.pixels as f32);
+        let line = ascent + descent;
+        let top = cy - line;
+        for (index, (image, rise)) in clock.lines.iter().enumerate() {
+            let baseline = top + line * index as f32 + ascent;
             target.draw_pixmap(
                 (cx - image.width() as f32 / 2.0).round() as i32,
-                (cy - image.height() as f32 / 2.0).round() as i32,
+                (baseline - *rise as f32).round() as i32,
                 image.as_ref(),
                 &PixmapPaint::default(),
                 Transform::identity(),
@@ -101,6 +129,33 @@ impl ClockRenderer {
             );
         }
     }
+}
+
+/// Fecha de hoy en el formato regional del usuario: corta ("30/10/2026") o larga
+/// ("jueves, 30 de octubre de 2026").
+pub fn today(long: bool) -> String {
+    format_date(&unsafe { GetLocalTime() }, long)
+}
+
+fn format_date(date: &windows::Win32::Foundation::SYSTEMTIME, long: bool) -> String {
+    use windows::Win32::Globalization::{GetDateFormatEx, DATE_LONGDATE, DATE_SHORTDATE};
+    let flags = if long { DATE_LONGDATE } else { DATE_SHORTDATE };
+    let mut buffer = [0u16; 128];
+    // Sin nombre de configuración regional: la del usuario.
+    let len = unsafe {
+        GetDateFormatEx(
+            windows::core::PCWSTR::null(),
+            flags,
+            Some(date),
+            windows::core::PCWSTR::null(),
+            Some(&mut buffer),
+            windows::core::PCWSTR::null(),
+        )
+    };
+    if len <= 1 {
+        return format!("{:02}/{:02}/{}", date.wDay, date.wMonth, date.wYear);
+    }
+    String::from_utf16_lossy(&buffer[..len as usize - 1])
 }
 
 fn rasterize(text: &str, size: f32) -> Pixmap {

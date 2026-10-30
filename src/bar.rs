@@ -115,6 +115,11 @@ impl BarState {
         if target == HoverTarget::Overflow {
             return Some(("Mostrar iconos ocultos".into(), self.overflow_center(scale)));
         }
+        if target == HoverTarget::Clock {
+            // Como en Windows: la fecha completa al pasar el cursor por el reloj.
+            let cx = (SHADOW_PAD_X + self.dock_width() - CLOCK_W / 2.0) * scale;
+            return Some((crate::clock::today(true), cx));
+        }
         if let HoverTarget::Status(index) = target {
             let item = self.status_item(index)?;
             return Some((self.status.label(item), self.status_center(index, scale)));

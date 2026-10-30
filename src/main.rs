@@ -1505,6 +1505,7 @@ impl App {
                         | HoverTarget::OpenApp(_)
                         | HoverTarget::Overflow
                         | HoverTarget::Status(_)
+                        | HoverTarget::Clock
                 )
             ) && self.bar.pressed.is_none()
             {
