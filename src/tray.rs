@@ -36,6 +36,14 @@ impl Tray {
                 .unwrap_or_default()
         };
 
+        let tray = Self { hwnd, icon };
+        tray.register();
+        tray
+    }
+
+    /// Registra el icono en la bandeja. También cuando la barra se vuelve a crear
+    /// (Explorer reiniciado, o la bandeja propia pidiendo los iconos).
+    pub fn register(&self) {
         let mut tip = [0u16; 128];
         let tip_str = "GlassBar - Liquid Glass Taskbar";
         for (i, c) in tip_str.encode_utf16().enumerate().take(127) {
@@ -44,11 +52,11 @@ impl Tray {
 
         let nid = NOTIFYICONDATAW {
             cbSize: std::mem::size_of::<NOTIFYICONDATAW>() as u32,
-            hWnd: hwnd,
+            hWnd: self.hwnd,
             uID: TRAY_ID,
             uFlags: NIF_MESSAGE | NIF_ICON | NIF_TIP,
             uCallbackMessage: WM_TRAY,
-            hIcon: icon,
+            hIcon: self.icon,
             szTip: tip,
             ..Default::default()
         };
@@ -56,8 +64,6 @@ impl Tray {
         unsafe {
             let _ = Shell_NotifyIconW(NIM_ADD, &nid);
         }
-
-        Self { hwnd, icon }
     }
 
     /// Despliega el menú contextual de la bandeja y devuelve la opción elegida.

@@ -193,8 +193,24 @@ mod tests {
     }
 }
 
+/// Imagen de un icono de Windows a `side` píxeles (p. ej. el de la bandeja de otro
+/// programa).
+pub fn from_hicon(
+    icon: windows::Win32::UI::WindowsAndMessaging::HICON,
+    side: u32,
+) -> Option<Pixmap> {
+    unsafe { rasterize_at(icon, side) }
+}
+
 unsafe fn rasterize(icon: windows::Win32::UI::WindowsAndMessaging::HICON) -> Option<Pixmap> {
-    const SIDE: u32 = 128;
+    rasterize_at(icon, 128)
+}
+
+unsafe fn rasterize_at(
+    icon: windows::Win32::UI::WindowsAndMessaging::HICON,
+    side: u32,
+) -> Option<Pixmap> {
+    let side = side.max(1);
     let dc = CreateCompatibleDC(None);
     if dc.is_invalid() {
         return None;
@@ -202,8 +218,8 @@ unsafe fn rasterize(icon: windows::Win32::UI::WindowsAndMessaging::HICON) -> Opt
     let bmi = BITMAPINFO {
         bmiHeader: BITMAPINFOHEADER {
             biSize: std::mem::size_of::<BITMAPINFOHEADER>() as u32,
-            biWidth: SIDE as i32,
-            biHeight: -(SIDE as i32),
+            biWidth: side as i32,
+            biHeight: -(side as i32),
             biPlanes: 1,
             biBitCount: 32,
             biCompression: BI_RGB.0,
@@ -222,15 +238,15 @@ unsafe fn rasterize(icon: windows::Win32::UI::WindowsAndMessaging::HICON) -> Opt
     let old = SelectObject(dc, bitmap.into());
     let result = (|| {
         // Dos fondos permiten recuperar también el alfa de iconos antiguos con máscara.
-        let bytes = std::slice::from_raw_parts_mut(bits.cast::<u8>(), (SIDE * SIDE * 4) as usize);
+        let bytes = std::slice::from_raw_parts_mut(bits.cast::<u8>(), (side * side * 4) as usize);
         bytes.fill(0);
-        DrawIconEx(dc, 0, 0, icon, SIDE as i32, SIDE as i32, 0, None, DI_NORMAL).ok()?;
+        DrawIconEx(dc, 0, 0, icon, side as i32, side as i32, 0, None, DI_NORMAL).ok()?;
         let _ = GdiFlush();
         let black = bytes.to_vec();
         bytes.fill(255);
-        DrawIconEx(dc, 0, 0, icon, SIDE as i32, SIDE as i32, 0, None, DI_NORMAL).ok()?;
+        DrawIconEx(dc, 0, 0, icon, side as i32, side as i32, 0, None, DI_NORMAL).ok()?;
         let _ = GdiFlush();
-        let mut out = Pixmap::new(SIDE, SIDE)?;
+        let mut out = Pixmap::new(side, side)?;
         for ((dst, b), w) in out
             .data_mut()
             .chunks_exact_mut(4)

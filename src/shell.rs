@@ -28,10 +28,28 @@ unsafe extern "system" fn on_show(
     }
 }
 
+/// La barra principal de Explorer. Se salta la `Shell_TrayWnd` propia de GlassBar
+/// (ver `systray`), que se pone delante para recibir los iconos de la bandeja.
+pub fn explorer_tray() -> Option<HWND> {
+    let own = std::process::id();
+    let mut previous = None;
+    unsafe {
+        while let Ok(hwnd) = FindWindowExW(None, previous, w!("Shell_TrayWnd"), None) {
+            let mut pid = 0;
+            GetWindowThreadProcessId(hwnd, Some(&mut pid));
+            if pid != own {
+                return Some(hwnd);
+            }
+            previous = Some(hwnd);
+        }
+    }
+    None
+}
+
 fn taskbars() -> Vec<HWND> {
     let mut result = Vec::new();
     unsafe {
-        if let Ok(hwnd) = FindWindowW(w!("Shell_TrayWnd"), None) {
+        if let Some(hwnd) = explorer_tray() {
             result.push(hwnd);
         }
         let mut previous = None;
@@ -102,7 +120,7 @@ impl TaskbarReplacer {
         self.active = false;
         for hwnd in taskbars() {
             unsafe {
-                if hwnd == FindWindowW(w!("Shell_TrayWnd"), None).unwrap_or_default() {
+                if Some(hwnd) == explorer_tray() {
                     restore_opacity(hwnd);
                 }
                 let _ = ShowWindowAsync(hwnd, SW_SHOW);
@@ -141,7 +159,7 @@ pub fn toggle_overflow(anchor_x: i32, anchor_top: i32, screen_left: i32, screen_
 }
 
 unsafe fn open_overflow(anchor_x: i32, anchor_top: i32, screen_left: i32, screen_right: i32) {
-    let Ok(tray) = FindWindowW(w!("Shell_TrayWnd"), None) else {
+    let Some(tray) = explorer_tray() else {
         return;
     };
     // Explorer no responde a la flecha de la barra oculta; se muestra un instante,
