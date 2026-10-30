@@ -5,6 +5,7 @@
 //! Comportamiento auto-hide nativo (sale suavemente desde abajo al acercar el mouse) y estética translúcida.
 
 mod apps;
+mod audio;
 mod autohide;
 mod autostart;
 mod bar;
@@ -744,8 +745,15 @@ unsafe extern "system" fn quick_wndproc(
                         }
                         panel.render();
                     }
+                    Some(quick::Hit::AudioList) => {
+                        panel.model.audio_app = None;
+                        panel.set_view(quick::View::Audio);
+                        panel.backend.refresh();
+                        panel.render();
+                    }
                     Some(quick::Hit::Back) => {
                         panel.model.join = None;
+                        panel.model.audio_app = None;
                         panel.set_view(quick::View::Main);
                         panel.render();
                     }
@@ -758,6 +766,36 @@ unsafe extern "system" fn quick_wndproc(
                             connect,
                             since: Instant::now(),
                         };
+                        if panel.model.view == quick::View::Audio {
+                            let row = panel.model.audio_rows().get(index).copied();
+                            let mixer = &mut panel.model.system.audio;
+                            // Se ve al instante; el hilo de sistema lo confirma al releer.
+                            match row {
+                                Some(quick::AudioRow::Output(output)) => {
+                                    if let Some(output) = mixer.outputs.get(output) {
+                                        mixer.default = Some(output.id.clone());
+                                        panel.backend.set_default_output(output.id.clone());
+                                    }
+                                }
+                                Some(quick::AudioRow::App(app)) => {
+                                    panel.model.toggle_audio_app(app);
+                                }
+                                Some(quick::AudioRow::Choice(app, output)) => {
+                                    let id = output
+                                        .and_then(|o| mixer.outputs.get(o))
+                                        .map(|o| o.id.clone());
+                                    if let Some(app) = mixer.apps.get_mut(app) {
+                                        app.output = id.clone();
+                                        panel.backend.set_app_output(app.pids.clone(), id);
+                                    }
+                                    panel.model.audio_app = None;
+                                    panel.model.scroll_list(0.0);
+                                }
+                                _ => {}
+                            }
+                            panel.render();
+                            return;
+                        }
                         if panel.model.view == quick::View::List(system::Radio::Bluetooth) {
                             let Some(device) = panel.model.devices().get(index).cloned() else {
                                 return;
@@ -819,6 +857,8 @@ unsafe extern "system" fn quick_wndproc(
                     Some(quick::Hit::Settings) => {
                         let uri = match panel.model.view {
                             quick::View::List(system::Radio::Bluetooth) => "ms-settings:bluetooth",
+                            // "Volumen y dispositivos de aplicaciones" de Windows.
+                            quick::View::Audio => "ms-settings:apps-volume",
                             _ => "ms-settings:network-wifi",
                         };
                         panel.hide();

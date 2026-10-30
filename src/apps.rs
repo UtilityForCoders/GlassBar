@@ -194,7 +194,7 @@ impl OpenWindow {
 }
 
 /// Descripción del archivo (p. ej. "Google Chrome"), como la muestra el Explorador.
-fn file_description(exe: &str) -> Option<String> {
+pub fn file_description(exe: &str) -> Option<String> {
     use windows::Win32::Storage::FileSystem::{
         GetFileVersionInfoSizeW, GetFileVersionInfoW, VerQueryValueW,
     };
