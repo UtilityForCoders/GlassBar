@@ -88,6 +88,12 @@ impl ClockRenderer {
             cached: RefCell::new(None),
         }
     }
+    /// Si la hora mostrada ya no es la actual (cambió el minuto) y hay que redibujar.
+    pub fn outdated(&self) -> bool {
+        let now = unsafe { GetLocalTime() };
+        let time = format!("{:02}:{:02}", now.wHour, now.wMinute);
+        self.cached.borrow().as_ref().is_none_or(|c| c.time != time)
+    }
     pub fn draw(&self, target: &mut Pixmap, cx: f32, cy: f32, scale: f32) {
         let now = unsafe { GetLocalTime() };
         let time = format!("{:02}:{:02}", now.wHour, now.wMinute);

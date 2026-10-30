@@ -1340,6 +1340,8 @@ struct App {
     animating: bool,
     last_tick: Instant,
     mouse_tracked: bool,
+    /// Lee red, volumen y batería cada segundo.
+    status: status::Reader,
 }
 
 impl App {
@@ -1349,7 +1351,8 @@ impl App {
 
         let mut bar = BarState::new();
         apps::update_running_apps(&mut bar.primary_apps, &mut bar.open_apps);
-        bar.status = status::read();
+        let mut status_reader = status::Reader::new();
+        bar.status = status_reader.read();
         bar.keyboard = keyboard::current();
         let scale = scale.min((rc.right - rc.left) as f32 / (bar.dock_width() + 40.0));
         let (width, height) = bar.window_size(scale);
@@ -1400,6 +1403,7 @@ impl App {
             animating: false,
             last_tick: Instant::now(),
             mouse_tracked: false,
+            status: status_reader,
         })
     }
 
@@ -2015,7 +2019,7 @@ unsafe extern "system" fn wndproc(hwnd: HWND, msg: u32, wparam: WPARAM, lparam: 
                 if volume {
                     let delta = ((wparam.0 >> 16) & 0xffff) as i16 as f32 / 120.0;
                     status::change_volume(delta);
-                    app.bar.status = status::read();
+                    app.bar.status = app.status.read();
                     app.render();
                     app.restart_tooltip();
                 }
@@ -2075,10 +2079,11 @@ unsafe extern "system" fn wndproc(hwnd: HWND, msg: u32, wparam: WPARAM, lparam: 
                     // Pasar a pantalla completa (F11) no cambia la ventana activa.
                     app.check_priority(false);
                     // Red, volumen y batería; si aparece o desaparece la batería cambia el ancho.
-                    let status = status::read();
+                    let status = app.status.read();
                     // El idioma también cambia con atajos (Win+Espacio, Alt+Mayús).
                     app.update_keyboard();
                     let resized = status.items().len() != app.bar.status.items().len();
+                    let status_changed = status != app.bar.status;
                     app.bar.status = status;
                     // El volumen puede cambiar con las teclas o desde otra app.
                     if let Some(panel) = app.quick.as_mut().filter(|p| p.visible) {
@@ -2090,11 +2095,22 @@ unsafe extern "system" fn wndproc(hwnd: HWND, msg: u32, wparam: WPARAM, lparam: 
                             panel.render();
                         }
                     }
-                    if apps::update_running_apps(&mut app.bar.primary_apps, &mut app.bar.open_apps)
-                        || resized
-                    {
+                    let running = |app: &App| -> Vec<bool> {
+                        app.bar.primary_apps.iter().map(|a| a.is_running).collect()
+                    };
+                    let was_running = running(app);
+                    let opened_or_closed = apps::update_running_apps(
+                        &mut app.bar.primary_apps,
+                        &mut app.bar.open_apps,
+                    );
+                    if opened_or_closed || resized {
                         app.relayout();
-                    } else {
+                    } else if status_changed
+                        || running(app) != was_running
+                        || app.bar.clock_outdated()
+                    {
+                        // Solo si algo de lo que se ve cambió: redibujar el dock entero
+                        // cada segundo era la mayor parte de su gasto en reposo.
                         app.render();
                     }
                 });
