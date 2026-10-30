@@ -58,6 +58,8 @@ enum Command {
     DefaultOutput(String),
     /// Salida de una aplicación (sus procesos); `None` vuelve a la predeterminada.
     AppOutput(Vec<u32>, Option<String>),
+    /// Dispositivos Bluetooth recién leídos por su hilo (ver `bluetooth_reader`).
+    Devices(Vec<Device>),
 }
 
 /// Tiempo para que Windows confirme la conexión a una red nueva; si no lo hace, la
@@ -79,7 +81,8 @@ impl Backend {
         let snapshot = Arc::new(Mutex::new(Snapshot::default()));
         let shared = snapshot.clone();
         let target = notify.0 as isize;
-        std::thread::spawn(move || run(receiver, shared, target, message));
+        let devices = bluetooth_reader(sender.clone());
+        std::thread::spawn(move || run(receiver, devices, shared, target, message));
         Self { sender, snapshot }
     }
     pub fn snapshot(&self) -> Snapshot {
@@ -123,7 +126,37 @@ impl Backend {
     }
 }
 
-fn run(receiver: Receiver<Command>, shared: Arc<Mutex<Snapshot>>, target: isize, message: u32) {
+/// Hilo que lee los dispositivos Bluetooth y los devuelve como `Command::Devices`.
+/// Windows a veces tarda decenas de segundos en contestar; aparte, el panel no
+/// espera: muestra la última lista y se pone al día cuando llega la nueva.
+fn bluetooth_reader(results: Sender<Command>) -> Sender<()> {
+    let (requests, queue) = channel::<()>();
+    std::thread::spawn(move || {
+        use windows::Win32::System::Com::{CoInitializeEx, COINIT_MULTITHREADED};
+        unsafe {
+            let _ = CoInitializeEx(None, COINIT_MULTITHREADED);
+        }
+        while queue.recv().is_ok() {
+            // Las peticiones que llegaron mientras tanto quedan cubiertas por esta.
+            queue.try_iter().for_each(drop);
+            if results
+                .send(Command::Devices(crate::bluetooth::devices()))
+                .is_err()
+            {
+                break;
+            }
+        }
+    });
+    requests
+}
+
+fn run(
+    receiver: Receiver<Command>,
+    bluetooth_reader: Sender<()>,
+    shared: Arc<Mutex<Snapshot>>,
+    target: isize,
+    message: u32,
+) {
     use windows::Win32::System::Com::{CoInitializeEx, COINIT_MULTITHREADED};
     unsafe {
         let _ = CoInitializeEx(None, COINIT_MULTITHREADED);
@@ -139,6 +172,10 @@ fn run(receiver: Receiver<Command>, shared: Arc<Mutex<Snapshot>>, target: isize,
     let mut join_failed: Option<String> = None;
     // Iconos de las aplicaciones con audio, cargados una vez.
     let mut icons = std::collections::HashMap::new();
+    // Última lista de dispositivos Bluetooth; si hay una lectura en curso, y si hace
+    // falta otra al terminar (algo cambió mientras tanto).
+    let mut devices: Vec<Device> = Vec::new();
+    let (mut reading_devices, mut devices_again) = (false, false);
     // Cuántas lecturas quedan pendientes tras una búsqueda o conexión, y cuándo.
     let (mut rereads, mut reread_at) = (0, Instant::now());
     loop {
@@ -230,6 +267,29 @@ fn run(receiver: Receiver<Command>, shared: Arc<Mutex<Snapshot>>, target: isize,
             display.set(wmi.as_ref(), value);
         }
         // Tras mover el brillo no hace falta releerlo todo: el panel ya muestra el valor.
+        // Llegaron los dispositivos: solo cambia esa parte de lo publicado.
+        let arrived = commands.iter_mut().rev().find_map(|c| match c {
+            Command::Devices(list) => Some(std::mem::take(list)),
+            _ => None,
+        });
+        let fresh = arrived.is_some();
+        if let Some(list) = arrived {
+            devices = list;
+            reading_devices = false;
+            if std::mem::take(&mut devices_again) {
+                reading_devices = bluetooth_reader.send(()).is_ok();
+            }
+            if !opened && !reread {
+                if let Ok(mut shared) = shared.lock() {
+                    shared.devices = devices.clone();
+                }
+                unsafe {
+                    let _ =
+                        PostMessageW(Some(HWND(target as *mut _)), message, WPARAM(0), LPARAM(0));
+                }
+                continue;
+            }
+        }
         if !opened && !reread {
             continue;
         }
@@ -258,7 +318,14 @@ fn run(receiver: Receiver<Command>, shared: Arc<Mutex<Snapshot>>, target: isize,
             network: crate::profile::time("system.network_name", || unsafe { network_name() }),
             networks,
             devices: if bluetooth == Some(true) {
-                crate::bluetooth::devices()
+                if fresh {
+                    // Recién llegados: no hace falta pedirlos otra vez.
+                } else if reading_devices {
+                    devices_again = true;
+                } else {
+                    reading_devices = bluetooth_reader.send(()).is_ok();
+                }
+                devices.clone()
             } else {
                 Vec::new()
             },
