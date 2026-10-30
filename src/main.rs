@@ -1856,7 +1856,14 @@ unsafe extern "system" fn wndproc(hwnd: HWND, msg: u32, wparam: WPARAM, lparam: 
                     }
                     return;
                 }
-                app.check_priority(true);
+                // Con el menú de un icono de la bandeja abierto, el dock y su panel no
+                // se ponen delante: el menú quedaría detrás.
+                let tray_menu = app.tray_panel.as_ref().is_some_and(|p| p.menu.is_some())
+                    || app
+                        .tray_clicked
+                        .is_some_and(|at| at.elapsed() < Duration::from_millis(1500))
+                    || menu_open();
+                app.check_priority(!tray_menu);
                 app.update_keyboard();
             });
             LRESULT(0)

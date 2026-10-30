@@ -428,7 +428,10 @@ unsafe extern "system" fn host_wndproc(
                         PostMessageW(Some(HWND(target as *mut _)), message, WPARAM(0), LPARAM(0));
                 }
             }
-            forward();
+            // A Explorer se le pasa desde otro hilo y sin esperar: si se le esperase
+            // aquí, él podría escribir a la vez a esta bandeja y quedarse los dos
+            // esperándose (pasaba con varios iconos seguidos).
+            forward_later(wparam.0, bytes.to_vec());
             return LRESULT(1);
         }
         return forward();
@@ -439,6 +442,44 @@ unsafe extern "system" fn host_wndproc(
         return forward();
     }
     DefWindowProcW(hwnd, msg, wparam, lparam)
+}
+
+/// Reenvía a Explorer los mensajes de iconos, en orden, desde un hilo propio.
+fn forward_later(sender: usize, bytes: Vec<u8>) {
+    use std::sync::mpsc::{channel, Sender};
+    use std::sync::{Mutex, OnceLock};
+    static QUEUE: OnceLock<Mutex<Sender<(usize, Vec<u8>)>>> = OnceLock::new();
+    let queue = QUEUE.get_or_init(|| {
+        let (send, receive) = channel::<(usize, Vec<u8>)>();
+        std::thread::spawn(move || {
+            use windows::Win32::System::DataExchange::COPYDATASTRUCT;
+            for (sender, bytes) in receive {
+                let Some(explorer) = crate::shell::explorer_tray() else {
+                    continue;
+                };
+                let data = COPYDATASTRUCT {
+                    dwData: 1,
+                    cbData: bytes.len() as u32,
+                    lpData: bytes.as_ptr() as *mut _,
+                };
+                unsafe {
+                    let _ = SendMessageTimeoutW(
+                        explorer,
+                        WM_COPYDATA,
+                        WPARAM(sender),
+                        LPARAM(&data as *const _ as isize),
+                        SMTO_ABORTIFHUNG,
+                        2000,
+                        None,
+                    );
+                }
+            }
+        });
+        Mutex::new(send)
+    });
+    if let Ok(queue) = queue.lock() {
+        let _ = queue.send((sender, bytes));
+    }
 }
 
 /// Si el icono va en el panel: no oculto, y no uno de Explorer sin a quién avisar
