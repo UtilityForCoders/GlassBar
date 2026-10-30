@@ -1,5 +1,5 @@
 //! Hora y fecha con Segoe UI del sistema y antialias en escala de grises.
-use fontdue::{Font, FontSettings};
+use crate::font::Font;
 use std::{cell::RefCell, sync::OnceLock};
 use tiny_skia::{Pixmap, PixmapPaint, Transform};
 use windows::Win32::System::SystemInformation::GetLocalTime;
@@ -7,7 +7,7 @@ use windows::Win32::System::SystemInformation::GetLocalTime;
 fn font_file(name: &str) -> Option<Font> {
     let windows = std::env::var_os("WINDIR").unwrap_or_else(|| "C:\\Windows".into());
     let path = std::path::PathBuf::from(windows).join("Fonts").join(name);
-    Font::from_bytes(std::fs::read(path).ok()?, FontSettings::default()).ok()
+    Font::from_bytes(std::fs::read(path).ok()?)
 }
 
 fn system_font() -> &'static Font {
@@ -162,7 +162,7 @@ fn rasterize(text: &str, size: f32) -> Pixmap {
     rasterize_with(system_font(), text, size)
 }
 
-type Glyph = std::rc::Rc<(fontdue::Metrics, Vec<u8>)>;
+type Glyph = std::rc::Rc<(crate::font::Metrics, Vec<u8>)>;
 
 /// Rasterizar un glifo es lo más caro de pintar texto; el lanzador redibuja
 /// decenas de nombres en cada cambio, así que cada glifo se rasteriza una vez.

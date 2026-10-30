@@ -13,6 +13,7 @@ mod bar;
 mod bluetooth;
 mod catalog;
 mod clock;
+mod font;
 mod glass;
 mod guard;
 mod icons;
