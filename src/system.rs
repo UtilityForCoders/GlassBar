@@ -1,8 +1,11 @@
 //! Ajustes del sistema para el panel rápido: Wi-Fi y Bluetooth (encender/apagar),
-//! brillo de la pantalla del dock y nombre de la red. Leerlos y cambiarlos puede tardar (WMI, radios), así
-//! que se hace en un hilo aparte que avisa al panel con un mensaje al terminar.
-use std::sync::mpsc::{channel, Receiver, Sender};
+//! redes Wi-Fi, brillo de la pantalla del dock y nombre de la red. Leerlos y
+//! cambiarlos puede tardar (WMI, radios, búsquedas), así que se hace en un hilo
+//! aparte que avisa al panel con un mensaje al terminar.
+use crate::wifi::{Network, Wlan};
+use std::sync::mpsc::{channel, Receiver, RecvTimeoutError, Sender};
 use std::sync::{Arc, Mutex};
+use std::time::{Duration, Instant};
 use windows::core::{BSTR, PCWSTR};
 use windows::Win32::Foundation::{HWND, LPARAM, WPARAM};
 use windows::Win32::UI::WindowsAndMessaging::PostMessageW;
@@ -16,6 +19,8 @@ pub struct Snapshot {
     pub brightness: Option<u8>,
     /// Nombre de la red conectada, como lo muestra Windows.
     pub network: Option<String>,
+    /// Redes Wi-Fi cercanas; `None` si el equipo no tiene adaptador Wi-Fi.
+    pub networks: Option<Vec<Network>>,
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -28,7 +33,16 @@ enum Command {
     Refresh,
     SetRadio(Radio, bool),
     SetBrightness(u8),
+    /// Buscar redes Wi-Fi (al abrir la lista).
+    Scan,
+    /// Conectarse con un perfil guardado.
+    Connect(String),
+    Disconnect,
 }
+
+/// Tras buscar redes o conectarse, Windows tarda unos segundos en tener el resultado:
+/// se vuelve a leer pasado este tiempo, y una vez más si sigue cambiando.
+const SETTLE: Duration = Duration::from_secs(3);
 
 pub struct Backend {
     sender: Sender<Command>,
@@ -56,6 +70,15 @@ impl Backend {
     pub fn set_brightness(&self, percent: u8) {
         let _ = self.sender.send(Command::SetBrightness(percent.min(100)));
     }
+    pub fn scan(&self) {
+        let _ = self.sender.send(Command::Scan);
+    }
+    pub fn connect(&self, profile: String) {
+        let _ = self.sender.send(Command::Connect(profile));
+    }
+    pub fn disconnect(&self) {
+        let _ = self.sender.send(Command::Disconnect);
+    }
 }
 
 fn run(receiver: Receiver<Command>, shared: Arc<Mutex<Snapshot>>, target: isize, message: u32) {
@@ -67,30 +90,65 @@ fn run(receiver: Receiver<Command>, shared: Arc<Mutex<Snapshot>>, target: isize,
     // Qué pantalla y por qué vía se controla; se recalcula en cada lectura por si
     // cambió el monitor principal o se conectó otro.
     let mut display = Display::None;
-    while let Ok(first) = receiver.recv() {
+    let wlan = Wlan::open();
+    // Cuántas lecturas quedan pendientes tras una búsqueda o conexión, y cuándo.
+    let (mut rereads, mut reread_at) = (0, Instant::now());
+    loop {
+        let first = if rereads > 0 {
+            match receiver.recv_timeout(reread_at.saturating_duration_since(Instant::now())) {
+                Ok(command) => Some(command),
+                Err(RecvTimeoutError::Timeout) => None,
+                Err(RecvTimeoutError::Disconnected) => break,
+            }
+        } else {
+            match receiver.recv() {
+                Ok(command) => Some(command),
+                Err(_) => break,
+            }
+        };
         // Al arrastrar el brillo llegan muchas órdenes seguidas: solo cuenta la última.
-        let mut commands = vec![first];
+        let mut commands: Vec<Command> = first.into_iter().collect();
         commands.extend(receiver.try_iter());
         let last_brightness = commands.iter().rev().find_map(|c| match c {
             Command::SetBrightness(value) => Some(*value),
             _ => None,
         });
-        let mut changed_radio = false;
+        // Sin orden nueva: venció la espera de una relectura.
+        let mut reread = commands.is_empty();
+        if reread {
+            rereads -= 1;
+            reread_at = Instant::now() + SETTLE;
+        }
         for command in &commands {
-            if let Command::SetRadio(radio, on) = command {
-                set_radio(*radio, *on);
-                changed_radio = true;
+            match command {
+                Command::SetRadio(radio, on) => {
+                    set_radio(*radio, *on);
+                    reread = true;
+                }
+                Command::Scan | Command::Connect(_) | Command::Disconnect => {
+                    if let Some(wlan) = &wlan {
+                        match command {
+                            Command::Scan => wlan.scan(),
+                            Command::Connect(profile) => wlan.connect(profile),
+                            _ => wlan.disconnect(),
+                        }
+                    }
+                    (rereads, reread_at) = (2, Instant::now() + SETTLE);
+                    reread = true;
+                }
+                _ => {}
             }
         }
-        let refresh = changed_radio || commands.iter().any(|c| matches!(c, Command::Refresh));
-        if refresh {
+        // Al abrir el panel se vuelve a mirar qué pantalla controla el brillo.
+        let opened = commands.iter().any(|c| matches!(c, Command::Refresh));
+        if opened {
             display = Display::find(wmi.as_ref());
         }
         if let Some(value) = last_brightness {
             display.set(wmi.as_ref(), value);
         }
         // Tras mover el brillo no hace falta releerlo todo: el panel ya muestra el valor.
-        if !refresh {
+        if !opened && !reread {
             continue;
         }
         let (wifi, bluetooth) = radios();
@@ -99,6 +157,7 @@ fn run(receiver: Receiver<Command>, shared: Arc<Mutex<Snapshot>>, target: isize,
             bluetooth,
             brightness: display.get(wmi.as_ref()),
             network: unsafe { network_name() },
+            networks: wlan.as_ref().and_then(Wlan::networks),
         };
         if let Ok(mut shared) = shared.lock() {
             *shared = snapshot;
