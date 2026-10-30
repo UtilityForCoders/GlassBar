@@ -1,5 +1,9 @@
 //! Tecla Windows: pulsada sola abre el lanzador de GlassBar en lugar del Inicio
 //! nativo; las combinaciones (Win+E, Win+D, Win+L…) siguen llegando a Windows.
+//!
+//! El filtro vive en un hilo propio que no hace nada más. Si Windows tiene que
+//! esperar a un filtro de teclado ocupado, deja pasar la tecla (y se abre su
+//! Inicio) y, si pasa varias veces, lo quita sin avisar.
 use std::sync::atomic::{AtomicBool, AtomicIsize, AtomicU32, Ordering};
 use windows::Win32::Foundation::{HWND, LPARAM, LRESULT, WPARAM};
 use windows::Win32::System::LibraryLoader::GetModuleHandleW;
@@ -8,8 +12,9 @@ use windows::Win32::UI::Input::KeyboardAndMouse::{
     KEYEVENTF_EXTENDEDKEY, KEYEVENTF_KEYUP, VIRTUAL_KEY, VK_LWIN, VK_RWIN,
 };
 use windows::Win32::UI::WindowsAndMessaging::{
-    CallNextHookEx, PostMessageW, SetWindowsHookExW, UnhookWindowsHookEx, HC_ACTION, HHOOK,
-    KBDLLHOOKSTRUCT, LLKHF_INJECTED, WH_KEYBOARD_LL, WM_KEYDOWN, WM_SYSKEYDOWN,
+    CallNextHookEx, GetMessageW, PostMessageW, PostThreadMessageW, SetWindowsHookExW,
+    UnhookWindowsHookEx, HC_ACTION, KBDLLHOOKSTRUCT, LLKHF_INJECTED, MSG, WH_KEYBOARD_LL,
+    WM_KEYDOWN, WM_QUIT, WM_SYSKEYDOWN,
 };
 
 /// Tecla sin asignar que Windows ignora; intercalada antes de soltar Win, hace que
@@ -22,24 +27,45 @@ static WIN_DOWN: AtomicBool = AtomicBool::new(false);
 static COMBO: AtomicBool = AtomicBool::new(false);
 
 pub struct WinKey {
-    hook: HHOOK,
+    /// Hilo del filtro, para pedirle que termine.
+    thread: u32,
+    handle: Option<std::thread::JoinHandle<()>>,
 }
 impl WinKey {
     /// Publica `message` en `target` cada vez que se pulsa y suelta Win sola.
     pub fn install(target: HWND, message: u32) -> Option<Self> {
         TARGET.store(target.0 as isize, Ordering::Relaxed);
         MESSAGE.store(message, Ordering::Relaxed);
-        let module = unsafe { GetModuleHandleW(None) }.ok()?;
-        let hook =
-            unsafe { SetWindowsHookExW(WH_KEYBOARD_LL, Some(on_key), Some(module.into()), 0) }
-                .ok()?;
-        Some(Self { hook })
+        let (ready, installed) = std::sync::mpsc::channel();
+        let handle = std::thread::spawn(move || unsafe {
+            let module = GetModuleHandleW(None).ok();
+            let hook = module.and_then(|m| {
+                SetWindowsHookExW(WH_KEYBOARD_LL, Some(on_key), Some(m.into()), 0).ok()
+            });
+            let thread = windows::Win32::System::Threading::GetCurrentThreadId();
+            let _ = ready.send(hook.map(|_| thread));
+            let Some(hook) = hook else {
+                return;
+            };
+            // Windows llama al filtro desde el bucle de mensajes de este hilo.
+            let mut msg = MSG::default();
+            while GetMessageW(&mut msg, None, 0, 0).as_bool() {}
+            let _ = UnhookWindowsHookEx(hook);
+        });
+        let thread = installed.recv().ok().flatten()?;
+        Some(Self {
+            thread,
+            handle: Some(handle),
+        })
     }
 }
 impl Drop for WinKey {
     fn drop(&mut self) {
         unsafe {
-            let _ = UnhookWindowsHookEx(self.hook);
+            let _ = PostThreadMessageW(self.thread, WM_QUIT, WPARAM(0), LPARAM(0));
+        }
+        if let Some(handle) = self.handle.take() {
+            let _ = handle.join();
         }
     }
 }
