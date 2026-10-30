@@ -14,6 +14,7 @@ mod bluetooth;
 mod catalog;
 mod clock;
 mod font;
+mod frames;
 mod glass;
 mod guard;
 mod icons;
@@ -86,8 +87,6 @@ const TIMER_TICK: usize = 2;
 const TIMER_EDGE: usize = 3;
 const TIMER_TIP: usize = 4;
 
-/// ~60 FPS durante animaciones físicas (16 ms). En reposo el timer se apaga (0% CPU).
-const FRAME_MS: u32 = 16;
 /// Refresco del reloj y verificación de apps activas.
 const TICK_MS: u32 = 1000;
 /// Verificación de proximidad del cursor al borde inferior para auto-hide inmediato (60 ms).
@@ -423,9 +422,9 @@ fn present_popup(
     let running = transition.running(now);
     unsafe {
         if running || animating {
-            let _ = SetTimer(Some(hwnd), TIMER_ANIM, FRAME_MS, None);
+            frames::start(hwnd);
         } else {
-            let _ = KillTimer(Some(hwnd), TIMER_ANIM);
+            frames::stop(hwnd);
         }
         if !visible && !running {
             let _ = ShowWindow(hwnd, SW_HIDE);
@@ -1753,24 +1752,20 @@ impl App {
         self.update_position();
     }
 
-    /// Enciende el temporizador de 60 fps
+    /// Empieza a recibir un fotograma por refresco de la pantalla (ver `frames`).
     fn start_animating(&mut self) {
         if !self.animating {
             self.animating = true;
             self.last_tick = Instant::now();
-            unsafe {
-                let _ = SetTimer(Some(self.hwnd), TIMER_ANIM, FRAME_MS, None);
-            }
+            frames::start(self.hwnd);
         }
     }
 
-    /// Apaga el temporizador de 60 fps cuando los resortes se asientan (0% CPU)
+    /// Deja de recibir fotogramas cuando los resortes se asientan (0% CPU).
     fn stop_animating(&mut self) {
         if self.animating {
             self.animating = false;
-            unsafe {
-                let _ = KillTimer(Some(self.hwnd), TIMER_ANIM);
-            }
+            frames::stop(self.hwnd);
         }
     }
 }
@@ -2885,6 +2880,9 @@ fn main() -> Result<()> {
         // Antes de ocultar la barra nativa: si este proceso muere, el vigilante la devuelve.
         guard::spawn();
 
+        // Fotogramas de las animaciones al ritmo de la pantalla.
+        frames::init(TIMER_ANIM);
+
         // Modo Per-Monitor DPI Aware v2
         let _ = SetProcessDpiAwarenessContext(DPI_AWARENESS_CONTEXT_PER_MONITOR_AWARE_V2);
 
@@ -3000,6 +2998,7 @@ fn main() -> Result<()> {
 
         let mut msg = MSG::default();
         while GetMessageW(&mut msg, None, 0, 0).as_bool() {
+            frames::delivered(msg.hwnd, msg.message, msg.wParam.0);
             let _ = TranslateMessage(&msg);
             DispatchMessageW(&msg);
         }
