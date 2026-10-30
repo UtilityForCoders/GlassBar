@@ -4,6 +4,7 @@
 //! Barra de tareas moderna ultra-transparente estilo Windows 11 Glass para Windows, ultraligera en Rust.
 //! Comportamiento auto-hide nativo (sale suavemente desde abajo al acercar el mouse) y estética translúcida.
 
+mod accent;
 mod apps;
 mod audio;
 mod autohide;
@@ -72,6 +73,8 @@ const WM_MOUSELEAVE: u32 = 0x02A3;
 const WM_SHOW_LAUNCHER: u32 = windows::Win32::UI::WindowsAndMessaging::WM_APP + 2;
 /// Cambió la ventana activa: el dock comprueba si debe ponerse encima o apartarse.
 const WM_FOREGROUND: u32 = windows::Win32::UI::WindowsAndMessaging::WM_APP + 3;
+/// DWM avisa de que cambió el color de énfasis o de las ventanas.
+const WM_DWMCOLORIZATIONCOLORCHANGED: u32 = 0x0320;
 /// El hilo de sistema terminó de leer Wi-Fi, Bluetooth, brillo y red.
 const WM_QUICK_UPDATE: u32 = windows::Win32::UI::WindowsAndMessaging::WM_APP + 4;
 
@@ -1755,6 +1758,23 @@ impl App {
 
 unsafe extern "system" fn wndproc(hwnd: HWND, msg: u32, wparam: WPARAM, lparam: LPARAM) -> LRESULT {
     match msg {
+        // Cambió el color de énfasis (Windows avisa con estos dos mensajes, también
+        // por otros ajustes): se vuelve a leer y, si es otro, se redibuja lo abierto.
+        windows::Win32::UI::WindowsAndMessaging::WM_SETTINGCHANGE
+        | WM_DWMCOLORIZATIONCOLORCHANGED => {
+            with_app(|app| {
+                if accent::refresh() {
+                    app.render();
+                    if let Some(panel) = app.quick.as_mut().filter(|p| p.visible) {
+                        panel.render();
+                    }
+                    if let Some(menu) = app.launcher.as_mut().filter(|m| m.visible) {
+                        menu.render();
+                    }
+                }
+            });
+            DefWindowProcW(hwnd, msg, wparam, lparam)
+        }
         WM_FOREGROUND => {
             with_app(|app| {
                 app.check_priority(true);

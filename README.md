@@ -56,7 +56,7 @@ Un clic en el grupo abre el panel rápido de GlassBar justo encima, con el estil
 - **Salida de audio:** la flecha **›** junto al volumen abre la lista de salidas (altavoces, auriculares…), con la predeterminada marcada; un clic la cambia. Debajo aparecen las aplicaciones que están usando el audio, con su icono y la salida que usan; un clic despliega las salidas para elegir otra o volver a la predeterminada, y Windows lo recuerda para la próxima vez. Windows no ofrece una API pública para esto: GlassBar usa las interfaces internas de su configuración de sonido (`IPolicyConfig` y `AudioPolicyConfig`, Windows 10 1803 o posterior), como EarTrumpet. Si no están, la lista lo indica. **Más configuración de sonido** abre "Volumen y dispositivos de aplicaciones".
 - **Pie:** nivel de batería (si la hay) y **Más opciones**, que abre el panel de Windows para lo demás.
 
-Las barras se arrastran o se mueven con la rueda de 2 % en 2 %. Leer y cambiar las radios y el brillo puede tardar, así que se hace en un hilo aparte y el panel no se bloquea. Escape o un clic fuera lo cierran.
+Los botones activos, las barras, la línea del campo de contraseña y las selecciones de texto usan el color de énfasis de Windows (Configuración → Personalización → Colores), con los mismos tonos que Windows usa en modo oscuro: el oscuro para los botones activos y el claro para barras y selecciones. Si se cambia el color, GlassBar lo aplica al momento. Las barras se arrastran o se mueven con la rueda de 2 % en 2 %. Leer y cambiar las radios y el brillo puede tardar, así que se hace en un hilo aparte y el panel no se bloquea. Escape o un clic fuera lo cierran.
 
 ## Tecla Windows
 

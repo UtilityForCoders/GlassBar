@@ -4,6 +4,8 @@ use std::fs::File;
 use std::io::Write;
 use tiny_skia::Pixmap;
 
+#[path = "../src/accent.rs"]
+mod accent;
 #[path = "../src/apps.rs"]
 mod apps;
 #[path = "../src/bar.rs"]

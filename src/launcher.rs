@@ -617,7 +617,7 @@ impl LauncherState {
                 let left = width_to(start) - offset + scale;
                 fill_rounded(
                     &mut layer,
-                    [76, 160, 255, 110],
+                    crate::accent::with_alpha(crate::accent::current().light, 110),
                     left,
                     line_top,
                     width_to(end) - offset + scale - left,
