@@ -377,7 +377,7 @@ unsafe extern "system" fn find_hosted_process(child: HWND, lparam: LPARAM) -> BO
 }
 
 /// Ruta del ejecutable y, si es una app empaquetada, su AppUserModelID.
-fn process_info(pid: u32) -> Option<(String, Option<String>)> {
+pub fn process_info(pid: u32) -> Option<(String, Option<String>)> {
     use windows::Win32::Storage::Packaging::Appx::GetApplicationUserModelId;
     if pid == 0 {
         return None;

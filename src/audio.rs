@@ -24,7 +24,8 @@ pub struct Output {
 #[derive(Clone, Debug, PartialEq)]
 pub struct App {
     pub name: String,
-    /// Ruta del ejecutable: identifica a la aplicación aunque tenga varios procesos.
+    /// Identifica a la aplicación aunque tenga varios procesos: su AppUserModelID si
+    /// es de la Microsoft Store, o la ruta de su ejecutable.
     pub path: String,
     pub pids: Vec<u32>,
     /// Salida elegida para ella; `None` si usa la predeterminada.
@@ -86,32 +87,42 @@ pub fn read(icons: &mut std::collections::HashMap<String, Option<Pixmap>>) -> Mi
         };
         let (outputs, default) = outputs(&enumerator);
         let policy = Policy::open();
+        let parents = processes();
         let mut apps: Vec<App> = Vec::new();
         for output in &outputs {
             for pid in session_processes(&enumerator, &output.id) {
-                let Some(path) = process_path(pid) else {
+                // El audio de WebView2 se atribuye a la aplicación que lo usa.
+                let owner = owner(pid, &parents);
+                let Some((exe, app_id)) = crate::apps::process_info(owner) else {
                     continue;
                 };
-                if let Some(app) = apps.iter_mut().find(|a| a.path == path) {
+                // Las apps de la Store se reconocen por su paquete, no por su .exe.
+                let shell = app_id.map(|id| format!("shell:AppsFolder\\{id}"));
+                let key = shell.clone().unwrap_or_else(|| exe.clone());
+                if let Some(app) = apps.iter_mut().find(|a| a.path == key) {
                     if !app.pids.contains(&pid) {
                         app.pids.push(pid);
                     }
                     continue;
                 }
-                let name = crate::apps::file_description(&path).unwrap_or_else(|| {
-                    let file = path.rsplit('\\').next().unwrap_or(&path);
-                    file.strip_suffix(".exe").unwrap_or(file).to_string()
-                });
+                let name = shell
+                    .as_deref()
+                    .and_then(crate::icons::display_name)
+                    .or_else(|| crate::apps::file_description(&exe))
+                    .unwrap_or_else(|| {
+                        let file = exe.rsplit('\\').next().unwrap_or(&exe);
+                        file.strip_suffix(".exe").unwrap_or(file).to_string()
+                    });
                 let icon = icons
-                    .entry(path.clone())
+                    .entry(key.clone())
                     .or_insert_with(|| {
-                        crate::icons::load(&path).map(|i| crate::apps::downscale(&i, 48))
+                        crate::icons::load(&key).map(|i| crate::apps::downscale(&i, 48))
                     })
                     .clone();
                 apps.push(App {
                     name,
                     output: policy.as_ref().and_then(|p| p.get(pid)),
-                    path,
+                    path: key,
                     pids: vec![pid],
                     icon,
                 });
@@ -168,25 +179,62 @@ unsafe fn session_processes(enumerator: &IMMDeviceEnumerator, id: &str) -> Vec<u
     pids
 }
 
-/// Ruta completa del ejecutable de un proceso.
-unsafe fn process_path(pid: u32) -> Option<String> {
+/// Padre y nombre del ejecutable de cada proceso en marcha.
+fn processes() -> std::collections::HashMap<u32, (u32, String)> {
     use windows::Win32::Foundation::CloseHandle;
-    use windows::Win32::System::Threading::{
-        OpenProcess, QueryFullProcessImageNameW, PROCESS_NAME_WIN32,
-        PROCESS_QUERY_LIMITED_INFORMATION,
+    use windows::Win32::System::Diagnostics::ToolHelp::{
+        CreateToolhelp32Snapshot, Process32FirstW, Process32NextW, PROCESSENTRY32W,
+        TH32CS_SNAPPROCESS,
     };
-    let process = OpenProcess(PROCESS_QUERY_LIMITED_INFORMATION, false, pid).ok()?;
-    let mut buffer = [0u16; 1024];
-    let mut len = buffer.len() as u32;
-    let result = QueryFullProcessImageNameW(
-        process,
-        PROCESS_NAME_WIN32,
-        windows::core::PWSTR(buffer.as_mut_ptr()),
-        &mut len,
-    );
-    let _ = CloseHandle(process);
-    result.ok()?;
-    Some(String::from_utf16_lossy(&buffer[..len as usize]))
+    let mut map = std::collections::HashMap::new();
+    unsafe {
+        let Ok(snapshot) = CreateToolhelp32Snapshot(TH32CS_SNAPPROCESS, 0) else {
+            return map;
+        };
+        let mut entry = PROCESSENTRY32W {
+            dwSize: std::mem::size_of::<PROCESSENTRY32W>() as u32,
+            ..Default::default()
+        };
+        let mut more = Process32FirstW(snapshot, &mut entry).is_ok();
+        while more {
+            let end = entry.szExeFile.iter().position(|&c| c == 0).unwrap_or(0);
+            let name = String::from_utf16_lossy(&entry.szExeFile[..end]);
+            map.insert(entry.th32ProcessID, (entry.th32ParentProcessID, name));
+            more = Process32NextW(snapshot, &mut entry).is_ok();
+        }
+        let _ = CloseHandle(snapshot);
+    }
+    map
+}
+
+/// Proceso al que se atribuye el audio de `pid`: si es de WebView2 (el componente
+/// con el que apps como WhatsApp o Teams muestran contenido web), la aplicación que
+/// lo abrió, subiendo por sus padres; si no, el propio proceso.
+fn owner(pid: u32, processes: &std::collections::HashMap<u32, (u32, String)>) -> u32 {
+    let is_webview = |pid: u32| {
+        processes
+            .get(&pid)
+            .is_some_and(|(_, n)| n.eq_ignore_ascii_case("msedgewebview2.exe"))
+    };
+    let mut current = pid;
+    // Pocos niveles: proceso de audio → navegador de WebView2 → aplicación.
+    for _ in 0..8 {
+        if !is_webview(current) {
+            return current;
+        }
+        match processes.get(&current) {
+            Some(&(parent, _)) if parent != 0 && processes.contains_key(&parent) => {
+                current = parent
+            }
+            _ => break,
+        }
+    }
+    // Si la aplicación ya no está, queda el propio WebView2.
+    if is_webview(current) {
+        pid
+    } else {
+        current
+    }
 }
 
 /// Cambia la salida predeterminada (para música y vídeo y para el resto, como hace
@@ -332,5 +380,26 @@ mod tests {
         assert_eq!(output_id(&policy).as_deref(), Some(id));
         // Vacío: la aplicación usa la salida predeterminada.
         assert_eq!(output_id(""), None);
+    }
+
+    #[test]
+    fn webview2_audio_belongs_to_the_app_that_opened_it() {
+        let processes: std::collections::HashMap<u32, (u32, String)> = [
+            (10, (1, "explorer.exe")),
+            (20, (10, "WhatsApp.Root.exe")),
+            (21, (20, "msedgewebview2.exe")),
+            (22, (21, "msedgewebview2.exe")),
+            (30, (10, "Spotify.exe")),
+            // WebView2 cuyo padre ya terminó.
+            (40, (99, "msedgewebview2.exe")),
+        ]
+        .into_iter()
+        .map(|(pid, (parent, name))| (pid, (parent, name.to_string())))
+        .collect();
+        assert_eq!(owner(22, &processes), 20);
+        assert_eq!(owner(21, &processes), 20);
+        assert_eq!(owner(30, &processes), 30);
+        assert_eq!(owner(40, &processes), 40);
+        assert_eq!(owner(77, &processes), 77);
     }
 }
