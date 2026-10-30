@@ -1,6 +1,6 @@
 //! Redes Wi-Fi cercanas mediante la API WLAN de Windows: buscarlas, conectarse a las
-//! guardadas y desconectarse. Las redes nuevas (sin perfil guardado) necesitan
-//! contraseña y por ahora se configuran en el panel de Windows.
+//! guardadas o a redes nuevas (creando su perfil con la contraseña) y desconectarse.
+//! Las redes de empresa (con usuario) y las WEP se siguen configurando en Windows.
 use windows::core::{GUID, PCWSTR};
 use windows::Win32::Foundation::HANDLE;
 use windows::Win32::NetworkManagement::WiFi::*;
@@ -14,6 +14,91 @@ pub struct Network {
     pub signal: u8,
     pub secured: bool,
     pub connected: bool,
+    /// Cómo crear su perfil para conectarse por primera vez; `None` si el panel no
+    /// sabe hacerlo (redes de empresa, WEP).
+    pub security: Option<Security>,
+}
+
+/// Seguridad de una red, con lo que hace falta para escribir su perfil.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum Security {
+    Open,
+    WpaPersonal { tkip: bool },
+    Wpa2Personal { tkip: bool },
+    Wpa3Personal,
+}
+impl Security {
+    fn from_algorithms(auth: i32, cipher: i32) -> Option<Self> {
+        // Valores de DOT11_AUTH_ALGORITHM y DOT11_CIPHER_ALGORITHM.
+        let tkip = cipher == 2;
+        match auth {
+            1 if cipher == 0 => Some(Self::Open),
+            4 => Some(Self::WpaPersonal { tkip }),
+            7 => Some(Self::Wpa2Personal { tkip }),
+            9 => Some(Self::Wpa3Personal),
+            _ => None,
+        }
+    }
+    pub fn needs_password(self) -> bool {
+        self != Self::Open
+    }
+}
+
+/// La contraseña de una red WPA: de 8 a 63 caracteres, o la clave de 64 cifras
+/// hexadecimales. Devuelve el motivo si no vale.
+pub fn check_password(password: &str) -> Result<(), &'static str> {
+    let len = password.chars().count();
+    let hex_key = len == 64 && password.chars().all(|c| c.is_ascii_hexdigit());
+    if !hex_key && !(8..=63).contains(&len) {
+        return Err("La contraseña debe tener entre 8 y 63 caracteres");
+    }
+    Ok(())
+}
+
+/// Escapa el texto para el XML del perfil (nombre de red y contraseña).
+fn escape(text: &str) -> String {
+    text.replace('&', "&amp;")
+        .replace('<', "&lt;")
+        .replace('>', "&gt;")
+        .replace('"', "&quot;")
+        .replace('\'', "&apos;")
+}
+
+/// Perfil WLAN de una red nueva, en el formato que guarda Windows. El nombre de la
+/// red va también en hexadecimal para que no dependa de su codificación.
+pub fn profile_xml(ssid: &str, security: Security, password: &str) -> String {
+    let hex: String = ssid.bytes().map(|b| format!("{b:02X}")).collect();
+    let (authentication, encryption) = match security {
+        Security::Open => ("open", "none"),
+        Security::WpaPersonal { tkip } => ("WPAPSK", if tkip { "TKIP" } else { "AES" }),
+        Security::Wpa2Personal { tkip } => ("WPA2PSK", if tkip { "TKIP" } else { "AES" }),
+        Security::Wpa3Personal => ("WPA3SAE", "AES"),
+    };
+    let key = if security.needs_password() {
+        let kind = if password.chars().count() == 64 {
+            "networkKey"
+        } else {
+            "passPhrase"
+        };
+        format!(
+            "<sharedKey><keyType>{kind}</keyType><protected>false</protected>\
+             <keyMaterial>{}</keyMaterial></sharedKey>",
+            escape(password)
+        )
+    } else {
+        String::new()
+    };
+    format!(
+        "<?xml version=\"1.0\"?>\
+         <WLANProfile xmlns=\"http://www.microsoft.com/networking/WLAN/profile/v1\">\
+         <name>{name}</name>\
+         <SSIDConfig><SSID><hex>{hex}</hex><name>{name}</name></SSID></SSIDConfig>\
+         <connectionType>ESS</connectionType><connectionMode>auto</connectionMode>\
+         <MSM><security><authEncryption><authentication>{authentication}</authentication>\
+         <encryption>{encryption}</encryption><useOneX>false</useOneX></authEncryption>\
+         {key}</security></MSM></WLANProfile>",
+        name = escape(ssid),
+    )
 }
 
 /// Une las entradas de una misma red (Windows la repite: una con su perfil guardado
@@ -108,6 +193,10 @@ impl Wlan {
                         signal: n.wlanSignalQuality.min(100) as u8,
                         secured: n.bSecurityEnabled.as_bool(),
                         connected: n.dwFlags & WLAN_AVAILABLE_NETWORK_CONNECTED != 0,
+                        security: Security::from_algorithms(
+                            n.dot11DefaultAuthAlgorithm.0,
+                            n.dot11DefaultCipherAlgorithm.0,
+                        ),
                     }
                 })
                 .collect();
@@ -132,6 +221,45 @@ impl Wlan {
         };
         unsafe {
             let _ = WlanConnect(self.handle, &guid, &parameters, None);
+        }
+    }
+
+    /// Guarda el perfil de una red nueva con su contraseña y se conecta con él.
+    /// Devuelve el nombre del perfil, o `None` si Windows no lo aceptó.
+    pub fn join(&self, ssid: &str, security: Security, password: &str) -> Option<String> {
+        let guid = self.interface()?;
+        let xml: Vec<u16> = profile_xml(ssid, security, password)
+            .encode_utf16()
+            .chain(std::iter::once(0))
+            .collect();
+        let mut reason = 0;
+        let result = unsafe {
+            WlanSetProfile(
+                self.handle,
+                &guid,
+                0,
+                PCWSTR(xml.as_ptr()),
+                PCWSTR::null(),
+                true,
+                None,
+                &mut reason,
+            )
+        };
+        if result != 0 {
+            return None;
+        }
+        self.connect(ssid);
+        Some(ssid.to_string())
+    }
+
+    /// Borra un perfil guardado (el de una red nueva cuya contraseña no funcionó).
+    pub fn forget(&self, profile: &str) {
+        let Some(guid) = self.interface() else {
+            return;
+        };
+        let name: Vec<u16> = profile.encode_utf16().chain(std::iter::once(0)).collect();
+        unsafe {
+            let _ = WlanDeleteProfile(self.handle, &guid, PCWSTR(name.as_ptr()), None);
         }
     }
 
@@ -162,6 +290,7 @@ mod tests {
             signal,
             secured: true,
             connected,
+            security: Some(Security::Wpa2Personal { tkip: false }),
         }
     }
 
@@ -181,5 +310,51 @@ mod tests {
         assert_eq!(merged[0].signal, 60);
         assert!(merged[0].connected);
         assert_eq!(merged[2].profile, None);
+    }
+
+    #[test]
+    fn security_and_password_rules_follow_windows() {
+        assert_eq!(Security::from_algorithms(1, 0), Some(Security::Open));
+        assert_eq!(
+            Security::from_algorithms(7, 4),
+            Some(Security::Wpa2Personal { tkip: false })
+        );
+        assert_eq!(
+            Security::from_algorithms(9, 4),
+            Some(Security::Wpa3Personal)
+        );
+        // Empresa (802.1X) y WEP se configuran en Windows.
+        assert_eq!(Security::from_algorithms(6, 4), None);
+        assert_eq!(Security::from_algorithms(1, 257), None);
+
+        assert!(check_password("corta").is_err());
+        assert!(check_password("ocho1234").is_ok());
+        assert!(check_password(&"a".repeat(63)).is_ok());
+        assert!(check_password(&"a".repeat(65)).is_err());
+        assert!(check_password(&"ab".repeat(32)).is_ok());
+        assert!(check_password(&"zz".repeat(32)).is_err());
+    }
+
+    #[test]
+    fn profile_xml_escapes_and_matches_the_security() {
+        let xml = profile_xml(
+            "Café & <Té>",
+            Security::Wpa2Personal { tkip: false },
+            "p\"ass<word>",
+        );
+        assert!(xml.contains("<name>Café &amp; &lt;Té&gt;</name>"));
+        // "Café" en UTF-8 lleva la "é" como C3 A9.
+        assert!(xml.contains("<hex>436166C3A92026203C54C3A93E</hex>"));
+        assert!(xml.contains("<authentication>WPA2PSK</authentication>"));
+        assert!(xml.contains("<encryption>AES</encryption>"));
+        assert!(xml.contains("<keyType>passPhrase</keyType>"));
+        assert!(xml.contains("<keyMaterial>p&quot;ass&lt;word&gt;</keyMaterial>"));
+
+        let open = profile_xml("Biblioteca", Security::Open, "");
+        assert!(open.contains("<authentication>open</authentication>"));
+        assert!(!open.contains("sharedKey"));
+        let wpa3 = profile_xml("Casa", Security::Wpa3Personal, &"ab".repeat(32));
+        assert!(wpa3.contains("<authentication>WPA3SAE</authentication>"));
+        assert!(wpa3.contains("<keyType>networkKey</keyType>"));
     }
 }

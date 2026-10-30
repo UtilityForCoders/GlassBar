@@ -8,6 +8,7 @@ mod apps;
 mod autohide;
 mod autostart;
 mod bar;
+mod bluetooth;
 mod catalog;
 mod clock;
 mod glass;
@@ -563,6 +564,7 @@ impl QuickWindow {
         let anchor_bottom = self.pos.y + self.surface.height as i32;
         self.set_view(quick::View::Main);
         self.pos.y = anchor_bottom - self.surface.height as i32;
+        self.model.join = None;
         // Lo último conocido mientras el hilo de sistema vuelve a leerlo.
         self.model.system = self.backend.snapshot();
         self.backend.refresh();
@@ -615,7 +617,7 @@ unsafe extern "system" fn quick_wndproc(
     lparam: LPARAM,
 ) -> LRESULT {
     use windows::Win32::UI::WindowsAndMessaging::{
-        WA_INACTIVE, WM_ACTIVATE, WM_CAPTURECHANGED, WM_CLOSE, WM_KEYDOWN, WM_MOUSEWHEEL,
+        WA_INACTIVE, WM_ACTIVATE, WM_CAPTURECHANGED, WM_CHAR, WM_CLOSE, WM_KEYDOWN, WM_MOUSEWHEEL,
     };
     // Coordenadas lógicas del panel a partir de las del mensaje.
     let point = |scale: f32| {
@@ -733,46 +735,94 @@ unsafe extern "system" fn quick_wndproc(
                         panel.hide();
                         status::open_quick_settings();
                     }
-                    Some(quick::Hit::WifiList) => {
-                        panel.set_view(quick::View::Wifi);
-                        panel.backend.scan();
+                    Some(quick::Hit::List(radio)) => {
+                        panel.set_view(quick::View::List(radio));
+                        if radio == system::Radio::Wifi {
+                            panel.backend.scan();
+                        } else {
+                            panel.backend.refresh();
+                        }
                         panel.render();
                     }
                     Some(quick::Hit::Back) => {
+                        panel.model.join = None;
                         panel.set_view(quick::View::Main);
                         panel.render();
                     }
-                    Some(quick::Hit::Network(index)) => {
-                        let Some(network) = panel.model.networks().get(index).cloned() else {
-                            return;
+                    Some(quick::Hit::Row(index)) => {
+                        let open = |uri: &str| {
+                            let _ = std::process::Command::new("explorer.exe").arg(uri).spawn();
                         };
-                        let pending = |connect| quick::Pending {
-                            ssid: network.ssid.clone(),
+                        let pending = |key: String, connect| quick::Pending {
+                            key,
                             connect,
                             since: Instant::now(),
                         };
+                        if panel.model.view == quick::View::List(system::Radio::Bluetooth) {
+                            let Some(device) = panel.model.devices().get(index).cloned() else {
+                                return;
+                            };
+                            if device.audio {
+                                let connect = !device.connected;
+                                panel.model.pending =
+                                    Some(pending(device.address.to_string(), connect));
+                                panel.backend.set_bluetooth_audio(device.address, connect);
+                            } else {
+                                // Ratones, teclados… se conectan solos al encenderlos.
+                                panel.hide();
+                                open("ms-settings:bluetooth");
+                                return;
+                            }
+                            panel.render();
+                            return;
+                        }
+                        let Some(network) = panel.model.networks().get(index).cloned() else {
+                            return;
+                        };
                         if network.connected {
-                            panel.model.pending = Some(pending(false));
+                            panel.model.pending = Some(pending(network.ssid.clone(), false));
                             panel.backend.disconnect();
                         } else if let Some(profile) = network.profile.clone() {
-                            panel.model.pending = Some(pending(true));
+                            panel.model.pending = Some(pending(network.ssid.clone(), true));
                             panel.backend.connect(profile);
+                        } else if network.security == Some(wifi::Security::Open) {
+                            // Red abierta: se conecta directamente, sin contraseña.
+                            panel.model.toggle_join(index);
+                            if let Some((ssid, security, password)) =
+                                panel.model.take_join(Instant::now())
+                            {
+                                panel.backend.join(ssid, security, password);
+                            }
+                        } else if network.security.is_some() {
+                            panel.model.toggle_join(index);
                         } else {
-                            // Red nueva: pide contraseña, así que se usa la lista de
-                            // Windows hasta que el panel tenga un campo para escribirla.
+                            // Redes de empresa (con usuario) o WEP: en la lista de Windows.
                             panel.hide();
-                            let _ = std::process::Command::new("explorer.exe")
-                                .arg("ms-availablenetworks:")
-                                .spawn();
+                            open("ms-availablenetworks:");
                             return;
                         }
                         panel.render();
                     }
-                    Some(quick::Hit::WifiSettings) => {
+                    Some(quick::Hit::JoinConfirm) => {
+                        if let Some((ssid, security, password)) =
+                            panel.model.take_join(Instant::now())
+                        {
+                            panel.backend.join(ssid, security, password);
+                        }
+                        panel.render();
+                    }
+                    Some(quick::Hit::JoinCancel) => {
+                        panel.model.join = None;
+                        panel.model.scroll_list(0.0);
+                        panel.render();
+                    }
+                    Some(quick::Hit::Settings) => {
+                        let uri = match panel.model.view {
+                            quick::View::List(system::Radio::Bluetooth) => "ms-settings:bluetooth",
+                            _ => "ms-settings:network-wifi",
+                        };
                         panel.hide();
-                        let _ = std::process::Command::new("explorer.exe")
-                            .arg("ms-settings:network-wifi")
-                            .spawn();
+                        let _ = std::process::Command::new("explorer.exe").arg(uri).spawn();
                     }
                     _ => {}
                 }
@@ -785,8 +835,8 @@ unsafe extern "system" fn quick_wndproc(
                     return;
                 };
                 let steps = ((wparam.0 >> 16) & 0xffff) as i16 as f32 / 120.0;
-                // En la lista de redes, la rueda la desplaza (algo más de una red por muesca).
-                if panel.model.view == quick::View::Wifi {
+                // En las listas, la rueda las desplaza (algo más de una fila por muesca).
+                if matches!(panel.model.view, quick::View::List(_)) {
                     panel.model.scroll_list(-steps * 60.0);
                     let (x, y) = {
                         let mut cursor = POINT::default();
@@ -811,8 +861,73 @@ unsafe extern "system" fn quick_wndproc(
                 }
             });
         }
-        WM_KEYDOWN if wparam.0 == 0x1B => {
-            with_app(|app| app.quick.as_mut().map(QuickWindow::hide));
+        // Con el formulario de una red nueva abierto, el teclado escribe la contraseña.
+        WM_CHAR => {
+            with_app(|app| {
+                let Some(panel) = app.quick.as_mut().filter(|p| p.visible) else {
+                    return;
+                };
+                let Some(join) = &mut panel.model.join else {
+                    return;
+                };
+                if let Some(ch) = char::from_u32(wparam.0 as u32).filter(|c| !c.is_control()) {
+                    join.field.insert(&ch.to_string());
+                    join.error = None;
+                    panel.render();
+                }
+            });
+        }
+        WM_KEYDOWN => {
+            with_app(|app| {
+                let Some(panel) = app.quick.as_mut().filter(|p| p.visible) else {
+                    return;
+                };
+                let Some(join) = &mut panel.model.join else {
+                    // Sin formulario, Escape cierra el panel.
+                    if wparam.0 == 0x1B {
+                        panel.hide();
+                    }
+                    return;
+                };
+                use windows::Win32::UI::Input::KeyboardAndMouse::GetKeyState;
+                let ctrl = GetKeyState(0x11) < 0;
+                let shift = GetKeyState(0x10) < 0;
+                match wparam.0 {
+                    // Escape cierra el formulario; Enter se conecta (o muestra por qué no).
+                    0x1B => {
+                        panel.model.join = None;
+                        panel.model.scroll_list(0.0);
+                    }
+                    0x0D => {
+                        if let Some((ssid, security, password)) =
+                            panel.model.take_join(Instant::now())
+                        {
+                            panel.backend.join(ssid, security, password);
+                        }
+                    }
+                    // Al editar la contraseña se quita el aviso anterior.
+                    key => {
+                        match key {
+                            0x08 => join.field.backspace(ctrl),
+                            0x2E => join.field.delete(ctrl),
+                            0x25 => join.field.left(ctrl, shift),
+                            0x27 => join.field.right(ctrl, shift),
+                            0x24 => join.field.home(shift),
+                            0x23 => join.field.end(shift),
+                            0x41 if ctrl => join.field.select_all(),
+                            // Pegar sí; copiar o cortar una contraseña oculta, no.
+                            0x56 if ctrl => {
+                                if let Some(text) = clipboard_text(hwnd) {
+                                    join.field.insert(&text);
+                                }
+                            }
+                            _ => return,
+                        }
+                        join.error = None;
+                    }
+                }
+                panel.render();
+            });
         }
         _ => return DefWindowProcW(hwnd, msg, wparam, lparam),
     }

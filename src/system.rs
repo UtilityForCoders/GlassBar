@@ -1,8 +1,9 @@
 //! Ajustes del sistema para el panel rápido: Wi-Fi y Bluetooth (encender/apagar),
-//! redes Wi-Fi, brillo de la pantalla del dock y nombre de la red. Leerlos y
+//! redes Wi-Fi, dispositivos Bluetooth, brillo de la pantalla del dock y nombre de la red. Leerlos y
 //! cambiarlos puede tardar (WMI, radios, búsquedas), así que se hace en un hilo
 //! aparte que avisa al panel con un mensaje al terminar.
-use crate::wifi::{Network, Wlan};
+use crate::bluetooth::Device;
+use crate::wifi::{Network, Security, Wlan};
 use std::sync::mpsc::{channel, Receiver, RecvTimeoutError, Sender};
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
@@ -21,6 +22,11 @@ pub struct Snapshot {
     pub network: Option<String>,
     /// Redes Wi-Fi cercanas; `None` si el equipo no tiene adaptador Wi-Fi.
     pub networks: Option<Vec<Network>>,
+    /// Dispositivos Bluetooth emparejados.
+    pub devices: Vec<Device>,
+    /// Red nueva a la que no se pudo conectar (contraseña incorrecta o sin señal);
+    /// su perfil ya se borró.
+    pub join_failed: Option<String>,
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -38,7 +44,19 @@ enum Command {
     /// Conectarse con un perfil guardado.
     Connect(String),
     Disconnect,
+    /// Conectarse a una red nueva creando su perfil.
+    Join {
+        ssid: String,
+        security: Security,
+        password: String,
+    },
+    /// Conectar o desconectar el audio de un dispositivo Bluetooth.
+    BluetoothAudio(u64, bool),
 }
+
+/// Tiempo para que Windows confirme la conexión a una red nueva; si no lo hace, la
+/// contraseña no era la buena (o no hay señal) y su perfil se borra.
+const JOIN_FOR: Duration = Duration::from_secs(20);
 
 /// Tras buscar redes o conectarse, Windows tarda unos segundos en tener el resultado:
 /// se vuelve a leer pasado este tiempo, y una vez más si sigue cambiando.
@@ -79,6 +97,18 @@ impl Backend {
     pub fn disconnect(&self) {
         let _ = self.sender.send(Command::Disconnect);
     }
+    pub fn join(&self, ssid: String, security: Security, password: String) {
+        let _ = self.sender.send(Command::Join {
+            ssid,
+            security,
+            password,
+        });
+    }
+    pub fn set_bluetooth_audio(&self, address: u64, connected: bool) {
+        let _ = self
+            .sender
+            .send(Command::BluetoothAudio(address, connected));
+    }
 }
 
 fn run(receiver: Receiver<Command>, shared: Arc<Mutex<Snapshot>>, target: isize, message: u32) {
@@ -91,6 +121,9 @@ fn run(receiver: Receiver<Command>, shared: Arc<Mutex<Snapshot>>, target: isize,
     // cambió el monitor principal o se conectó otro.
     let mut display = Display::None;
     let wlan = Wlan::open();
+    // Red nueva a la espera de que Windows confirme la conexión, y hasta cuándo.
+    let mut joining: Option<(String, Instant)> = None;
+    let mut join_failed: Option<String> = None;
     // Cuántas lecturas quedan pendientes tras una búsqueda o conexión, y cuándo.
     let (mut rereads, mut reread_at) = (0, Instant::now());
     loop {
@@ -125,6 +158,31 @@ fn run(receiver: Receiver<Command>, shared: Arc<Mutex<Snapshot>>, target: isize,
                     set_radio(*radio, *on);
                     reread = true;
                 }
+                Command::Join {
+                    ssid,
+                    security,
+                    password,
+                } => {
+                    join_failed = None;
+                    match wlan
+                        .as_ref()
+                        .and_then(|w| w.join(ssid, *security, password))
+                    {
+                        Some(profile) => {
+                            joining = Some((profile, Instant::now() + JOIN_FOR));
+                            // Se relee cada 3 s hasta confirmarla o agotar el plazo.
+                            let reads = JOIN_FOR.as_secs() / SETTLE.as_secs() + 1;
+                            (rereads, reread_at) = (reads as i32, Instant::now() + SETTLE);
+                        }
+                        None => join_failed = Some(ssid.clone()),
+                    }
+                    reread = true;
+                }
+                Command::BluetoothAudio(address, connected) => {
+                    crate::bluetooth::set_audio_connected(*address, *connected);
+                    (rereads, reread_at) = (2, Instant::now() + SETTLE);
+                    reread = true;
+                }
                 Command::Scan | Command::Connect(_) | Command::Disconnect => {
                     if let Some(wlan) = &wlan {
                         match command {
@@ -152,12 +210,33 @@ fn run(receiver: Receiver<Command>, shared: Arc<Mutex<Snapshot>>, target: isize,
             continue;
         }
         let (wifi, bluetooth) = radios();
+        let networks = wlan.as_ref().and_then(Wlan::networks);
+        if let Some((ssid, deadline)) = &joining {
+            let connected = networks
+                .iter()
+                .flatten()
+                .any(|n| n.connected && n.profile.as_deref() == Some(ssid.as_str()));
+            if connected {
+                joining = None;
+            } else if Instant::now() >= *deadline {
+                if let Some(wlan) = &wlan {
+                    wlan.forget(ssid);
+                }
+                join_failed = joining.take().map(|(ssid, _)| ssid);
+            }
+        }
         let snapshot = Snapshot {
             wifi,
             bluetooth,
             brightness: display.get(wmi.as_ref()),
             network: unsafe { network_name() },
-            networks: wlan.as_ref().and_then(Wlan::networks),
+            networks,
+            devices: if bluetooth == Some(true) {
+                crate::bluetooth::devices()
+            } else {
+                Vec::new()
+            },
+            join_failed: join_failed.clone(),
         };
         if let Ok(mut shared) = shared.lock() {
             *shared = snapshot;
