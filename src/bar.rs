@@ -1,6 +1,6 @@
 //! Dock compacto: Inicio, programas anclados, estado del sistema y hora.
 use crate::apps::{default_apps, draw_app_icon, draw_windows_start_icon, AppItem};
-use crate::clock::{draw_icon, ClockRenderer};
+use crate::clock::{draw_icon_aligned, ClockRenderer};
 use crate::glass::{draw_hover, draw_running_dot, draw_transparent_dock};
 use crate::spring::Spring;
 use crate::status::{Item, Status};
@@ -18,7 +18,7 @@ const OVERFLOW_W: f32 = 30.0;
 /// Grupo de red, volumen y batería: margen a cada lado y ancho de cada icono.
 const STATUS_PAD: f32 = 6.0;
 const STATUS_STEP: f32 = 24.0;
-const STATUS_ICON: f32 = 15.0;
+const STATUS_ICON: f32 = 16.0;
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum HoverTarget {
@@ -339,7 +339,7 @@ impl BarState {
         }
         for (index, item) in self.status.items().into_iter().enumerate() {
             let (glyph, opacity) = self.status.glyph(item);
-            draw_icon(
+            draw_icon_aligned(
                 pixmap,
                 glyph,
                 self.status_center(index, scale),
