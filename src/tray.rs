@@ -1,6 +1,6 @@
 //! Ícono de GlassBar en la bandeja del sistema (System Tray) y menú contextual.
 
-use windows::core::{w, PCWSTR};
+use windows::core::{w, HSTRING, PCWSTR};
 use windows::Win32::Foundation::{HWND, POINT};
 use windows::Win32::System::LibraryLoader::GetModuleHandleW;
 use windows::Win32::UI::Shell::{
@@ -8,11 +8,13 @@ use windows::Win32::UI::Shell::{
 };
 use windows::Win32::UI::WindowsAndMessaging::{
     AppendMenuW, CreatePopupMenu, DestroyIcon, DestroyMenu, GetCursorPos, LoadIconW,
-    SetForegroundWindow, TrackPopupMenuEx, HICON, HMENU, IDI_APPLICATION, MF_DISABLED, MF_GRAYED,
-    MF_SEPARATOR, MF_STRING, TPM_BOTTOMALIGN, TPM_LEFTALIGN, TPM_RETURNCMD, WM_APP,
+    SetForegroundWindow, TrackPopupMenuEx, HICON, HMENU, IDI_APPLICATION, MF_CHECKED, MF_DISABLED,
+    MF_GRAYED, MF_POPUP, MF_SEPARATOR, MF_STRING, MF_UNCHECKED, TPM_BOTTOMALIGN, TPM_LEFTALIGN,
+    TPM_RETURNCMD, WM_APP,
 };
 
 use crate::autostart;
+use crate::style::{Appearance, Choice, State, Styles};
 
 pub const WM_TRAY: u32 = WM_APP + 1;
 const TRAY_ID: u32 = 101;
@@ -66,7 +68,7 @@ impl Tray {
     }
 
     /// Despliega el menú contextual de GlassBar y devuelve la opción elegida.
-    pub fn show_context_menu(&self) -> Option<u32> {
+    pub fn show_context_menu(&self, styles: &Styles) -> Option<u32> {
         unsafe {
             let menu: HMENU = CreatePopupMenu().ok()?;
 
@@ -77,6 +79,15 @@ impl Tray {
                 0,
                 w!("GlassBar v0.1.0 — Liquid Glass"),
             );
+            let _ = AppendMenuW(menu, MF_SEPARATOR, 0, None);
+
+            // Un submenú por situación con su apariencia, como en TranslucentTB.
+            for state in State::ALL {
+                if let Ok(submenu) = style_menu(styles, state) {
+                    let name = HSTRING::from(state.name());
+                    let _ = AppendMenuW(menu, MF_POPUP, submenu.0 as usize, PCWSTR(name.as_ptr()));
+                }
+            }
             let _ = AppendMenuW(menu, MF_SEPARATOR, 0, None);
 
             // Iniciar con Windows
@@ -114,6 +125,33 @@ impl Tray {
 
         (cmd.0 != 0).then_some(cmd.0 as u32)
     }
+}
+
+/// Submenú de una situación: si cuenta (el escritorio siempre) y su apariencia.
+unsafe fn style_menu(styles: &Styles, state: State) -> windows::core::Result<HMENU> {
+    let menu = CreatePopupMenu()?;
+    let look = styles.look(state);
+    let checked = |on: bool| if on { MF_CHECKED } else { MF_UNCHECKED };
+    if state != State::Desktop {
+        let _ = AppendMenuW(
+            menu,
+            MF_STRING | checked(look.enabled),
+            Choice::Toggle(state).command() as usize,
+            w!("Activado"),
+        );
+        let _ = AppendMenuW(menu, MF_SEPARATOR, 0, None);
+    }
+    for appearance in Appearance::ALL {
+        let name = HSTRING::from(appearance.name());
+        // Desactivada, sin marca: elegir una apariencia la activa.
+        let _ = AppendMenuW(
+            menu,
+            MF_STRING | checked(look.enabled && look.appearance == appearance),
+            Choice::Set(state, appearance).command() as usize,
+            PCWSTR(name.as_ptr()),
+        );
+    }
+    Ok(menu)
 }
 
 impl Drop for Tray {

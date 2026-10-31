@@ -31,6 +31,7 @@ mod quick;
 mod shell;
 mod spring;
 mod status;
+mod style;
 mod system;
 mod systray;
 mod textfield;
@@ -1375,6 +1376,12 @@ struct App {
     mouse_tracked: bool,
     /// Lee red, volumen y batería cada segundo.
     status: status::Reader,
+    /// Apariencia de cada situación (escritorio, ventana maximizada…).
+    styles: style::Styles,
+    /// Cuándo se miró la pantalla por última vez para elegir la apariencia.
+    scene_read: Instant,
+    /// Desenfoque de Windows aplicado ahora: apariencia y tamaño de la ventana.
+    backdrop: Option<(style::Appearance, u32, u32)>,
 }
 
 impl App {
@@ -1387,6 +1394,8 @@ impl App {
         let mut status_reader = status::Reader::new();
         bar.status = status_reader.read();
         bar.keyboard = keyboard::current();
+        let styles = style::Styles::load();
+        bar.appearance = styles.look(style::State::Desktop).appearance;
         let scale = scale.min((rc.right - rc.left) as f32 / (bar.dock_width() + 40.0));
         let (width, height) = bar.window_size(scale);
         let surface = Surface::new(width, height)?;
@@ -1445,7 +1454,54 @@ impl App {
             last_tick: Instant::now(),
             mouse_tracked: false,
             status: status_reader,
+            styles,
+            scene_read: Instant::now(),
+            backdrop: None,
         })
+    }
+
+    /// Mira lo que pasa en pantalla y, si cambia la apariencia del dock, lo redibuja.
+    fn update_style(&mut self) {
+        self.scene_read = Instant::now();
+        let appearance = if self.styles.watches_screen() {
+            let launcher = self.launcher.as_ref().filter(|menu| menu.visible);
+            let monitor = windows::Win32::Foundation::RECT {
+                left: self.screen_left,
+                top: self.screen_top,
+                right: self.screen_right,
+                bottom: self.screen_bottom,
+            };
+            let scene = style::Scene::read(
+                monitor,
+                launcher.is_some(),
+                launcher.is_some_and(|menu| !menu.model.query.is_empty()),
+            );
+            self.styles.resolve(&scene)
+        } else {
+            self.styles.look(style::State::Desktop).appearance
+        };
+        if appearance != self.bar.appearance {
+            self.bar.appearance = appearance;
+            self.render();
+        }
+    }
+
+    /// Pone el desenfoque de Windows detrás del dock si su apariencia lo pide, con
+    /// la forma del dock; solo cuando cambia la apariencia o el tamaño.
+    fn sync_backdrop(&mut self) {
+        let key = (self.bar.appearance, self.surface.width, self.surface.height);
+        if self.backdrop == Some(key) {
+            return;
+        }
+        self.backdrop = Some(key);
+        let px = |v: f32| (v * self.scale).round() as i32;
+        let rect = windows::Win32::Foundation::RECT {
+            left: px(bar::SHADOW_PAD_X),
+            top: px(bar::SHADOW_PAD_Y),
+            right: self.surface.width as i32 - px(bar::SHADOW_PAD_X),
+            bottom: self.surface.height as i32 - px(bar::SHADOW_PAD_Y),
+        };
+        style::apply_backdrop(self.hwnd, self.bar.appearance, rect, px(glass::DOCK_RADIUS));
     }
 
     /// Abre o cierra el panel rápido sobre los iconos de red, volumen y batería.
@@ -1824,6 +1880,7 @@ impl App {
         self.bar.draw(&mut self.surface.pixmap, self.scale);
         self.surface.copy_to_dib();
         self.update_position();
+        self.sync_backdrop();
     }
 
     /// Empieza a recibir un fotograma por refresco de la pantalla (ver `frames`).
@@ -1895,6 +1952,7 @@ unsafe extern "system" fn wndproc(hwnd: HWND, msg: u32, wparam: WPARAM, lparam: 
                         .is_some_and(|at| at.elapsed() < Duration::from_millis(1500));
                 app.check_priority(!tray_menu);
                 app.update_keyboard();
+                app.update_style();
             });
             LRESULT(0)
         }
@@ -2206,7 +2264,7 @@ unsafe extern "system" fn wndproc(hwnd: HWND, msg: u32, wparam: WPARAM, lparam: 
                     }
                     // En el resto del dock, el de GlassBar.
                     _ => {
-                        if let Some(cmd) = app.tray.show_context_menu() {
+                        if let Some(cmd) = app.tray.show_context_menu(&app.styles) {
                             handle_menu_command(app, cmd);
                         }
                     }
@@ -2255,6 +2313,8 @@ unsafe extern "system" fn wndproc(hwnd: HWND, msg: u32, wparam: WPARAM, lparam: 
                     let status = app.status.read();
                     // El idioma también cambia con atajos (Win+Espacio, Alt+Mayús).
                     app.update_keyboard();
+                    // Maximizar o restaurar no cambia la ventana activa.
+                    app.update_style();
                     let resized = status.items().len() != app.bar.status.items().len();
                     let status_changed = status != app.bar.status;
                     app.bar.status = status;
@@ -2316,6 +2376,13 @@ unsafe extern "system" fn wndproc(hwnd: HWND, msg: u32, wparam: WPARAM, lparam: 
                         app.scale,
                     );
                     app.check_preview(pt, Instant::now());
+                    // Con el dock a la vista, la apariencia sigue a la pantalla más de
+                    // cerca (escribir en el lanzador, maximizar una ventana).
+                    if app.visibility.expanded
+                        && app.scene_read.elapsed() >= Duration::from_millis(250)
+                    {
+                        app.update_style();
+                    }
                     if let Some(panel) = app.tray_panel.as_mut().filter(|p| p.visible) {
                         panel.watch_menu();
                     }
@@ -2362,7 +2429,7 @@ unsafe extern "system" fn wndproc(hwnd: HWND, msg: u32, wparam: WPARAM, lparam: 
             let event = (lparam.0 & 0xffff) as u32;
             if event == WM_RBUTTONUP {
                 with_app(|app| {
-                    if let Some(cmd) = app.tray.show_context_menu() {
+                    if let Some(cmd) = app.tray.show_context_menu(&app.styles) {
                         handle_menu_command(app, cmd);
                     }
                 });
@@ -3735,7 +3802,14 @@ fn handle_menu_command(app: &mut App, cmd: u32) {
                 PostQuitMessage(0);
             }
         }
-        _ => {}
+        _ => {
+            if let Some(choice) = style::Choice::from_command(cmd) {
+                choice.apply(&mut app.styles);
+                let _ = app.styles.save();
+                // Que el cambio se vea ya.
+                app.update_style();
+            }
+        }
     }
 }
 

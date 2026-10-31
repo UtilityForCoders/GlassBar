@@ -38,6 +38,8 @@ mod pins;
 mod spring;
 #[path = "../src/status.rs"]
 mod status;
+#[path = "../src/style.rs"]
+mod style;
 #[path = "../src/textfield.rs"]
 mod textfield;
 #[path = "../src/usage.rs"]
