@@ -1,7 +1,7 @@
 //! Dock compacto: Inicio, programas anclados, estado del sistema y hora.
 use crate::apps::{default_apps, draw_app_icon, draw_windows_start_icon, AppItem};
 use crate::clock::{draw_icon_aligned, ClockRenderer};
-use crate::glass::{draw_hover, draw_running_dot, draw_transparent_dock};
+use crate::glass::{draw_dock, draw_hover, draw_running_dot};
 use crate::spring::Spring;
 use crate::status::{Item, Status};
 use tiny_skia::Pixmap;
@@ -60,6 +60,8 @@ pub struct BarState {
     pub status: Status,
     /// Teclado de la ventana activa; `None` si solo hay uno instalado.
     pub keyboard: Option<crate::keyboard::Layout>,
+    /// Apariencia del fondo según lo que pasa en pantalla (ver `style`).
+    pub appearance: crate::style::Appearance,
     clock: ClockRenderer,
 }
 
@@ -75,6 +77,7 @@ impl BarState {
             pressed: None,
             status: Status::default(),
             keyboard: None,
+            appearance: Default::default(),
             clock: ClockRenderer::new(),
         }
     }
@@ -310,8 +313,9 @@ impl BarState {
         let x = SHADOW_PAD_X * scale;
         let y = SHADOW_PAD_Y * scale;
         let cy = y + DOCK_H * scale / 2.0;
-        draw_transparent_dock(
+        draw_dock(
             pixmap,
+            self.appearance,
             x,
             y,
             self.dock_width() * scale,

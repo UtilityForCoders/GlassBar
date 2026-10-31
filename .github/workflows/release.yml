@@ -1,0 +1,96 @@
+name: Publicar versión
+
+# Después de cada compilación correcta de un push a main: si la versión de
+# Cargo.toml aún no tiene su etiqueta, crea la etiqueta vX.Y.Z y la versión en
+# GitHub con el .exe, el instalador y sus sumas SHA-256. Con Git Flow, a main solo
+# llegan ramas release/* y hotfix/*, que suben la versión.
+on:
+  workflow_run:
+    workflows: [Compilar]
+    types: [completed]
+    branches: [main]
+
+permissions:
+  contents: write
+  actions: read
+
+concurrency:
+  group: release
+  cancel-in-progress: false
+
+jobs:
+  release:
+    if: >-
+      github.event.workflow_run.conclusion == 'success' &&
+      github.event.workflow_run.event == 'push'
+    runs-on: windows-latest
+    defaults:
+      run:
+        shell: bash
+    env:
+      GH_TOKEN: ${{ github.token }}
+      SHA: ${{ github.event.workflow_run.head_sha }}
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          ref: ${{ github.event.workflow_run.head_sha }}
+          fetch-depth: 0
+
+      - name: Leer la versión
+        id: version
+        run: |
+          version=$(grep -m1 '^version' Cargo.toml | cut -d'"' -f2)
+          if ! [[ "$version" =~ ^[0-9]+\.[0-9]+\.[0-9]+(-[0-9A-Za-z.-]+)?$ ]]; then
+            echo "::error file=Cargo.toml::La versión \"$version\" no sigue SemVer (X.Y.Z)."
+            exit 1
+          fi
+          echo "version=$version" >> "$GITHUB_OUTPUT"
+          if git rev-parse -q --verify "refs/tags/v$version" > /dev/null; then
+            echo "::notice::v$version ya está publicada; no hay versión nueva que publicar."
+            echo "exists=true" >> "$GITHUB_OUTPUT"
+          else
+            echo "exists=false" >> "$GITHUB_OUTPUT"
+          fi
+
+      - name: Descargar el .exe compilado
+        if: steps.version.outputs.exists == 'false'
+        uses: actions/download-artifact@v4
+        with:
+          name: glassbar-exe
+          path: target/release
+          run-id: ${{ github.event.workflow_run.id }}
+          github-token: ${{ github.token }}
+
+      - name: Generar el instalador
+        if: steps.version.outputs.exists == 'false'
+        shell: pwsh
+        run: |
+          choco install innosetup --no-progress -y
+          & "${env:ProgramFiles(x86)}\Inno Setup 6\ISCC.exe" "/DAppVersion=${{ steps.version.outputs.version }}" installer\glassbar.iss
+          if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
+
+      - name: Preparar los archivos
+        if: steps.version.outputs.exists == 'false'
+        run: |
+          version=${{ steps.version.outputs.version }}
+          mkdir dist
+          cp target/release/glassbar.exe "dist/glassbar-$version-x64.exe"
+          cp "target/installer/glassbar-setup-$version.exe" "dist/glassbar-setup-$version-x64.exe"
+          cd dist
+          sha256sum *.exe > SHA256SUMS.txt
+          cat SHA256SUMS.txt
+
+      - name: Crear la versión
+        if: steps.version.outputs.exists == 'false'
+        run: |
+          version=${{ steps.version.outputs.version }}
+          prerelease=()
+          # Las versiones con sufijo (1.0.0-beta.1) salen como preliminares.
+          if [[ "$version" == *-* ]]; then
+            prerelease=(--prerelease)
+          fi
+          gh release create "v$version" dist/* \
+            --target "$SHA" \
+            --title "GlassBar v$version" \
+            --generate-notes \
+            "${prerelease[@]}"

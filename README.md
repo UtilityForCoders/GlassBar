@@ -81,13 +81,26 @@ Mientras GlassBar está abierto, pulsar y soltar la tecla Windows sola muestra u
 
 Volver a ejecutar GlassBar mientras ya está abierto muestra u oculta este lanzador sin crear otra instancia. `--replace` cierra la instancia anterior de forma normal antes de iniciar la nueva.
 
+## Estilos
+
+Como en TranslucentTB, el aspecto del dock cambia según lo que pasa en pantalla. El menú de GlassBar (clic derecho en un hueco del dock o en su icono de la bandeja) tiene un submenú por situación, de menor a mayor prioridad:
+
+- **Escritorio**: el aspecto de base, siempre activo.
+- **Ventana visible**: hay una ventana sin minimizar en el monitor del dock.
+- **Ventana maximizada**: la ventana de delante está maximizada. Una maximizada tapada por otra ventana no cuenta, y entonces vale Ventana visible.
+- **Inicio abierto**: el lanzador de GlassBar está abierto.
+- **Búsqueda abierta**: se escribe en el buscador del lanzador o está abierta la búsqueda de Windows (Win+S).
+- **Vista de tareas abierta**: Win+Tab.
+
+En cada una se elige la apariencia: **Normal** (el cristal de siempre), **Opaca**, **Transparente**, **Desenfoque** o **Acrílico**. Las dos últimas usan el desenfoque de Windows recortado a la forma del dock. Si se dan varias situaciones, gana la activada de mayor prioridad. Elegir una apariencia activa la situación, y **Activado** la quita sin perder la apariencia elegida. Por defecto solo cuenta el Escritorio con el aspecto Normal. Los ajustes se guardan en `%LOCALAPPDATA%\GlassBar\styles.json`.
+
 ## Comportamiento
 
 Acerca el cursor a los últimos 6 píxeles lógicos del borde inferior del monitor principal para desplegar la barra. Al alejarlo, espera 300 ms y se oculta con una animación suave sin rebote. El margen entre la barra y el borde también permite mantenerla abierta. Se oculta por completo, incluso si activaste el borde sin entrar en ella.
 
 La barra inicia con el Explorador si no hay configuración guardada. El ancho se adapta a los programas anclados; si supera la pantalla, se reduce la escala. La hora usa formato de 24 horas; la fecha, el formato regional. Los indicadores de ejecución comparan nombres de ejecutables; los accesos web y algunas aplicaciones empaquetadas pueden no mostrar indicador.
 
-La transparencia usa composición alfa real, sin desenfoque de fondo. Mientras GlassBar está abierto, oculta las barras nativas del monitor principal y los secundarios. Un evento de Windows vuelve a ocultarlas cuando Explorer intenta mostrarlas; la comprobación periódica también cubre reinicios de Explorer. Al salir normalmente, se quita el detector y se restaura la barra original. No se modifican las preferencias de la barra de Windows. Un segundo proceso `glassbar.exe` (el vigilante) espera a que GlassBar termine y vuelve a mostrar la barra nativa, incluso si se cerró a la fuerza o falló.
+La transparencia usa composición alfa real; el desenfoque de fondo solo aparece con las apariencias Desenfoque y Acrílico (ver Estilos). Mientras GlassBar está abierto, oculta las barras nativas del monitor principal y los secundarios. Un evento de Windows vuelve a ocultarlas cuando Explorer intenta mostrarlas; la comprobación periódica también cubre reinicios de Explorer. Al salir normalmente, se quita el detector y se restaura la barra original. No se modifican las preferencias de la barra de Windows. Un segundo proceso `glassbar.exe` (el vigilante) espera a que GlassBar termine y vuelve a mostrar la barra nativa, incluso si se cerró a la fuerza o falló.
 
 El dock vuelve a ponerse por encima de las demás ventanas cada vez que cambia la ventana activa. Con una app a pantalla completa (juego, vídeo, presentación) en su monitor, no aparece al llevar el ratón al borde; la tecla Windows sigue abriendo el lanzador.
 
@@ -105,5 +118,9 @@ cargo build --release
 `cargo run --example preview` genera `dock_preview.bmp` sin iniciar la barra ni ocultar la barra nativa. Acepta rutas de programas como argumentos para probar distintas distribuciones sin modificar los programas guardados.
 
 `cargo run --example preview -- --launcher` genera una vista previa del lanzador. `--launcher-power` muestra únicamente su confirmación de apagado; estas vistas previas no ejecutan programas ni apagan el equipo.
+
+## Versiones
+
+Las versiones se publican solas en [Releases](https://github.com/UtilityForCoders/GlassBar/releases). Cada una trae `glassbar-X.Y.Z-x64.exe` (el programa, sin instalar), `glassbar-setup-X.Y.Z-x64.exe` (el instalador, para el usuario actual) y `SHA256SUMS.txt` para comprobarlos.
 
 Licencia MIT.

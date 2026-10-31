@@ -2,12 +2,12 @@
 ; Instala solo para el usuario actual (%LOCALAPPDATA%\Programs\GlassBar).
 
 #ifndef AppVersion
-  #define AppVersion "0.1.0"
+  #define AppVersion "0.2.0"
 #endif
 
 #define AppName "GlassBar"
 #define AppExe "glassbar.exe"
-#define AppUrl "https://github.com/JhonTMich/GlassBar"
+#define AppUrl "https://github.com/UtilityForCoders/GlassBar"
 #define RunKey "Software\Microsoft\Windows\CurrentVersion\Run"
 #define RunValue "GlassBar"
 
