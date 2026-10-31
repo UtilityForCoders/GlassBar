@@ -28,15 +28,18 @@ jobs:
           HEAD: ${{ github.head_ref }}
           BASE: ${{ github.base_ref }}
         run: |
+          # Las versiones y los arreglos urgentes llegan a main y vuelven a develop,
+          # directamente o fusionando main en develop tras publicar.
           case "$HEAD" in
             feature/*|bugfix/*|dependabot/*) allowed="develop" ;;
-            release/*|hotfix/*) allowed="main" ;;
+            release/*|hotfix/*) allowed="main develop" ;;
+            main) allowed="develop" ;;
             *)
               echo "::error::La rama \"$HEAD\" no sigue Git Flow: usa feature/*, bugfix/*, release/* o hotfix/*."
               exit 1
               ;;
           esac
-          if [[ "$BASE" != "$allowed" ]]; then
-            echo "::error::Un PR desde \"$HEAD\" va contra \"$allowed\", no contra \"$BASE\"."
+          if [[ " $allowed " != *" $BASE "* ]]; then
+            echo "::error::Un PR desde \"$HEAD\" va contra ${allowed// / o }, no contra \"$BASE\"."
             exit 1
           fi
