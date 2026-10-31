@@ -299,14 +299,17 @@ struct Windows {
     maximized: bool,
 }
 
+/// Las ventanas llegan de delante hacia atrás: basta con la primera que cuenta.
+/// "Maximizada" es que esa, la de delante, lo esté; una maximizada detrás de otra
+/// ventana no se ve y no cuenta, y entonces vale "Ventana visible".
 unsafe extern "system" fn collect(hwnd: HWND, lparam: LPARAM) -> BOOL {
     let windows = &mut *(lparam.0 as *mut Windows);
-    if counts(hwnd, windows.monitor) {
-        windows.visible = true;
-        windows.maximized |= IsZoomed(hwnd).as_bool();
+    if !counts(hwnd, windows.monitor) {
+        return true.into();
     }
-    // Basta con saber que hay una maximizada.
-    (!windows.maximized).into()
+    windows.visible = true;
+    windows.maximized = IsZoomed(hwnd).as_bool();
+    false.into()
 }
 
 /// Ventana de una app, a la vista en el monitor: ni minimizada, ni oculta en otro

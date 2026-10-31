@@ -87,7 +87,7 @@ Como en TranslucentTB, el aspecto del dock cambia según lo que pasa en pantalla
 
 - **Escritorio**: el aspecto de base, siempre activo.
 - **Ventana visible**: hay una ventana sin minimizar en el monitor del dock.
-- **Ventana maximizada**: alguna de ellas está maximizada.
+- **Ventana maximizada**: la ventana de delante está maximizada. Una maximizada tapada por otra ventana no cuenta, y entonces vale Ventana visible.
 - **Inicio abierto**: el lanzador de GlassBar está abierto.
 - **Búsqueda abierta**: se escribe en el buscador del lanzador o está abierta la búsqueda de Windows (Win+S).
 - **Vista de tareas abierta**: Win+Tab.
