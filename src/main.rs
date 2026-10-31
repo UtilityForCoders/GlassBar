@@ -291,6 +291,19 @@ impl Tooltip {
                 ULW_ALPHA,
             );
             let _ = ShowWindow(self.hwnd, SW_SHOWNOACTIVATE);
+            // Encima de todo, también de los paneles abiertos después (bandeja, menús).
+            use windows::Win32::UI::WindowsAndMessaging::{
+                SetWindowPos, HWND_TOPMOST, SWP_NOACTIVATE, SWP_NOMOVE, SWP_NOSIZE,
+            };
+            let _ = SetWindowPos(
+                self.hwnd,
+                Some(HWND_TOPMOST),
+                0,
+                0,
+                0,
+                0,
+                SWP_NOMOVE | SWP_NOSIZE | SWP_NOACTIVATE,
+            );
         }
         self.surface = Some(surface);
         self.visible = true;
@@ -3184,6 +3197,30 @@ impl Drop for TrayWindow {
     }
 }
 
+/// Muestra el nombre del icono del panel de la bandeja bajo el cursor, encima de él
+/// como en Windows.
+fn show_tray_tip(app: &mut App) {
+    let Some(panel) = app.tray_panel.as_ref().filter(|p| p.visible) else {
+        return;
+    };
+    let scale = panel.scale;
+    let label = panel.model.hovered.map(|index| {
+        let (cx, cy) = panel.model.cell(index);
+        (
+            panel.model.icons[index].tip.clone(),
+            panel.pos.x + ((cx + 20.0) * scale).round() as i32,
+            panel.pos.y + ((cy - 4.0) * scale).round() as i32,
+        )
+    });
+    let (left, right) = (app.screen_left, app.screen_right);
+    if let Some(tip) = &mut app.tooltip {
+        match label.filter(|(text, _, _)| !text.trim().is_empty()) {
+            Some((text, cx, bottom)) => tip.show(&text, cx, bottom, left, right, scale),
+            None => tip.hide(),
+        }
+    }
+}
+
 unsafe extern "system" fn tray_wndproc(
     hwnd: HWND,
     msg: u32,
@@ -3212,6 +3249,7 @@ unsafe extern "system" fn tray_wndproc(
             };
             let (x, y) = point(panel.scale);
             if let Some(index) = panel.model.hit_test(x, y) {
+                let _ = unsafe { KillTimer(Some(hwnd), TIMER_TIP) };
                 if let Some(tip) = &mut app.tooltip {
                     tip.hide();
                 }
@@ -3270,29 +3308,30 @@ unsafe extern "system" fn tray_wndproc(
                 }
                 panel.model.hovered = hit;
                 panel.render();
-                // El nombre del icono encima de él, como en Windows.
-                let scale = panel.scale;
-                let label = hit.map(|index| {
-                    let (cx, cy) = panel.model.cell(index);
-                    (
-                        panel.model.icons[index].tip.clone(),
-                        panel.pos.x + ((cx + 20.0) * scale).round() as i32,
-                        panel.pos.y + ((cy - 4.0) * scale).round() as i32,
-                    )
-                });
                 if let Some(index) = hit {
                     systray::hover(panel.model.icons[index].key, cursor());
                 }
-                let (left, right) = (app.screen_left, app.screen_right);
-                if let Some(tip) = &mut app.tooltip {
-                    match label.filter(|(text, _, _)| !text.trim().is_empty()) {
-                        Some((text, cx, bottom)) => tip.show(&text, cx, bottom, left, right, scale),
-                        None => tip.hide(),
+                // Con un nombre ya a la vista pasa al del icono vecino al momento;
+                // si no, espera a que el cursor se quede quieto, como en el dock.
+                let showing = app.tooltip.as_ref().is_some_and(|t| t.visible);
+                if showing && hit.is_some() {
+                    show_tray_tip(app);
+                } else {
+                    if let Some(tip) = &mut app.tooltip {
+                        tip.hide();
+                    }
+                    if hit.is_some() {
+                        let _ = SetTimer(Some(hwnd), TIMER_TIP, TIP_MS, None);
                     }
                 }
             });
         }
+        WM_TIMER if wparam.0 == TIMER_TIP => {
+            let _ = KillTimer(Some(hwnd), TIMER_TIP);
+            with_app(show_tray_tip);
+        }
         WM_MOUSELEAVE => {
+            let _ = KillTimer(Some(hwnd), TIMER_TIP);
             with_app(|app| {
                 if let Some(tip) = &mut app.tooltip {
                     tip.hide();
