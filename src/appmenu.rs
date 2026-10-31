@@ -320,7 +320,10 @@ pub const CMD_EXIT: u32 = 3;
 /// TranslucentTB), iniciar con Windows y salir.
 pub fn glassbar(styles: &Styles, autostart: bool) -> AppMenu {
     let mut entries = vec![
-        Entry::Header("GlassBar v0.1.0 — Liquid Glass".into()),
+        Entry::Header(format!(
+            "GlassBar v{} — Liquid Glass",
+            env!("CARGO_PKG_VERSION")
+        )),
         Entry::Separator,
     ];
     for state in State::ALL {
