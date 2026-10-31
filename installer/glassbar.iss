@@ -2,7 +2,7 @@
 ; Instala solo para el usuario actual (%LOCALAPPDATA%\Programs\GlassBar).
 
 #ifndef AppVersion
-  #define AppVersion "0.2.0"
+  #define AppVersion "0.2.1"
 #endif
 
 #define AppName "GlassBar"
@@ -58,3 +58,5 @@ Root: HKCU; Subkey: "{#RunKey}"; ValueType: string; ValueName: "{#RunValue}"; Va
 
 [Run]
 Filename: "{app}\{#AppExe}"; Description: "{cm:LaunchProgram,{#AppName}}"; Flags: nowait postinstall skipifsilent
+; Al actualizar desde GlassBar el instalador va en silencio: lo vuelve a abrir.
+Filename: "{app}\{#AppExe}"; Flags: nowait; Check: WizardSilent

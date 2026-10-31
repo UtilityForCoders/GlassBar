@@ -4,8 +4,10 @@
 use windows::core::PCWSTR;
 use windows::Win32::Foundation::HWND;
 use windows::Win32::System::LibraryLoader::GetModuleHandleW;
+pub use windows::Win32::UI::Shell::NIN_BALLOONUSERCLICK;
 use windows::Win32::UI::Shell::{
-    Shell_NotifyIconW, NIF_ICON, NIF_MESSAGE, NIF_TIP, NIM_ADD, NIM_DELETE, NOTIFYICONDATAW,
+    Shell_NotifyIconW, NIF_ICON, NIF_INFO, NIF_MESSAGE, NIF_TIP, NIIF_INFO, NIM_ADD, NIM_DELETE,
+    NIM_MODIFY, NOTIFYICONDATAW,
 };
 use windows::Win32::UI::WindowsAndMessaging::{
     DestroyIcon, LoadIconW, HICON, IDI_APPLICATION, WM_APP,
@@ -56,6 +58,33 @@ impl Tray {
 
         unsafe {
             let _ = Shell_NotifyIconW(NIM_ADD, &nid);
+        }
+    }
+}
+
+impl Tray {
+    /// Muestra una notificación de Windows desde el icono de GlassBar. Al pulsarla,
+    /// la ventana recibe `WM_TRAY` con `NIN_BALLOONUSERCLICK`.
+    pub fn notify(&self, title: &str, text: &str) {
+        fn copy<const N: usize>(text: &str) -> [u16; N] {
+            let mut out = [0u16; N];
+            for (slot, c) in out.iter_mut().zip(text.encode_utf16().take(N - 1)) {
+                *slot = c;
+            }
+            out
+        }
+        let nid = NOTIFYICONDATAW {
+            cbSize: std::mem::size_of::<NOTIFYICONDATAW>() as u32,
+            hWnd: self.hwnd,
+            uID: TRAY_ID,
+            uFlags: NIF_INFO,
+            szInfoTitle: copy(title),
+            szInfo: copy(text),
+            dwInfoFlags: NIIF_INFO,
+            ..Default::default()
+        };
+        unsafe {
+            let _ = Shell_NotifyIconW(NIM_MODIFY, &nid);
         }
     }
 }
