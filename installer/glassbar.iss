@@ -58,3 +58,5 @@ Root: HKCU; Subkey: "{#RunKey}"; ValueType: string; ValueName: "{#RunValue}"; Va
 
 [Run]
 Filename: "{app}\{#AppExe}"; Description: "{cm:LaunchProgram,{#AppName}}"; Flags: nowait postinstall skipifsilent
+; Al actualizar desde GlassBar el instalador va en silencio: lo vuelve a abrir.
+Filename: "{app}\{#AppExe}"; Flags: nowait; Check: WizardSilent

@@ -44,6 +44,8 @@ mod status;
 mod style;
 #[path = "../src/textfield.rs"]
 mod textfield;
+#[path = "../src/update.rs"]
+mod update;
 #[path = "../src/usage.rs"]
 mod usage;
 
@@ -166,8 +168,14 @@ fn main() {
         if !styles.watches_screen() {
             styles.set_appearance(style::State::VisibleWindow, style::Appearance::Blur);
         }
-        let mut menu =
-            appmenu::Cascade::new(appmenu::glassbar(&styles, autostart::is_enabled()), false);
+        // Con una versión nueva, para ver su opción.
+        let updates = appmenu::Updates {
+            check: true,
+            available: Some("9.9.9".into()),
+            busy: false,
+        };
+        let root = appmenu::glassbar(&styles, autostart::is_enabled(), &updates);
+        let mut menu = appmenu::Cascade::new(root, false);
         menu.key(0x28);
         menu.key(0x28);
         menu.key(0x27);
@@ -177,6 +185,28 @@ fn main() {
         menu.draw(&mut image, scale);
         std::fs::write("target/glassbar-menu-preview.bmp", bmp_entry(&image)).unwrap();
         println!("Menú de GlassBar: target/glassbar-menu-preview.bmp");
+        return;
+    }
+    // Última versión publicada; con `--download`, también descarga su instalador y
+    // comprueba su suma, sin instalarlo.
+    if arguments_of("--update").is_some() {
+        match update::latest() {
+            Ok(release) => {
+                println!(
+                    "Publicada: v{} (esta: v{}; más nueva: {})",
+                    release.version,
+                    update::Version::current(),
+                    release.version > update::Version::current()
+                );
+                if arguments_of("--download").is_some() {
+                    match update::download(&release) {
+                        Ok(path) => println!("Instalador comprobado: {}", path.display()),
+                        Err(error) => println!("Error al descargar: {error}"),
+                    }
+                }
+            }
+            Err(error) => println!("Error al consultar: {error}"),
+        }
         return;
     }
     // Jump list de cualquier AppUserModelID (p. ej. `--jumplist-id Chrome`).

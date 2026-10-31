@@ -25,6 +25,7 @@ pub const GLYPH_CLOSE: char = '\u{E8BB}';
 pub const GLYPH_CHECK: char = '\u{E73E}';
 const GLYPH_CHEVRON: char = '\u{E76C}';
 const GLYPH_EXIT: char = '\u{E7E8}';
+const GLYPH_DOWNLOAD: char = '\u{E896}';
 
 /// Lado de los iconos, en unidades lógicas (los iconos pequeños de Windows).
 pub const ICON: f32 = 16.0;
@@ -315,10 +316,23 @@ impl AppMenu {
 /// Opciones del menú de GlassBar.
 pub const CMD_AUTOSTART: u32 = 2;
 pub const CMD_EXIT: u32 = 3;
+pub const CMD_UPDATE: u32 = 4;
+pub const CMD_UPDATE_CHECK: u32 = 5;
+
+/// Estado de las actualizaciones que muestra el menú de GlassBar.
+#[derive(Default)]
+pub struct Updates {
+    /// Buscar versiones nuevas sola.
+    pub check: bool,
+    /// Versión nueva publicada ("0.3.0").
+    pub available: Option<String>,
+    /// Descargando o instalando.
+    pub busy: bool,
+}
 
 /// El menú de GlassBar: un submenú por situación con su apariencia (como en
-/// TranslucentTB), iniciar con Windows y salir.
-pub fn glassbar(styles: &Styles, autostart: bool) -> AppMenu {
+/// TranslucentTB), iniciar con Windows, actualizaciones y salir.
+pub fn glassbar(styles: &Styles, autostart: bool, updates: &Updates) -> AppMenu {
     let mut entries = vec![
         Entry::Header(format!(
             "GlassBar v{} — Liquid Glass",
@@ -357,6 +371,20 @@ pub fn glassbar(styles: &Styles, autostart: bool) -> AppMenu {
         label: "Iniciar con Windows".into(),
         command: CMD_AUTOSTART,
     });
+    entries.push(Entry::Item {
+        icon: Icon::check(updates.check),
+        label: "Buscar actualizaciones".into(),
+        command: CMD_UPDATE_CHECK,
+    });
+    match (&updates.available, updates.busy) {
+        (_, true) => entries.push(Entry::Header("Descargando la actualización…".into())),
+        (Some(version), false) => entries.push(Entry::Item {
+            icon: Icon::Glyph(GLYPH_DOWNLOAD),
+            label: format!("Actualizar a v{version}"),
+            command: CMD_UPDATE,
+        }),
+        (None, false) => {}
+    }
     entries.push(Entry::Separator);
     entries.push(Entry::Item {
         icon: Icon::Glyph(GLYPH_EXIT),
