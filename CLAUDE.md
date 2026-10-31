@@ -59,7 +59,7 @@ Todos los commits siguen [Conventional Commits 1.0](https://www.conventionalcomm
 | Workflow | Cuándo | Qué hace |
 |---|---|---|
 | `build.yml` (Compilar) | Push a `main` o `develop`, y cada PR | Formato, tests y compilación release; sube el `.exe` como artefacto. En los PR contra `main`, además exige una versión nueva en `Cargo.toml`. |
-| `pull-request.yml` (Normas del PR) | Cada PR | El título sigue Conventional Commits y la rama va contra la base que manda Git Flow. |
+| `pull-request.yml` (Normas del PR) | Cada PR | El título sigue Conventional Commits y la rama va contra la base que manda Git Flow: `feature/*`, `bugfix/*` y Dependabot contra `develop`; `release/*` y `hotfix/*` contra `main` o `develop`; `main` solo contra `develop`. |
 | `release.yml` (Publicar versión) | Tras cada Compilar correcto de un push a `main` | Si `vX.Y.Z` (de `Cargo.toml`) aún no existe, crea la etiqueta y la versión en GitHub con el `.exe`, el instalador de Inno Setup y `SHA256SUMS.txt`. Las notas se generan con los PR incluidos. |
 
 Dependabot (`.github/dependabot.yml`) abre sus PR contra `develop`, con mensajes `build(deps): ...` y `ci(deps): ...`.
@@ -70,6 +70,6 @@ Dependabot (`.github/dependabot.yml`) abre sus PR contra `develop`, con mensajes
 2. Subir `version` en `Cargo.toml` y ejecutar `cargo build` para poner al día `Cargo.lock`. El CI compila con `--locked` y falla si no está al día.
 3. Commit `chore(release): X.Y.Z`; abrir el PR contra `main` con ese mismo título.
 4. Fusionarlo con merge commit. El CI compila `main` y `release.yml` publica `vX.Y.Z` sola.
-5. Fusionar `main` en `develop` para que tenga la versión nueva.
+5. Abrir un PR de `main` contra `develop` titulado `chore(release): fusionar X.Y.Z en develop` y fusionarlo con merge commit, para que `develop` tenga la versión nueva.
 
 Un `hotfix/X.Y.Z` sigue los mismos pasos, pero sale de `main`.
