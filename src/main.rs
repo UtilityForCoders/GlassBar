@@ -37,6 +37,7 @@ mod systray;
 mod textfield;
 mod tray;
 mod traypanel;
+mod update;
 mod usage;
 mod wifi;
 mod winkey;
@@ -73,7 +74,7 @@ use windows::Win32::UI::WindowsAndMessaging::{
 
 use crate::appmenu::{
     CMD_APP_CLOSE, CMD_APP_END_TASK, CMD_APP_OPEN, CMD_APP_PIN, CMD_APP_UNPIN, CMD_AUTOSTART,
-    CMD_EXIT, CMD_JUMP,
+    CMD_EXIT, CMD_JUMP, CMD_UPDATE, CMD_UPDATE_CHECK,
 };
 use crate::autohide::AutoHide;
 use crate::bar::{BarState, HoverTarget, BOTTOM_MARGIN};
@@ -90,6 +91,8 @@ const WM_DWMCOLORIZATIONCOLORCHANGED: u32 = 0x0320;
 const WM_QUICK_UPDATE: u32 = windows::Win32::UI::WindowsAndMessaging::WM_APP + 4;
 /// Cambiaron los iconos de la bandeja de otros programas (ver `systray`).
 const WM_TRAY_ICONS: u32 = windows::Win32::UI::WindowsAndMessaging::WM_APP + 6;
+/// Un hilo de las actualizaciones terminó (ver `App::handle_update_events`).
+const WM_UPDATE: u32 = windows::Win32::UI::WindowsAndMessaging::WM_APP + 7;
 /// El hilo de iconos del lanzador cargó alguno nuevo.
 const WM_LAUNCHER_ICONS: u32 = windows::Win32::UI::WindowsAndMessaging::WM_APP + 5;
 
@@ -99,6 +102,9 @@ const TIMER_EDGE: usize = 3;
 const TIMER_TIP: usize = 4;
 /// Una vez, poco después de arrancar: vuelve a pedir los iconos de la bandeja.
 const TIMER_ANNOUNCE: usize = 5;
+/// Buscar actualizaciones: una vez poco después de arrancar y luego cada 6 horas.
+const TIMER_UPDATE_FIRST: usize = 6;
+const TIMER_UPDATE: usize = 7;
 
 /// Refresco del reloj y verificación de apps activas.
 const TICK_MS: u32 = 1000;
@@ -1387,6 +1393,34 @@ struct App {
     /// Ventana con el desenfoque de Windows que va debajo del dock con las
     /// apariencias Desenfoque y Acrílico.
     backdrop: Option<style::Backdrop>,
+    /// Actualizaciones (ver `update`): ajustes, versión nueva encontrada y los
+    /// hilos que buscan o descargan, que responden por `update_events`.
+    update_settings: update::Settings,
+    new_release: Option<update::Release>,
+    /// Versión de la que ya se avisó, para no repetirlo cada 6 horas.
+    notified: Option<update::Version>,
+    checking: bool,
+    updating: bool,
+    update_sender: std::sync::mpsc::Sender<UpdateEvent>,
+    update_events: std::sync::mpsc::Receiver<UpdateEvent>,
+}
+
+/// Respuesta de los hilos de las actualizaciones.
+enum UpdateEvent {
+    Checked(std::result::Result<Option<update::Release>, String>),
+    Downloaded(std::result::Result<std::path::PathBuf, String>),
+}
+
+/// Avisa a la ventana del dock (`hwnd`) de que hay una respuesta de actualizaciones.
+fn notify_update(hwnd: isize) {
+    unsafe {
+        let _ = windows::Win32::UI::WindowsAndMessaging::PostMessageW(
+            Some(HWND(hwnd as *mut _)),
+            WM_UPDATE,
+            WPARAM(0),
+            LPARAM(0),
+        );
+    }
 }
 
 impl App {
@@ -1401,6 +1435,7 @@ impl App {
         bar.keyboard = keyboard::current();
         let styles = style::Styles::load();
         bar.appearance = styles.look(style::State::Desktop).appearance;
+        let (update_sender, update_events) = std::sync::mpsc::channel();
         let scale = scale.min((rc.right - rc.left) as f32 / (bar.dock_width() + 40.0));
         let (width, height) = bar.window_size(scale);
         let surface = Surface::new(width, height)?;
@@ -1463,6 +1498,13 @@ impl App {
             styles,
             scene_read: Instant::now(),
             backdrop: style::Backdrop::new(),
+            update_settings: update::Settings::load(),
+            new_release: None,
+            notified: None,
+            checking: false,
+            updating: false,
+            update_sender,
+            update_events,
         })
     }
 
@@ -1548,9 +1590,98 @@ impl App {
             let _ = GetCursorPos(&mut cursor);
         }
         let bounds = (self.screen_left, self.screen_right);
+        let updates = appmenu::Updates {
+            check: self.update_settings.check,
+            available: self.new_release.as_ref().map(|r| r.version.to_string()),
+            busy: self.updating,
+        };
         if let Some(menu) = &mut self.app_menu {
-            menu.open_glassbar(&self.styles, autostart::is_enabled(), cursor, bounds);
+            menu.open_glassbar(
+                &self.styles,
+                autostart::is_enabled(),
+                &updates,
+                cursor,
+                bounds,
+            );
         }
+    }
+
+    /// Busca en un hilo aparte si hay una versión nueva; responde con `WM_UPDATE`.
+    fn check_updates(&mut self) {
+        if !self.update_settings.check || self.checking || self.updating {
+            return;
+        }
+        self.checking = true;
+        let (sender, hwnd) = (self.update_sender.clone(), self.hwnd.0 as isize);
+        std::thread::spawn(move || {
+            let _ = sender.send(UpdateEvent::Checked(update::newer()));
+            notify_update(hwnd);
+        });
+    }
+
+    /// Descarga la versión nueva en un hilo aparte; al terminar se instala.
+    fn start_update(&mut self) {
+        let Some(release) = self.new_release.clone().filter(|_| !self.updating) else {
+            return;
+        };
+        self.updating = true;
+        self.tray.notify(
+            "Actualizando GlassBar",
+            &format!("Descargando la v{}…", release.version),
+        );
+        let (sender, hwnd) = (self.update_sender.clone(), self.hwnd.0 as isize);
+        std::thread::spawn(move || {
+            let _ = sender.send(UpdateEvent::Downloaded(update::download(&release)));
+            notify_update(hwnd);
+        });
+    }
+
+    /// Atiende lo que respondieron los hilos de las actualizaciones.
+    fn handle_update_events(&mut self) {
+        while let Ok(event) = self.update_events.try_recv() {
+            match event {
+                UpdateEvent::Checked(result) => {
+                    self.checking = false;
+                    // Sin conexión o sin respuesta, se vuelve a mirar en 6 horas.
+                    let Ok(release) = result else {
+                        continue;
+                    };
+                    // Se avisa una vez por versión, no cada 6 horas.
+                    if let Some(release) = &release {
+                        if self.notified != Some(release.version) {
+                            self.notified = Some(release.version);
+                            self.tray.notify(
+                                "Hay una versión nueva de GlassBar",
+                                &format!(
+                                    "La v{} está lista. Haz clic aquí para actualizar.",
+                                    release.version
+                                ),
+                            );
+                        }
+                    }
+                    self.new_release = release;
+                }
+                UpdateEvent::Downloaded(Ok(installer)) => match update::install(&installer) {
+                    // El instalador cierra GlassBar si sigue abierto y lo vuelve a abrir.
+                    Ok(()) => {
+                        self.shell.restore();
+                        unsafe {
+                            PostQuitMessage(0);
+                        }
+                    }
+                    Err(error) => self.update_failed(&error),
+                },
+                UpdateEvent::Downloaded(Err(error)) => self.update_failed(&error),
+            }
+        }
+    }
+
+    fn update_failed(&mut self, error: &str) {
+        self.updating = false;
+        self.tray.notify(
+            "No se pudo actualizar GlassBar",
+            &format!("Motivo: {error}."),
+        );
     }
 
     /// Mira lo que pasa en pantalla y, si cambia la apariencia del dock, lo redibuja.
@@ -1997,6 +2128,10 @@ unsafe extern "system" fn wndproc(hwnd: HWND, msg: u32, wparam: WPARAM, lparam: 
             });
             DefWindowProcW(hwnd, msg, wparam, lparam)
         }
+        WM_UPDATE => {
+            with_app(|app| app.handle_update_events());
+            LRESULT(0)
+        }
         WM_TRAY_ICONS => {
             with_app(|app| {
                 if let Some(panel) = app.tray_panel.as_mut().filter(|p| p.visible) {
@@ -2410,6 +2545,13 @@ unsafe extern "system" fn wndproc(hwnd: HWND, msg: u32, wparam: WPARAM, lparam: 
                         app.render();
                     }
                 });
+            } else if id == TIMER_UPDATE_FIRST || id == TIMER_UPDATE {
+                with_app(|app| {
+                    if id == TIMER_UPDATE_FIRST {
+                        let _ = KillTimer(Some(app.hwnd), TIMER_UPDATE_FIRST);
+                    }
+                    app.check_updates();
+                });
             } else if id == TIMER_ANNOUNCE {
                 with_app(|app| {
                     let _ = KillTimer(Some(app.hwnd), TIMER_ANNOUNCE);
@@ -2495,6 +2637,9 @@ unsafe extern "system" fn wndproc(hwnd: HWND, msg: u32, wparam: WPARAM, lparam: 
                 with_app(|app| {
                     app.open_glassbar_menu();
                 });
+            } else if event == tray::NIN_BALLOONUSERCLICK {
+                // Clic en el aviso de una versión nueva: se actualiza.
+                with_app(|app| app.start_update());
             }
             LRESULT(0)
         }
@@ -3125,13 +3270,15 @@ impl AppMenuWindow {
         &mut self,
         styles: &style::Styles,
         autostart: bool,
+        updates: &appmenu::Updates,
         cursor: POINT,
         (left, right): (i32, i32),
     ) {
         let (_, dpi) = monitors::get_info(monitors::primary());
         self.scale = dpi.max(0.3);
         // Los submenús, a la derecha si caben; si no, a la izquierda.
-        let wide = appmenu::Cascade::new(appmenu::glassbar(styles, autostart), false);
+        let root = appmenu::glassbar(styles, autostart, updates);
+        let wide = appmenu::Cascade::new(root, false);
         let room = cursor.x + (wide.size().0 * self.scale).ceil() as i32 <= right;
         self.model = if room {
             wide
@@ -3900,6 +4047,13 @@ fn handle_menu_command(app: &mut App, cmd: u32) {
                 PostQuitMessage(0);
             }
         }
+        CMD_UPDATE => app.start_update(),
+        CMD_UPDATE_CHECK => {
+            app.update_settings.check = !app.update_settings.check;
+            let _ = app.update_settings.save();
+            // Al activarlo, se mira ya.
+            app.check_updates();
+        }
         _ => {
             if let Some(choice) = style::Choice::from_command(cmd) {
                 choice.apply(&mut app.styles);
@@ -4173,6 +4327,11 @@ fn main() -> Result<()> {
         // Al arrancar, los programas pueden registrar sus iconos antes de que todo
         // esté listo; se les vuelven a pedir con el bucle de mensajes ya en marcha.
         let _ = SetTimer(Some(hwnd), TIMER_ANNOUNCE, 2000, None);
+
+        // Actualizaciones: poco después de arrancar, sin estorbar al inicio, y luego
+        // cada 6 horas.
+        let _ = SetTimer(Some(hwnd), TIMER_UPDATE_FIRST, 15_000, None);
+        let _ = SetTimer(Some(hwnd), TIMER_UPDATE, update::CHECK_EVERY_MS, None);
 
         APP.with(|cell| *cell.borrow_mut() = Some(app));
 

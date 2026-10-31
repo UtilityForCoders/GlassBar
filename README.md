@@ -121,6 +121,14 @@ cargo build --release
 
 ## Versiones
 
+GlassBar busca versiones nuevas poco después de arrancar y luego cada 6 horas. Si hay una, avisa con una notificación de Windows; un clic en ella, o en **Actualizar a vX.Y.Z** del menú de GlassBar, la instala:
+
+1. Descarga el instalador.
+2. Comprueba su suma SHA-256.
+3. Lo ejecuta en silencio y GlassBar se vuelve a abrir solo.
+
+Se desactiva con **Buscar actualizaciones** en ese mismo menú. Ver [PRIVACY.md](PRIVACY.md).
+
 Las versiones se publican solas en [Releases](https://github.com/UtilityForCoders/GlassBar/releases). Cada una trae `glassbar-X.Y.Z-x64.exe` (el programa, sin instalar), `glassbar-setup-X.Y.Z-x64.exe` (el instalador, para el usuario actual) y `SHA256SUMS.txt` para comprobarlos.
 
 Licencia MIT.
