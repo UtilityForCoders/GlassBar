@@ -5,7 +5,7 @@ use std::path::PathBuf;
 use windows::core::BOOL;
 use windows::Win32::Foundation::{HWND, LPARAM, RECT};
 use windows::Win32::Graphics::Dwm::{DwmGetWindowAttribute, DWMWA_CLOAKED};
-use windows::Win32::Graphics::Gdi::{CreateRoundRectRgn, SetWindowRgn, HRGN};
+use windows::Win32::Graphics::Gdi::{CreateRoundRectRgn, SetWindowRgn};
 use windows::Win32::UI::WindowsAndMessaging::{
     EnumWindows, GetClassNameW, GetForegroundWindow, GetWindow, GetWindowLongPtrW, GetWindowRect,
     GetWindowTextLengthW, GetWindowThreadProcessId, IsIconic, IsWindowVisible, IsZoomed,
@@ -350,33 +350,133 @@ fn overlaps(a: RECT, b: RECT) -> bool {
     a.left < b.right && b.left < a.right && a.top < b.bottom && b.top < a.bottom
 }
 
-/// Pone o quita el desenfoque de Windows detrás de la ventana del dock, recortado a
-/// su forma redondeada (`rect` y `radius` en píxeles de la ventana).
-pub fn apply_backdrop(hwnd: HWND, appearance: Appearance, rect: RECT, radius: i32) {
-    // ACCENT_DISABLED, ACCENT_ENABLE_BLURBEHIND y ACCENT_ENABLE_ACRYLICBLURBEHIND.
-    let state = match appearance {
-        Appearance::Blur => 3,
-        Appearance::Acrylic => 4,
-        _ => 0,
-    };
-    set_accent(hwnd, state, 0x99_24_1c_17);
-    unsafe {
-        let region = if appearance.backdrop() {
-            CreateRoundRectRgn(
+/// Desenfoque de Windows detrás del dock (apariencias Desenfoque y Acrílico). El
+/// dock es una ventana con transparencia por píxel, y en ellas Windows desenfoca el
+/// rectángulo entero sin respetar su forma ni su región. Por eso el desenfoque va
+/// en una ventana normal aparte, recortada a la forma redondeada del dock y justo
+/// debajo de él.
+pub struct Backdrop {
+    hwnd: HWND,
+    /// Apariencia y tamaño aplicados, para no repetir el trabajo en cada fotograma.
+    applied: std::cell::Cell<Option<(Appearance, i32, i32)>>,
+}
+
+impl Backdrop {
+    pub fn new() -> Option<Self> {
+        use windows::core::w;
+        use windows::Win32::Graphics::Gdi::{GetStockObject, BLACK_BRUSH, HBRUSH};
+        use windows::Win32::System::LibraryLoader::GetModuleHandleW;
+        use windows::Win32::UI::WindowsAndMessaging::{
+            CreateWindowExW, RegisterClassExW, WNDCLASSEXW, WS_EX_NOACTIVATE, WS_EX_TOPMOST,
+            WS_EX_TRANSPARENT, WS_POPUP,
+        };
+        unsafe {
+            let instance = GetModuleHandleW(None).ok()?;
+            // Negro: con el acento de Windows, lo negro deja ver el desenfoque.
+            let class = WNDCLASSEXW {
+                cbSize: std::mem::size_of::<WNDCLASSEXW>() as u32,
+                lpfnWndProc: Some(backdrop_wndproc),
+                hInstance: instance.into(),
+                hbrBackground: HBRUSH(GetStockObject(BLACK_BRUSH).0),
+                lpszClassName: w!("GlassBarBackdrop"),
+                ..Default::default()
+            };
+            RegisterClassExW(&class);
+            let hwnd = CreateWindowExW(
+                WS_EX_TOOLWINDOW | WS_EX_NOACTIVATE | WS_EX_TOPMOST | WS_EX_TRANSPARENT,
+                w!("GlassBarBackdrop"),
+                w!("GlassBar — Fondo"),
+                WS_POPUP,
+                0,
+                0,
+                1,
+                1,
+                None,
+                None,
+                Some(instance.into()),
+                None,
+            )
+            .ok()?;
+            Some(Self {
+                hwnd,
+                applied: std::cell::Cell::new(None),
+            })
+        }
+    }
+
+    /// Pone el desenfoque de `appearance` bajo la ventana `dock`, en `rect` (en
+    /// pantalla) con esquinas de radio `radius`; lo quita si no lo necesita.
+    pub fn update(&self, dock: HWND, appearance: Appearance, rect: RECT, radius: i32) {
+        use windows::Win32::UI::WindowsAndMessaging::{
+            SetWindowPos, ShowWindow, SWP_NOACTIVATE, SWP_SHOWWINDOW, SW_HIDE,
+        };
+        if !appearance.backdrop() {
+            if self.applied.take().is_some() {
+                unsafe {
+                    let _ = ShowWindow(self.hwnd, SW_HIDE);
+                }
+            }
+            return;
+        }
+        let (width, height) = (rect.right - rect.left, rect.bottom - rect.top);
+        let applied = self.applied.get();
+        unsafe {
+            if applied.map(|(a, _, _)| a) != Some(appearance) {
+                // ACCENT_ENABLE_ACRYLICBLURBEHIND y ACCENT_ENABLE_BLURBEHIND.
+                let state = if appearance == Appearance::Acrylic {
+                    4
+                } else {
+                    3
+                };
+                set_accent(self.hwnd, state, ACRYLIC_TINT);
+            }
+            if applied.map(|(_, w, h)| (w, h)) != Some((width, height)) {
+                let region =
+                    CreateRoundRectRgn(0, 0, width + 1, height + 1, radius * 2, radius * 2);
+                // Windows se queda con la región.
+                let _ = SetWindowRgn(self.hwnd, Some(region), true);
+            }
+            // Justo debajo del dock, aunque otra ventana "siempre encima" se haya
+            // puesto entre medias.
+            let _ = SetWindowPos(
+                self.hwnd,
+                Some(dock),
                 rect.left,
                 rect.top,
-                rect.right + 1,
-                rect.bottom + 1,
-                radius * 2,
-                radius * 2,
-            )
-        } else {
-            HRGN::default()
-        };
-        // Windows se queda con la región; sin ella, la ventana entera.
-        let _ = SetWindowRgn(hwnd, Some(region).filter(|r| !r.is_invalid()), true);
+                width,
+                height,
+                SWP_NOACTIVATE | SWP_SHOWWINDOW,
+            );
+        }
+        self.applied.set(Some((appearance, width, height)));
     }
 }
+
+impl Drop for Backdrop {
+    fn drop(&mut self) {
+        unsafe {
+            let _ = windows::Win32::UI::WindowsAndMessaging::DestroyWindow(self.hwnd);
+        }
+    }
+}
+
+/// La ventana del desenfoque no hace nada propio: ni recibe clics (los atraviesa)
+/// ni se activa.
+unsafe extern "system" fn backdrop_wndproc(
+    hwnd: HWND,
+    msg: u32,
+    wparam: windows::Win32::Foundation::WPARAM,
+    lparam: LPARAM,
+) -> windows::Win32::Foundation::LRESULT {
+    use windows::Win32::UI::WindowsAndMessaging::{DefWindowProcW, HTTRANSPARENT, WM_NCHITTEST};
+    if msg == WM_NCHITTEST {
+        return windows::Win32::Foundation::LRESULT(HTTRANSPARENT as isize);
+    }
+    DefWindowProcW(hwnd, msg, wparam, lparam)
+}
+
+/// Tinte del acrílico (AABBGGRR): el gris oscuro del dock.
+const ACRYLIC_TINT: u32 = 0xB0_24_1c_17;
 
 /// `SetWindowCompositionAttribute`, sin documentar pero estable desde Windows 10:
 /// es lo que usan la barra de Windows y TranslucentTB. `color` es AABBGGRR.
