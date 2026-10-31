@@ -2,13 +2,18 @@ name: Compilar
 
 on:
   push:
-    branches: [main]
-    tags: ['v*']
+    branches: [main, develop]
   pull_request:
   workflow_dispatch:
 
 permissions:
   contents: read
+
+# Un push nuevo a la misma rama o PR cancela la compilación anterior, salvo en
+# main: de cada compilación de main sale una versión.
+concurrency:
+  group: build-${{ github.ref }}
+  cancel-in-progress: ${{ github.ref != 'refs/heads/main' }}
 
 jobs:
   build:
@@ -39,3 +44,26 @@ jobs:
         with:
           name: glassbar-exe
           path: target/release/glassbar.exe
+
+  # Lo que entra en main se publica como versión: tiene que traer una versión nueva
+  # en Cargo.toml (y Cargo.lock al día, que lo comprueba `--locked`).
+  version:
+    if: github.event_name == 'pull_request' && github.base_ref == 'main'
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+
+      - name: Comprobar que la versión es nueva
+        run: |
+          version=$(grep -m1 '^version' Cargo.toml | cut -d'"' -f2)
+          if ! [[ "$version" =~ ^[0-9]+\.[0-9]+\.[0-9]+(-[0-9A-Za-z.-]+)?$ ]]; then
+            echo "::error file=Cargo.toml::La versión \"$version\" no sigue SemVer (X.Y.Z)."
+            exit 1
+          fi
+          if git rev-parse -q --verify "refs/tags/v$version" > /dev/null; then
+            echo "::error file=Cargo.toml::La versión v$version ya está publicada. Súbela en Cargo.toml (en la rama release/* o hotfix/*)."
+            exit 1
+          fi
+          echo "Se publicará v$version al fusionar."
