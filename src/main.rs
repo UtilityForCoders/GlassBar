@@ -1375,6 +1375,9 @@ struct App {
     animating: bool,
     last_tick: Instant,
     mouse_tracked: bool,
+    /// Algún botón del ratón estaba pulsado en el último sondeo (ver
+    /// `close_on_outside_click`).
+    mouse_down: bool,
     /// Lee red, volumen y batería cada segundo.
     status: status::Reader,
     /// Apariencia de cada situación (escritorio, ventana maximizada…).
@@ -1454,6 +1457,7 @@ impl App {
             animating: false,
             last_tick: Instant::now(),
             mouse_tracked: false,
+            mouse_down: false,
             status: status_reader,
             styles,
             scene_read: Instant::now(),
@@ -1480,6 +1484,53 @@ impl App {
         if let Some(menu) = &mut self.app_menu {
             menu.hide();
         }
+    }
+
+    /// Cierra lo abierto si se acaba de pulsar fuera del dock y de los paneles.
+    /// Normalmente se cierran al perder el foco, pero si Windows no se lo dio al
+    /// abrirse nunca lo pierden; esto se mira cada 40 ms y no depende de él.
+    fn close_on_outside_click(&mut self, cursor: POINT) {
+        use windows::Win32::UI::Input::KeyboardAndMouse::{
+            GetAsyncKeyState, VK_LBUTTON, VK_MBUTTON, VK_RBUTTON,
+        };
+        let down = [VK_LBUTTON, VK_RBUTTON, VK_MBUTTON]
+            .iter()
+            .any(|&key| unsafe { GetAsyncKeyState(key.0 as i32) } < 0);
+        // Solo al pulsar: arrastrar un deslizador hasta fuera del panel no lo cierra.
+        let pressed = down && !self.mouse_down;
+        self.mouse_down = down;
+        if !pressed {
+            return;
+        }
+        let popups = [
+            self.launcher.as_ref().filter(|p| p.visible).map(|p| p.hwnd),
+            self.quick.as_ref().filter(|p| p.visible).map(|p| p.hwnd),
+            self.language.as_ref().filter(|p| p.visible).map(|p| p.hwnd),
+            self.tray_panel
+                .as_ref()
+                .filter(|p| p.visible)
+                .map(|p| p.hwnd),
+            self.app_menu.as_ref().filter(|p| p.visible).map(|p| p.hwnd),
+        ];
+        if popups.iter().all(Option::is_none) {
+            return;
+        }
+        // El menú de un icono de la bandeja es de su programa: pulsar en él no es fuera.
+        if self.tray_panel.as_ref().is_some_and(|p| p.menu.is_some()) || menu_open() {
+            return;
+        }
+        let inside = |hwnd: HWND| unsafe {
+            let mut rect = windows::Win32::Foundation::RECT::default();
+            windows::Win32::UI::WindowsAndMessaging::GetWindowRect(hwnd, &mut rect).is_ok()
+                && cursor.x >= rect.left
+                && cursor.x < rect.right
+                && cursor.y >= rect.top
+                && cursor.y < rect.bottom
+        };
+        if inside(self.hwnd) || popups.into_iter().flatten().any(inside) {
+            return;
+        }
+        self.close_popups();
     }
 
     /// Abre el menú de GlassBar en el cursor, cerrando los paneles abiertos.
@@ -2386,6 +2437,7 @@ unsafe extern "system" fn wndproc(hwnd: HWND, msg: u32, wparam: WPARAM, lparam: 
                         app.scale,
                     );
                     app.check_preview(pt, Instant::now());
+                    app.close_on_outside_click(pt);
                     // Con el dock a la vista, la apariencia sigue a la pantalla más de
                     // cerca (escribir en el lanzador, maximizar una ventana).
                     if app.visibility.expanded
