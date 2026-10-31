@@ -54,7 +54,7 @@ jobs:
 
       - name: Descargar el .exe compilado
         if: steps.version.outputs.exists == 'false'
-        uses: actions/download-artifact@v4
+        uses: actions/download-artifact@v8
         with:
           name: glassbar-exe
           path: target/release
