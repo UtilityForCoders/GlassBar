@@ -1384,8 +1384,9 @@ struct App {
     styles: style::Styles,
     /// Cuándo se miró la pantalla por última vez para elegir la apariencia.
     scene_read: Instant,
-    /// Desenfoque de Windows aplicado ahora: apariencia y tamaño de la ventana.
-    backdrop: Option<(style::Appearance, u32, u32)>,
+    /// Ventana con el desenfoque de Windows que va debajo del dock con las
+    /// apariencias Desenfoque y Acrílico.
+    backdrop: Option<style::Backdrop>,
 }
 
 impl App {
@@ -1461,7 +1462,7 @@ impl App {
             status: status_reader,
             styles,
             scene_read: Instant::now(),
-            backdrop: None,
+            backdrop: style::Backdrop::new(),
         })
     }
 
@@ -1580,20 +1581,18 @@ impl App {
 
     /// Pone el desenfoque de Windows detrás del dock si su apariencia lo pide, con
     /// la forma del dock; solo cuando cambia la apariencia o el tamaño.
-    fn sync_backdrop(&mut self) {
-        let key = (self.bar.appearance, self.surface.width, self.surface.height);
-        if self.backdrop == Some(key) {
+    fn sync_backdrop(&self) {
+        let Some(backdrop) = &self.backdrop else {
             return;
-        }
-        self.backdrop = Some(key);
+        };
         let px = |v: f32| (v * self.scale).round() as i32;
         let rect = windows::Win32::Foundation::RECT {
-            left: px(bar::SHADOW_PAD_X),
-            top: px(bar::SHADOW_PAD_Y),
-            right: self.surface.width as i32 - px(bar::SHADOW_PAD_X),
-            bottom: self.surface.height as i32 - px(bar::SHADOW_PAD_Y),
+            left: self.pos.x + px(bar::SHADOW_PAD_X),
+            top: self.pos.y + px(bar::SHADOW_PAD_Y),
+            right: self.pos.x + self.surface.width as i32 - px(bar::SHADOW_PAD_X),
+            bottom: self.pos.y + self.surface.height as i32 - px(bar::SHADOW_PAD_Y),
         };
-        style::apply_backdrop(self.hwnd, self.bar.appearance, rect, px(glass::DOCK_RADIUS));
+        backdrop.update(self.hwnd, self.bar.appearance, rect, px(glass::DOCK_RADIUS));
     }
 
     /// Abre o cierra el panel rápido sobre los iconos de red, volumen y batería.
@@ -1729,6 +1728,8 @@ impl App {
         self.fullscreen = priority::fullscreen_app(monitor);
         if raise && !self.fullscreen {
             priority::raise(self.hwnd);
+            // Su desenfoque, otra vez justo debajo.
+            self.sync_backdrop();
         }
     }
 
@@ -1942,6 +1943,8 @@ impl App {
                 ULW_ALPHA,
             );
         }
+        // El desenfoque acompaña al dock al aparecer, ocultarse o cambiar de ancho.
+        self.sync_backdrop();
     }
 
     /// Redibuja el dock en la superficie y lo envía al compositor
@@ -1949,7 +1952,6 @@ impl App {
         self.bar.draw(&mut self.surface.pixmap, self.scale);
         self.surface.copy_to_dib();
         self.update_position();
-        self.sync_backdrop();
     }
 
     /// Empieza a recibir un fotograma por refresco de la pantalla (ver `frames`).
