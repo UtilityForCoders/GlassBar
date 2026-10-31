@@ -7,7 +7,7 @@
 
 #define AppName "GlassBar"
 #define AppExe "glassbar.exe"
-#define AppUrl "https://github.com/JhonTMich/GlassBar"
+#define AppUrl "https://github.com/UtilityForCoders/GlassBar"
 #define RunKey "Software\Microsoft\Windows\CurrentVersion\Run"
 #define RunValue "GlassBar"
 
