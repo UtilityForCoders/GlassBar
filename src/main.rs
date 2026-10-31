@@ -1461,8 +1461,10 @@ impl App {
         })
     }
 
-    /// Abre el menú de GlassBar en el cursor, cerrando los paneles abiertos.
-    fn open_glassbar_menu(&mut self) {
+    /// Cierra todos los paneles y menús: solo puede haber uno abierto, que si no se
+    /// tapan. El dock nunca se lleva el foco, así que un clic en él no cierra el que
+    /// esté abierto: lo cierra quien abre otro.
+    fn close_popups(&mut self) {
         if let Some(menu) = &mut self.launcher {
             menu.hide();
         }
@@ -1475,6 +1477,14 @@ impl App {
         if let Some(panel) = &mut self.tray_panel {
             panel.hide();
         }
+        if let Some(menu) = &mut self.app_menu {
+            menu.hide();
+        }
+    }
+
+    /// Abre el menú de GlassBar en el cursor, cerrando los paneles abiertos.
+    fn open_glassbar_menu(&mut self) {
+        self.close_popups();
         if self.app_menu.is_none() {
             match AppMenuWindow::new(self.hwnd) {
                 Ok(menu) => self.app_menu = Some(menu),
@@ -1541,12 +1551,7 @@ impl App {
             panel.hide();
             return;
         }
-        if let Some(menu) = &mut self.launcher {
-            menu.hide();
-        }
-        if let Some(panel) = &mut self.language {
-            panel.hide();
-        }
+        self.close_popups();
         if self.quick.is_none() {
             match QuickWindow::new(self.hwnd) {
                 Ok(panel) => self.quick = Some(panel),
@@ -1570,12 +1575,7 @@ impl App {
             }
             return;
         }
-        if let Some(panel) = &mut self.quick {
-            panel.hide();
-        }
-        if let Some(panel) = &mut self.language {
-            panel.hide();
-        }
+        self.close_popups();
         let pinned: Vec<_> = self
             .bar
             .primary_apps
@@ -1629,15 +1629,7 @@ impl App {
             panel.hide();
             return;
         }
-        if let Some(menu) = &mut self.launcher {
-            menu.hide();
-        }
-        if let Some(panel) = &mut self.quick {
-            panel.hide();
-        }
-        if let Some(panel) = &mut self.language {
-            panel.hide();
-        }
+        self.close_popups();
         if self.tray_panel.is_none() {
             match TrayWindow::new(self.hwnd) {
                 Ok(panel) => self.tray_panel = Some(panel),
@@ -1659,12 +1651,7 @@ impl App {
             panel.hide();
             return;
         }
-        if let Some(menu) = &mut self.launcher {
-            menu.hide();
-        }
-        if let Some(panel) = &mut self.quick {
-            panel.hide();
-        }
+        self.close_popups();
         if self.language.is_none() {
             match LanguageWindow::new(self.hwnd) {
                 Ok(panel) => self.language = Some(panel),
@@ -2079,6 +2066,11 @@ unsafe extern "system" fn wndproc(hwnd: HWND, msg: u32, wparam: WPARAM, lparam: 
 
         WM_LBUTTONDOWN => {
             with_app(|app| {
+                // Un clic en el dock cierra el menú abierto, como en Windows; los
+                // paneles se cierran al abrir otro o al llevarse el foco otra app.
+                if let Some(menu) = &mut app.app_menu {
+                    menu.hide();
+                }
                 if let Some(target) = app.bar.hovered {
                     app.bar.pressed = Some(target);
                     if let Some(preview) = &mut app.preview {
@@ -2260,18 +2252,7 @@ unsafe extern "system" fn wndproc(hwnd: HWND, msg: u32, wparam: WPARAM, lparam: 
                                 .item_label(target, app.scale)
                                 .map(|(_, cx)| cx.round() as i32)
                                 .unwrap_or_default();
-                        if let Some(menu) = &mut app.launcher {
-                            menu.hide();
-                        }
-                        if let Some(panel) = &mut app.quick {
-                            panel.hide();
-                        }
-                        if let Some(panel) = &mut app.language {
-                            panel.hide();
-                        }
-                        if let Some(panel) = &mut app.tray_panel {
-                            panel.hide();
-                        }
+                        app.close_popups();
                         if app.app_menu.is_none() {
                             match AppMenuWindow::new(app.hwnd) {
                                 Ok(menu) => app.app_menu = Some(menu),
