@@ -72,12 +72,13 @@ use windows::Win32::UI::WindowsAndMessaging::{
 };
 
 use crate::appmenu::{
-    CMD_APP_CLOSE, CMD_APP_END_TASK, CMD_APP_OPEN, CMD_APP_PIN, CMD_APP_UNPIN, CMD_JUMP,
+    CMD_APP_CLOSE, CMD_APP_END_TASK, CMD_APP_OPEN, CMD_APP_PIN, CMD_APP_UNPIN, CMD_AUTOSTART,
+    CMD_EXIT, CMD_JUMP,
 };
 use crate::autohide::AutoHide;
 use crate::bar::{BarState, HoverTarget, BOTTOM_MARGIN};
 use crate::shell::TaskbarReplacer;
-use crate::tray::{Tray, CMD_AUTOSTART, CMD_EXIT, WM_TRAY};
+use crate::tray::{Tray, WM_TRAY};
 
 const WM_MOUSELEAVE: u32 = 0x02A3;
 const WM_SHOW_LAUNCHER: u32 = windows::Win32::UI::WindowsAndMessaging::WM_APP + 2;
@@ -1460,6 +1461,36 @@ impl App {
         })
     }
 
+    /// Abre el menú de GlassBar en el cursor, cerrando los paneles abiertos.
+    fn open_glassbar_menu(&mut self) {
+        if let Some(menu) = &mut self.launcher {
+            menu.hide();
+        }
+        if let Some(panel) = &mut self.quick {
+            panel.hide();
+        }
+        if let Some(panel) = &mut self.language {
+            panel.hide();
+        }
+        if let Some(panel) = &mut self.tray_panel {
+            panel.hide();
+        }
+        if self.app_menu.is_none() {
+            match AppMenuWindow::new(self.hwnd) {
+                Ok(menu) => self.app_menu = Some(menu),
+                Err(_) => return,
+            }
+        }
+        let mut cursor = POINT::default();
+        unsafe {
+            let _ = GetCursorPos(&mut cursor);
+        }
+        let bounds = (self.screen_left, self.screen_right);
+        if let Some(menu) = &mut self.app_menu {
+            menu.open_glassbar(&self.styles, autostart::is_enabled(), cursor, bounds);
+        }
+    }
+
     /// Mira lo que pasa en pantalla y, si cambia la apariencia del dock, lo redibuja.
     fn update_style(&mut self) {
         self.scene_read = Instant::now();
@@ -2264,9 +2295,7 @@ unsafe extern "system" fn wndproc(hwnd: HWND, msg: u32, wparam: WPARAM, lparam: 
                     }
                     // En el resto del dock, el de GlassBar.
                     _ => {
-                        if let Some(cmd) = app.tray.show_context_menu(&app.styles) {
-                            handle_menu_command(app, cmd);
-                        }
+                        app.open_glassbar_menu();
                     }
                 }
             });
@@ -2429,9 +2458,7 @@ unsafe extern "system" fn wndproc(hwnd: HWND, msg: u32, wparam: WPARAM, lparam: 
             let event = (lparam.0 & 0xffff) as u32;
             if event == WM_RBUTTONUP {
                 with_app(|app| {
-                    if let Some(cmd) = app.tray.show_context_menu(&app.styles) {
-                        handle_menu_command(app, cmd);
-                    }
+                    app.open_glassbar_menu();
                 });
             }
             LRESULT(0)
@@ -2887,16 +2914,25 @@ struct MenuApp {
     jump: Vec<jumplist::Section>,
 }
 
-/// Menú propio de una app del dock (ver `appmenu`), con el estilo de Windows 11.
+/// De qué es el menú abierto.
+enum MenuPurpose {
+    /// El de una app del dock.
+    App(MenuApp),
+    /// El de GlassBar: estilos, iniciar con Windows y salir.
+    GlassBar,
+}
+
+/// Menú propio (ver `appmenu`), con el estilo de Windows 11: el de cada app del
+/// dock y el de GlassBar.
 struct AppMenuWindow {
     hwnd: HWND,
     surface: Option<Surface>,
     pos: POINT,
     scale: f32,
-    model: appmenu::AppMenu,
+    model: appmenu::Cascade,
     visible: bool,
     transition: launcher::Transition,
-    app: Option<MenuApp>,
+    purpose: Option<MenuPurpose>,
     /// Iconos ya reducidos al tamaño del menú, por archivo o tipo de archivo: así
     /// las siguientes aperturas no los vuelven a leer.
     icons: std::collections::HashMap<String, Option<Pixmap>>,
@@ -2925,10 +2961,10 @@ impl AppMenuWindow {
             surface: None,
             pos: POINT::default(),
             scale: 1.0,
-            model: appmenu::AppMenu::default(),
+            model: appmenu::Cascade::default(),
             visible: false,
             transition: launcher::Transition::hidden(),
-            app: None,
+            purpose: None,
             icons: std::collections::HashMap::new(),
             icons_scale: 0.0,
         })
@@ -3041,9 +3077,41 @@ impl AppMenuWindow {
                 command: CMD_APP_CLOSE,
             });
         }
-        self.model = appmenu::AppMenu::new(entries);
-        self.app = Some(app);
+        self.model = appmenu::Cascade::new(appmenu::AppMenu::new(entries), false);
+        self.purpose = Some(MenuPurpose::App(app));
+        let width = (self.model.size().0 * self.scale).ceil() as i32;
+        let margin = (12.0 * self.scale).round() as i32;
+        self.show(anchor_x - width / 2, dock_top - margin, (left, right));
+    }
 
+    /// Abre el menú de GlassBar con su esquina inferior izquierda en el cursor,
+    /// como el de un clic derecho en Windows.
+    fn open_glassbar(
+        &mut self,
+        styles: &style::Styles,
+        autostart: bool,
+        cursor: POINT,
+        (left, right): (i32, i32),
+    ) {
+        let (_, dpi) = monitors::get_info(monitors::primary());
+        self.scale = dpi.max(0.3);
+        // Los submenús, a la derecha si caben; si no, a la izquierda.
+        let wide = appmenu::Cascade::new(appmenu::glassbar(styles, autostart), false);
+        let room = cursor.x + (wide.size().0 * self.scale).ceil() as i32 <= right;
+        self.model = if room {
+            wide
+        } else {
+            appmenu::Cascade::new(wide.root, true)
+        };
+        self.purpose = Some(MenuPurpose::GlassBar);
+        // Con los submenús a la izquierda, el menú principal sigue en el cursor.
+        let root_x = (self.model.root_origin().0 * self.scale).round() as i32;
+        self.show(cursor.x - root_x, cursor.y, (left, right));
+    }
+
+    /// Muestra el menú ya preparado con su esquina superior izquierda en `x` y su
+    /// borde inferior en `bottom`, sin salirse de la pantalla.
+    fn show(&mut self, x: i32, bottom: i32, (left, right): (i32, i32)) {
         let (w, h) = self.model.size();
         let (width, height) = (
             (w * self.scale).ceil() as u32,
@@ -3061,11 +3129,11 @@ impl AppMenuWindow {
         }
         let margin = (12.0 * self.scale).round() as i32;
         self.pos = POINT {
-            x: (anchor_x - width as i32 / 2).clamp(
+            x: x.clamp(
                 left + margin,
                 (right - width as i32 - margin).max(left + margin),
             ),
-            y: dock_top - height as i32 - margin,
+            y: bottom - height as i32,
         };
         self.visible = true;
         self.transition.open(Instant::now());
@@ -3097,15 +3165,14 @@ impl AppMenuWindow {
             return;
         }
         self.visible = false;
-        self.model.hovered = None;
+        self.model.leave();
         self.transition.close(Instant::now());
         self.present();
     }
-    /// Cierra el menú y devuelve la opción `index` y la app sobre la que actuar.
-    fn choose(&mut self, index: usize) -> Option<(u32, MenuApp)> {
-        let command = self.model.command(index)?;
+    /// Cierra el menú y devuelve la orden elegida y de qué menú era.
+    fn choose(&mut self, command: u32) -> Option<(u32, MenuPurpose)> {
         self.hide();
-        Some((command, self.app.take()?))
+        Some((command, self.purpose.take()?))
     }
 }
 impl Drop for AppMenuWindow {
@@ -3164,19 +3231,25 @@ unsafe extern "system" fn app_menu_wndproc(
         )
     };
     // Primero se cierra el menú y se suelta; luego se actúa, que puede tocar el dock.
-    let choose = |index: Option<usize>| {
-        let Some(index) = index else {
+    let choose = |command: Option<u32>| {
+        let Some(command) = command else {
             return;
         };
         let choice = with_app(|app| {
             app.app_menu
                 .as_mut()
                 .filter(|m| m.visible)
-                .and_then(|m| m.choose(index))
+                .and_then(|m| m.choose(command))
         })
         .flatten();
-        if let Some((command, chosen)) = choice {
-            with_app(|app| run_menu_choice(app, command, chosen));
+        match choice {
+            Some((command, MenuPurpose::App(chosen))) => {
+                with_app(|app| run_menu_choice(app, command, chosen));
+            }
+            Some((command, MenuPurpose::GlassBar)) => {
+                with_app(|app| handle_menu_command(app, command));
+            }
+            None => {}
         }
     };
     match msg {
@@ -3199,9 +3272,7 @@ unsafe extern "system" fn app_menu_wndproc(
                 };
                 let _ = TrackMouseEvent(&mut track);
                 let (x, y) = point(menu.scale);
-                let hit = menu.model.hit_test(x, y);
-                if hit != menu.model.hovered {
-                    menu.model.hovered = hit;
+                if menu.model.point(x, y) {
                     menu.render();
                 }
             });
@@ -3209,48 +3280,40 @@ unsafe extern "system" fn app_menu_wndproc(
         WM_MOUSELEAVE => {
             with_app(|app| {
                 if let Some(menu) = app.app_menu.as_mut().filter(|m| m.visible) {
-                    if menu.model.hovered.take().is_some() {
+                    if menu.model.leave() {
                         menu.render();
                     }
                 }
             });
         }
         WM_LBUTTONUP => {
-            let index = with_app(|app| {
-                let menu = app.app_menu.as_ref().filter(|m| m.visible)?;
+            let command = with_app(|app| {
+                let menu = app.app_menu.as_mut().filter(|m| m.visible)?;
                 let (x, y) = point(menu.scale);
-                menu.model.hit_test(x, y)
+                let command = menu.model.click(x, y);
+                // Un clic en una opción con submenú lo abre.
+                menu.render();
+                command
             })
             .flatten();
-            choose(index);
+            choose(command);
         }
-        WM_KEYDOWN => match wparam.0 {
-            // Escape
-            0x1B => {
-                with_app(|app| app.app_menu.as_mut().map(AppMenuWindow::hide));
+        WM_KEYDOWN => {
+            let key = with_app(|app| {
+                let menu = app.app_menu.as_mut().filter(|m| m.visible)?;
+                let key = menu.model.key(wparam.0);
+                match key {
+                    appmenu::Key::Close => menu.hide(),
+                    appmenu::Key::Moved => menu.render(),
+                    appmenu::Key::Choose(_) => {}
+                }
+                Some(key)
+            })
+            .flatten();
+            if let Some(appmenu::Key::Choose(command)) = key {
+                choose(Some(command));
             }
-            // Flechas arriba y abajo
-            0x26 | 0x28 => {
-                with_app(|app| {
-                    if let Some(menu) = app.app_menu.as_mut().filter(|m| m.visible) {
-                        menu.model.move_hover(wparam.0 == 0x28);
-                        menu.render();
-                    }
-                });
-            }
-            // Enter
-            0x0D => {
-                let index = with_app(|app| {
-                    app.app_menu
-                        .as_ref()
-                        .filter(|m| m.visible)
-                        .and_then(|m| m.model.hovered)
-                })
-                .flatten();
-                choose(index);
-            }
-            _ => {}
-        },
+        }
         _ => return DefWindowProcW(hwnd, msg, wparam, lparam),
     }
     LRESULT(0)

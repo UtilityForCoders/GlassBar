@@ -42,6 +42,17 @@ impl State {
             State::TaskView => "Vista de tareas abierta",
         }
     }
+    /// Icono de Segoe Fluent Icons para el menú.
+    pub fn glyph(self) -> char {
+        match self {
+            State::Desktop => '\u{E7F4}',
+            State::VisibleWindow => '\u{E8A7}',
+            State::Maximized => '\u{E740}',
+            State::Start => '\u{E80F}',
+            State::Search => '\u{E721}',
+            State::TaskView => '\u{E7C4}',
+        }
+    }
 }
 
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq, serde::Serialize, serde::Deserialize)]

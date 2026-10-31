@@ -14,6 +14,8 @@ mod accent;
 mod appmenu;
 #[path = "../src/apps.rs"]
 mod apps;
+#[path = "../src/autostart.rs"]
+mod autostart;
 #[path = "../src/bar.rs"]
 mod bar;
 #[path = "../src/catalog.rs"]
@@ -145,16 +147,36 @@ fn main() {
             label: "Cerrar ventana".into(),
             command: appmenu::CMD_APP_CLOSE,
         });
-        let mut menu = appmenu::AppMenu::new(entries);
+        let mut menu = appmenu::Cascade::new(appmenu::AppMenu::new(entries), false);
         // La tercera opción resaltada, para ver el efecto al pasar el cursor.
-        menu.move_hover(true);
-        menu.move_hover(true);
-        menu.move_hover(true);
+        menu.key(0x28);
+        menu.key(0x28);
+        menu.key(0x28);
         let (w, h) = menu.size();
         let mut image = Pixmap::new((w * scale).ceil() as u32, (h * scale).ceil() as u32).unwrap();
         menu.draw(&mut image, scale);
         std::fs::write("target/appmenu-preview.bmp", bmp_entry(&image)).unwrap();
         println!("Menú de {id}: target/appmenu-preview.bmp");
+        return;
+    }
+    // Menú de GlassBar con el submenú de la segunda situación abierto, en
+    // target/glassbar-menu-preview.bmp.
+    if arguments_of("--glassbar-menu").is_some() {
+        let mut styles = style::Styles::load();
+        if !styles.watches_screen() {
+            styles.set_appearance(style::State::VisibleWindow, style::Appearance::Blur);
+        }
+        let mut menu =
+            appmenu::Cascade::new(appmenu::glassbar(&styles, autostart::is_enabled()), false);
+        menu.key(0x28);
+        menu.key(0x28);
+        menu.key(0x27);
+        menu.key(0x28);
+        let (w, h) = menu.size();
+        let mut image = Pixmap::new((w * scale).ceil() as u32, (h * scale).ceil() as u32).unwrap();
+        menu.draw(&mut image, scale);
+        std::fs::write("target/glassbar-menu-preview.bmp", bmp_entry(&image)).unwrap();
+        println!("Menú de GlassBar: target/glassbar-menu-preview.bmp");
         return;
     }
     // Jump list de cualquier AppUserModelID (p. ej. `--jumplist-id Chrome`).
