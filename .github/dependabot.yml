@@ -1,0 +1,23 @@
+# Actualizaciones de dependencias contra develop, como cualquier otro cambio
+# (Git Flow), con mensajes en Conventional Commits.
+version: 2
+updates:
+  - package-ecosystem: cargo
+    directory: /
+    target-branch: develop
+    schedule:
+      interval: weekly
+    commit-message:
+      prefix: build
+      include: scope
+    groups:
+      windows:
+        patterns: ["windows*"]
+
+  - package-ecosystem: github-actions
+    directory: /
+    target-branch: develop
+    schedule:
+      interval: weekly
+    commit-message:
+      prefix: ci

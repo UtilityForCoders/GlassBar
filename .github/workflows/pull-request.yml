@@ -1,0 +1,42 @@
+name: Normas del PR
+
+# Los PR se fusionan con squash y su título queda como commit: tiene que seguir
+# Conventional Commits. Las ramas siguen Git Flow (ver CLAUDE.md).
+on:
+  pull_request:
+    types: [opened, edited, synchronize, reopened]
+
+permissions:
+  contents: read
+
+jobs:
+  rules:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Título en Conventional Commits
+        env:
+          TITLE: ${{ github.event.pull_request.title }}
+        run: |
+          pattern='^(feat|fix|perf|refactor|style|test|docs|build|ci|chore|revert)(\([a-z0-9-]+\))?!?: .+[^.]$'
+          if [[ ! "$TITLE" =~ $pattern ]]; then
+            echo "::error::El título \"$TITLE\" no sigue Conventional Commits: tipo(ámbito opcional): descripción, sin punto final. Tipos: feat, fix, perf, refactor, style, test, docs, build, ci, chore, revert."
+            exit 1
+          fi
+
+      - name: Rama según Git Flow
+        env:
+          HEAD: ${{ github.head_ref }}
+          BASE: ${{ github.base_ref }}
+        run: |
+          case "$HEAD" in
+            feature/*|bugfix/*|dependabot/*) allowed="develop" ;;
+            release/*|hotfix/*) allowed="main" ;;
+            *)
+              echo "::error::La rama \"$HEAD\" no sigue Git Flow: usa feature/*, bugfix/*, release/* o hotfix/*."
+              exit 1
+              ;;
+          esac
+          if [[ "$BASE" != "$allowed" ]]; then
+            echo "::error::Un PR desde \"$HEAD\" va contra \"$allowed\", no contra \"$BASE\"."
+            exit 1
+          fi
