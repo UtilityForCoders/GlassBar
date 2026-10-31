@@ -19,7 +19,6 @@ const TRAY_ID: u32 = 101;
 
 pub const CMD_AUTOSTART: u32 = 2;
 pub const CMD_EXIT: u32 = 3;
-pub const CMD_REMOVE: u32 = 5;
 
 pub struct Tray {
     hwnd: HWND,
@@ -66,8 +65,8 @@ impl Tray {
         }
     }
 
-    /// Despliega el menú contextual de la bandeja y devuelve la opción elegida.
-    pub fn show_context_menu(&self, removable: bool) -> Option<u32> {
+    /// Despliega el menú contextual de GlassBar y devuelve la opción elegida.
+    pub fn show_context_menu(&self) -> Option<u32> {
         unsafe {
             let menu: HMENU = CreatePopupMenu().ok()?;
 
@@ -80,16 +79,6 @@ impl Tray {
             );
             let _ = AppendMenuW(menu, MF_SEPARATOR, 0, None);
 
-            if removable {
-                let _ = AppendMenuW(
-                    menu,
-                    MF_STRING,
-                    CMD_REMOVE as usize,
-                    w!("Quitar este programa"),
-                );
-            }
-            let _ = AppendMenuW(menu, MF_SEPARATOR, 0, None);
-
             // Iniciar con Windows
             let autostart_text = if autostart::is_enabled() {
                 w!("✓ Iniciar con Windows")
@@ -100,30 +89,30 @@ impl Tray {
 
             let _ = AppendMenuW(menu, MF_SEPARATOR, 0, None);
             let _ = AppendMenuW(menu, MF_STRING, CMD_EXIT as usize, w!("Salir de GlassBar"));
-
-            let mut pt = POINT::default();
-            let _ = GetCursorPos(&mut pt);
-
-            // Obligatorio para que el menú se cierre al hacer clic fuera
-            let _ = SetForegroundWindow(self.hwnd);
-
-            let cmd = TrackPopupMenuEx(
-                menu,
-                TPM_RETURNCMD.0 | TPM_LEFTALIGN.0 | TPM_BOTTOMALIGN.0,
-                pt.x,
-                pt.y,
-                self.hwnd,
-                None,
-            );
-
-            let _ = DestroyMenu(menu);
-
-            if cmd.0 != 0 {
-                Some(cmd.0 as u32)
-            } else {
-                None
-            }
+            self.track(menu)
         }
+    }
+
+    /// Muestra `menu` en el cursor, lo destruye y devuelve la opción elegida.
+    unsafe fn track(&self, menu: HMENU) -> Option<u32> {
+        let mut pt = POINT::default();
+        let _ = GetCursorPos(&mut pt);
+
+        // Obligatorio para que el menú se cierre al hacer clic fuera
+        let _ = SetForegroundWindow(self.hwnd);
+
+        let cmd = TrackPopupMenuEx(
+            menu,
+            TPM_RETURNCMD.0 | TPM_LEFTALIGN.0 | TPM_BOTTOMALIGN.0,
+            pt.x,
+            pt.y,
+            self.hwnd,
+            None,
+        );
+
+        let _ = DestroyMenu(menu);
+
+        (cmd.0 != 0).then_some(cmd.0 as u32)
     }
 }
 

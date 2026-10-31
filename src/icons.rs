@@ -26,6 +26,34 @@ pub fn load(path: &str) -> Option<Pixmap> {
     }
 }
 
+/// El icono número `index` de un archivo de recursos (.exe, .dll, .ico), como el que
+/// guarda una tarea de la jump list. Con `index` negativo, el icono del archivo.
+pub fn load_resource(path: &str, index: i32) -> Option<Pixmap> {
+    if index < 0 {
+        return load(path);
+    }
+    use windows::Win32::System::Com::{CoInitializeEx, CoUninitialize, COINIT_APARTMENTTHREADED};
+    let wide: Vec<u16> = path.encode_utf16().chain(Some(0)).collect();
+    unsafe {
+        let initialized = CoInitializeEx(None, COINIT_APARTMENTTHREADED).is_ok();
+        let mut icon = windows::Win32::UI::WindowsAndMessaging::HICON::default();
+        let result =
+            (SHDefExtractIconW(PCWSTR(wide.as_ptr()), index, 0, Some(&mut icon), None, 128)
+                .is_ok()
+                && !icon.is_invalid())
+            .then(|| {
+                let image = rasterize(icon);
+                let _ = DestroyIcon(icon);
+                image
+            })
+            .flatten();
+        if initialized {
+            CoUninitialize();
+        }
+        result.or_else(|| load(path))
+    }
+}
+
 /// Nombre que el Shell muestra para una ruta o elemento (`shell:AppsFolder\...`).
 pub fn display_name(path: &str) -> Option<String> {
     use windows::Win32::System::Com::{

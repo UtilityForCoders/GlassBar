@@ -1,11 +1,17 @@
 //! Genera una vista previa del dock en `dock_preview.bmp` para comprobar el renderizado exacto.
 
+// Incluye los módulos de la app con `#[path]` pero usa solo una parte: lo que solo
+// usa la app principal no es código muerto, aunque aquí lo parezca.
+#![allow(dead_code)]
+
 use std::fs::File;
 use std::io::Write;
 use tiny_skia::Pixmap;
 
 #[path = "../src/accent.rs"]
 mod accent;
+#[path = "../src/appmenu.rs"]
+mod appmenu;
 #[path = "../src/apps.rs"]
 mod apps;
 #[path = "../src/bar.rs"]
@@ -20,6 +26,8 @@ mod font;
 mod glass;
 #[path = "../src/icons.rs"]
 mod icons;
+#[path = "../src/jumplist.rs"]
+mod jumplist;
 #[path = "../src/keyboard.rs"]
 mod keyboard;
 #[path = "../src/launcher.rs"]
@@ -92,6 +100,95 @@ fn main() {
         println!("Tiempos: catálogo {opened:?}, precarga de iconos {preloaded:?}, primer dibujo {first:?}, redibujo {redraw:?}");
         return;
     }
+    // Menú de una app con su jump list real (p. ej. `--appmenu Chrome`), en
+    // target/appmenu-preview.bmp.
+    if let Some(index) = arguments_of("--appmenu") {
+        let id = std::env::args()
+            .nth(index + 1)
+            .unwrap_or_else(|| "Chrome".into());
+        let side = (appmenu::ICON * scale).round() as u32;
+        let small = |icon: Option<Pixmap>| icon.map(|i| apps::downscale(&i, side));
+        let mut entries = Vec::new();
+        let mut next = appmenu::CMD_JUMP;
+        for section in jumplist::sections(&id) {
+            entries.push(appmenu::Entry::Header(section.title));
+            for item in section.items {
+                let (path, number) = item.icon_source();
+                entries.push(appmenu::Entry::Item {
+                    icon: appmenu::Icon::Image(small(icons::load_resource(&path, number))),
+                    label: item.name,
+                    command: next,
+                });
+                next += 1;
+            }
+        }
+        entries.push(appmenu::Entry::Separator);
+        entries.push(appmenu::Entry::Item {
+            icon: appmenu::Icon::Image(small(icons::load(&format!("shell:AppsFolder\\{id}")))),
+            label: id.clone(),
+            command: appmenu::CMD_APP_OPEN,
+        });
+        entries.push(appmenu::Entry::Item {
+            icon: appmenu::Icon::Glyph(appmenu::GLYPH_UNPIN),
+            label: "Desanclar de la barra de tareas".into(),
+            command: appmenu::CMD_APP_UNPIN,
+        });
+        entries.push(appmenu::Entry::Item {
+            icon: appmenu::Icon::Glyph(appmenu::GLYPH_END_TASK),
+            label: "Finalizar tarea".into(),
+            command: appmenu::CMD_APP_END_TASK,
+        });
+        entries.push(appmenu::Entry::Item {
+            icon: appmenu::Icon::Glyph(appmenu::GLYPH_CLOSE),
+            label: "Cerrar ventana".into(),
+            command: appmenu::CMD_APP_CLOSE,
+        });
+        let mut menu = appmenu::AppMenu::new(entries);
+        // La tercera opción resaltada, para ver el efecto al pasar el cursor.
+        menu.move_hover(true);
+        menu.move_hover(true);
+        menu.move_hover(true);
+        let (w, h) = menu.size();
+        let mut image = Pixmap::new((w * scale).ceil() as u32, (h * scale).ceil() as u32).unwrap();
+        menu.draw(&mut image, scale);
+        std::fs::write("target/appmenu-preview.bmp", bmp_entry(&image)).unwrap();
+        println!("Menú de {id}: target/appmenu-preview.bmp");
+        return;
+    }
+    // Jump list de cualquier AppUserModelID (p. ej. `--jumplist-id Chrome`).
+    let arguments: Vec<String> = std::env::args().collect();
+    if let Some(index) = arguments.iter().position(|a| a == "--jumplist-id") {
+        for id in &arguments[index + 1..] {
+            println!("{id}");
+            for section in jumplist::sections(id) {
+                println!("    [{}]", section.title);
+                for item in section.items {
+                    println!("      {} | {:?}", item.name, item.action);
+                }
+            }
+        }
+        return;
+    }
+    // Jump list de cada app del dock: su AppUserModelID y lo que daría el clic derecho.
+    if std::env::args().any(|a| a == "--jumplist") {
+        apps::update_running_apps(&mut state.primary_apps, &mut state.open_apps);
+        for a in state.primary_apps.iter().chain(&state.open_apps) {
+            let command = a.pin_entry().command;
+            let id = jumplist::app_id(&command, &a.windows);
+            println!("{} | id {:?}", a.entry.name, id);
+            let sections = id.as_deref().map(jumplist::sections).unwrap_or_default();
+            if sections.is_empty() {
+                println!("    (sin jump list)");
+            }
+            for section in sections {
+                println!("    [{}]", section.title);
+                for item in section.items {
+                    println!("      {} | {:?}", item.name, item.action);
+                }
+            }
+        }
+        return;
+    }
     let open = std::env::args().any(|a| a == "--open");
     if open {
         apps::update_running_apps(&mut state.primary_apps, &mut state.open_apps);
@@ -122,6 +219,11 @@ fn main() {
     let mut file = File::create("dock_preview.bmp").expect("failed to create dock_preview.bmp");
     file.write_all(&bmp).expect("failed to write bmp");
     println!("Vista previa guardada en dock_preview.bmp ({}x{})", w, h);
+}
+
+/// Posición del argumento `name`, si se pasó.
+fn arguments_of(name: &str) -> Option<usize> {
+    std::env::args().position(|a| a == name)
 }
 
 fn bmp_entry(pixmap: &Pixmap) -> Vec<u8> {
