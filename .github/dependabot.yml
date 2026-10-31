@@ -13,6 +13,12 @@ updates:
     groups:
       windows:
         patterns: ["windows*"]
+    # windows y windows-core tienen que ir en la misma versión (0.62 con 0.62):
+    # una sin la otra no compila, y cada versión nueva cambia su API. Solo se
+    # aceptan los parches (0.62.x); el salto de versión se hace a mano, a la vez.
+    ignore:
+      - dependency-name: "windows*"
+        update-types: ["version-update:semver-major", "version-update:semver-minor"]
 
   - package-ecosystem: github-actions
     directory: /
