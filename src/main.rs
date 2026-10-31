@@ -5,6 +5,7 @@
 //! Comportamiento auto-hide nativo (sale suavemente desde abajo al acercar el mouse) y estética translúcida.
 
 mod accent;
+mod appmenu;
 mod apps;
 mod audio;
 mod autohide;
@@ -18,6 +19,7 @@ mod frames;
 mod glass;
 mod guard;
 mod icons;
+mod jumplist;
 mod keyboard;
 mod language;
 mod launcher;
@@ -68,12 +70,13 @@ use windows::Win32::UI::WindowsAndMessaging::{
     WS_EX_TOPMOST, WS_EX_TRANSPARENT, WS_POPUP,
 };
 
+use crate::appmenu::{
+    CMD_APP_CLOSE, CMD_APP_END_TASK, CMD_APP_OPEN, CMD_APP_PIN, CMD_APP_UNPIN, CMD_JUMP,
+};
 use crate::autohide::AutoHide;
 use crate::bar::{BarState, HoverTarget, BOTTOM_MARGIN};
 use crate::shell::TaskbarReplacer;
-use crate::tray::{
-    Tray, CMD_APP_CLOSE, CMD_APP_OPEN, CMD_APP_PIN, CMD_APP_UNPIN, CMD_AUTOSTART, CMD_EXIT, WM_TRAY,
-};
+use crate::tray::{Tray, CMD_AUTOSTART, CMD_EXIT, WM_TRAY};
 
 const WM_MOUSELEAVE: u32 = 0x02A3;
 const WM_SHOW_LAUNCHER: u32 = windows::Win32::UI::WindowsAndMessaging::WM_APP + 2;
@@ -1336,6 +1339,8 @@ struct App {
     systray: Option<systray::Host>,
     /// Panel de las apps en segundo plano; se crea la primera vez que se abre.
     tray_panel: Option<TrayWindow>,
+    /// Menú de una app del dock (clic derecho); se crea la primera vez que se abre.
+    app_menu: Option<AppMenuWindow>,
     /// Cuándo se pulsó un icono de ese panel: el dock no se oculta mientras su
     /// programa abre la ventana o el menú.
     tray_clicked: Option<Instant>,
@@ -1391,6 +1396,8 @@ impl App {
 
         // Antes que el icono propio, para que también llegue a la bandeja propia.
         let systray = systray::Host::install(hwnd, WM_TRAY_ICONS);
+        // Lo que tarda en leerse para las jump lists, listo antes del primer clic derecho.
+        jumplist::warm_up();
         let tray = Tray::new(hwnd);
         let pinned: Vec<_> = bar.primary_apps.iter().map(|a| a.entry.clone()).collect();
 
@@ -1412,6 +1419,7 @@ impl App {
             tray,
             systray,
             tray_panel: None,
+            app_menu: None,
             tray_clicked: None,
             launcher: None,
             quick: None,
@@ -2127,10 +2135,61 @@ unsafe extern "system" fn wndproc(hwnd: HWND, msg: u32, wparam: WPARAM, lparam: 
                             return;
                         };
                         let (name, windows) = (item.entry.name.clone(), item.windows.len());
-                        let pinned = matches!(target, HoverTarget::PrimaryApp(_));
-                        if let Some(cmd) = app.tray.show_app_menu(&name, pinned, windows) {
-                            handle_app_command(app, target, cmd);
+                        let icon = item.icon.clone();
+                        let launch = item.pin_entry().command;
+                        // Su jump list, como en la barra de Windows.
+                        let jump = jumplist::app_id(&launch, &item.windows)
+                            .map(|id| jumplist::sections(&id))
+                            .unwrap_or_default();
+                        // "Finalizar tarea" si está activado en Windows y hay qué terminar
+                        // (el Explorador no, que es el escritorio).
+                        let end_task =
+                            apps::end_task_enabled() && !item.task_processes().is_empty();
+                        let chosen = MenuApp {
+                            command: item.entry.command.clone(),
+                            pinned: matches!(target, HoverTarget::PrimaryApp(_)),
+                            launch,
+                            jump,
+                        };
+                        // Se abre sobre el icono de la app, como en Windows.
+                        let anchor = app.pos.x
+                            + app
+                                .bar
+                                .item_label(target, app.scale)
+                                .map(|(_, cx)| cx.round() as i32)
+                                .unwrap_or_default();
+                        if let Some(menu) = &mut app.launcher {
+                            menu.hide();
                         }
+                        if let Some(panel) = &mut app.quick {
+                            panel.hide();
+                        }
+                        if let Some(panel) = &mut app.language {
+                            panel.hide();
+                        }
+                        if let Some(panel) = &mut app.tray_panel {
+                            panel.hide();
+                        }
+                        if app.app_menu.is_none() {
+                            match AppMenuWindow::new(app.hwnd) {
+                                Ok(menu) => app.app_menu = Some(menu),
+                                Err(_) => return,
+                            }
+                        }
+                        let (top, bounds) = (app.y_shown, (app.screen_left, app.screen_right));
+                        if let Some(menu) = &mut app.app_menu {
+                            menu.open(
+                                &name,
+                                icon.as_ref(),
+                                windows,
+                                end_task,
+                                chosen,
+                                anchor,
+                                top,
+                                bounds,
+                            );
+                        }
+                        app.expand();
                     }
                     // En el resto del dock, el de GlassBar.
                     _ => {
@@ -2264,6 +2323,7 @@ unsafe extern "system" fn wndproc(hwnd: HWND, msg: u32, wparam: WPARAM, lparam: 
                             || app.quick.as_ref().is_some_and(|q| q.visible)
                             || app.language.as_ref().is_some_and(|l| l.visible)
                             || app.tray_panel.as_ref().is_some_and(|p| p.visible)
+                            || app.app_menu.as_ref().is_some_and(|m| m.visible)
                             || app.preview.as_ref().is_some_and(|p| p.visible)
                             // El panel de iconos ocultos abierto sobre la flecha; se mira
                             // al final porque recorre las ventanas, y solo con el dock fuera.
@@ -2737,6 +2797,385 @@ impl TrayWindow {
         }
     }
 }
+/// La app sobre la que se abrió el menú: quién es (se vuelve a buscar al elegir,
+/// porque el dock puede cambiar mientras el menú está abierto), cómo se abre y su
+/// jump list.
+struct MenuApp {
+    command: String,
+    pinned: bool,
+    launch: String,
+    jump: Vec<jumplist::Section>,
+}
+
+/// Menú propio de una app del dock (ver `appmenu`), con el estilo de Windows 11.
+struct AppMenuWindow {
+    hwnd: HWND,
+    surface: Option<Surface>,
+    pos: POINT,
+    scale: f32,
+    model: appmenu::AppMenu,
+    visible: bool,
+    transition: launcher::Transition,
+    app: Option<MenuApp>,
+    /// Iconos ya reducidos al tamaño del menú, por archivo o tipo de archivo: así
+    /// las siguientes aperturas no los vuelven a leer.
+    icons: std::collections::HashMap<String, Option<Pixmap>>,
+    icons_scale: f32,
+}
+impl AppMenuWindow {
+    fn new(owner: HWND) -> Result<Self> {
+        let hwnd = unsafe {
+            CreateWindowExW(
+                WS_EX_LAYERED | WS_EX_TOPMOST | WS_EX_TOOLWINDOW,
+                w!("GlassBarAppMenu"),
+                w!("GlassBar — Menú de la app"),
+                WS_POPUP,
+                0,
+                0,
+                1,
+                1,
+                Some(owner),
+                None,
+                Some(GetModuleHandleW(None)?.into()),
+                None,
+            )?
+        };
+        Ok(Self {
+            hwnd,
+            surface: None,
+            pos: POINT::default(),
+            scale: 1.0,
+            model: appmenu::AppMenu::default(),
+            visible: false,
+            transition: launcher::Transition::hidden(),
+            app: None,
+            icons: std::collections::HashMap::new(),
+            icons_scale: 0.0,
+        })
+    }
+
+    /// Icono del tamaño del menú, leído una sola vez por `key`.
+    fn icon(&mut self, key: String, load: impl FnOnce() -> Option<Pixmap>) -> Option<Pixmap> {
+        let side = (appmenu::ICON * self.scale).round().max(1.0) as u32;
+        self.icons
+            .entry(key)
+            .or_insert_with(|| load().map(|icon| apps::downscale(&icon, side)))
+            .clone()
+    }
+
+    /// Icono de un elemento de la jump list: el suyo propio; si no, el de su
+    /// archivo. Los archivos comparten el de su tipo; las carpetas, los programas y
+    /// los accesos directos tienen el suyo.
+    fn jump_icon(&mut self, item: &jumplist::JumpItem) -> Option<Pixmap> {
+        let (path, index) = item.icon_source();
+        let key = match (&item.icon, &item.action) {
+            (None, jumplist::Action::Open(file)) => {
+                let file = std::path::Path::new(file);
+                match file.extension().map(|e| e.to_string_lossy().to_lowercase()) {
+                    Some(ext)
+                        if !file.is_dir()
+                            && !matches!(ext.as_str(), "exe" | "lnk" | "ico" | "url") =>
+                    {
+                        format!("*.{ext}")
+                    }
+                    _ => path.to_lowercase(),
+                }
+            }
+            _ => format!("{},{index}", path.to_lowercase()),
+        };
+        self.icon(key, || icons::load_resource(&path, index))
+    }
+
+    /// Abre el menú de la app sobre su icono (`anchor_x`), encima del dock.
+    #[allow(clippy::too_many_arguments)]
+    fn open(
+        &mut self,
+        name: &str,
+        app_icon: Option<&Pixmap>,
+        windows: usize,
+        end_task: bool,
+        app: MenuApp,
+        anchor_x: i32,
+        dock_top: i32,
+        (left, right): (i32, i32),
+    ) {
+        use appmenu::{Entry, Icon};
+        let (_, dpi) = monitors::get_info(monitors::primary());
+        self.scale = dpi.max(0.3);
+        if self.icons_scale != self.scale {
+            self.icons.clear();
+            self.icons_scale = self.scale;
+        }
+        let mut entries = Vec::new();
+        let mut next = CMD_JUMP;
+        let jump = app.jump.clone();
+        for section in &jump {
+            entries.push(Entry::Header(section.title.clone()));
+            for item in &section.items {
+                entries.push(Entry::Item {
+                    icon: Icon::Image(self.jump_icon(item)),
+                    label: item.name.clone(),
+                    command: next,
+                });
+                next += 1;
+            }
+        }
+        if !entries.is_empty() {
+            entries.push(Entry::Separator);
+        }
+        let side = (appmenu::ICON * self.scale).round().max(1.0) as u32;
+        entries.push(Entry::Item {
+            icon: Icon::Image(app_icon.map(|icon| apps::downscale(icon, side))),
+            label: name.to_string(),
+            command: CMD_APP_OPEN,
+        });
+        entries.push(if app.pinned {
+            Entry::Item {
+                icon: Icon::Glyph(appmenu::GLYPH_UNPIN),
+                label: "Desanclar de la barra de tareas".into(),
+                command: CMD_APP_UNPIN,
+            }
+        } else {
+            Entry::Item {
+                icon: Icon::Glyph(appmenu::GLYPH_PIN),
+                label: "Anclar a la barra de tareas".into(),
+                command: CMD_APP_PIN,
+            }
+        });
+        if windows > 0 {
+            // Como en Windows 11, solo si está activado en sus ajustes.
+            if end_task {
+                entries.push(Entry::Item {
+                    icon: Icon::Glyph(appmenu::GLYPH_END_TASK),
+                    label: "Finalizar tarea".into(),
+                    command: CMD_APP_END_TASK,
+                });
+            }
+            entries.push(Entry::Item {
+                icon: Icon::Glyph(appmenu::GLYPH_CLOSE),
+                label: if windows == 1 {
+                    "Cerrar ventana".into()
+                } else {
+                    "Cerrar todas las ventanas".into()
+                },
+                command: CMD_APP_CLOSE,
+            });
+        }
+        self.model = appmenu::AppMenu::new(entries);
+        self.app = Some(app);
+
+        let (w, h) = self.model.size();
+        let (width, height) = (
+            (w * self.scale).ceil() as u32,
+            (h * self.scale).ceil() as u32,
+        );
+        if self
+            .surface
+            .as_ref()
+            .is_none_or(|s| s.width != width || s.height != height)
+        {
+            match Surface::new(width, height) {
+                Ok(surface) => self.surface = Some(surface),
+                Err(_) => return,
+            }
+        }
+        let margin = (12.0 * self.scale).round() as i32;
+        self.pos = POINT {
+            x: (anchor_x - width as i32 / 2).clamp(
+                left + margin,
+                (right - width as i32 - margin).max(left + margin),
+            ),
+            y: dock_top - height as i32 - margin,
+        };
+        self.visible = true;
+        self.transition.open(Instant::now());
+        self.render();
+        take_focus(self.hwnd);
+    }
+    fn render(&mut self) {
+        if let Some(surface) = &mut self.surface {
+            self.model.draw(&mut surface.pixmap, self.scale);
+            surface.copy_to_dib();
+        }
+        self.present();
+    }
+    fn present(&mut self) {
+        if let Some(surface) = &self.surface {
+            present_popup(
+                self.hwnd,
+                surface,
+                self.pos,
+                self.scale,
+                &self.transition,
+                self.visible,
+                false,
+            );
+        }
+    }
+    fn hide(&mut self) {
+        if !self.visible {
+            return;
+        }
+        self.visible = false;
+        self.model.hovered = None;
+        self.transition.close(Instant::now());
+        self.present();
+    }
+    /// Cierra el menú y devuelve la opción `index` y la app sobre la que actuar.
+    fn choose(&mut self, index: usize) -> Option<(u32, MenuApp)> {
+        let command = self.model.command(index)?;
+        self.hide();
+        Some((command, self.app.take()?))
+    }
+}
+impl Drop for AppMenuWindow {
+    fn drop(&mut self) {
+        unsafe {
+            let _ = windows::Win32::UI::WindowsAndMessaging::DestroyWindow(self.hwnd);
+        }
+    }
+}
+
+/// Lleva a cabo la opción elegida en el menú de una app.
+fn run_menu_choice(app: &mut App, command: u32, chosen: MenuApp) {
+    if let Some(index) = command.checked_sub(CMD_JUMP) {
+        if let Some(entry) = chosen
+            .jump
+            .iter()
+            .flat_map(|s| &s.items)
+            .nth(index as usize)
+        {
+            jumplist::open(entry, &chosen.launch);
+        }
+        return;
+    }
+    // La app se busca otra vez: si el dock cambió (se abrió o cerró otra), su
+    // posición ya no es la misma.
+    let same = |a: &apps::AppItem| a.entry.command.eq_ignore_ascii_case(&chosen.command);
+    let target = if chosen.pinned {
+        app.bar
+            .primary_apps
+            .iter()
+            .position(same)
+            .map(HoverTarget::PrimaryApp)
+    } else {
+        app.bar
+            .open_apps
+            .iter()
+            .position(same)
+            .map(HoverTarget::OpenApp)
+    };
+    if let Some(target) = target {
+        handle_app_command(app, target, command);
+    }
+}
+
+unsafe extern "system" fn app_menu_wndproc(
+    hwnd: HWND,
+    msg: u32,
+    wparam: WPARAM,
+    lparam: LPARAM,
+) -> LRESULT {
+    use windows::Win32::UI::WindowsAndMessaging::{WA_INACTIVE, WM_ACTIVATE, WM_KEYDOWN};
+    let point = |scale: f32| {
+        (
+            (lparam.0 & 0xffff) as i16 as f32 / scale,
+            ((lparam.0 >> 16) & 0xffff) as i16 as f32 / scale,
+        )
+    };
+    // Primero se cierra el menú y se suelta; luego se actúa, que puede tocar el dock.
+    let choose = |index: Option<usize>| {
+        let Some(index) = index else {
+            return;
+        };
+        let choice = with_app(|app| {
+            app.app_menu
+                .as_mut()
+                .filter(|m| m.visible)
+                .and_then(|m| m.choose(index))
+        })
+        .flatten();
+        if let Some((command, chosen)) = choice {
+            with_app(|app| run_menu_choice(app, command, chosen));
+        }
+    };
+    match msg {
+        WM_ACTIVATE if (wparam.0 & 0xffff) as u32 == WA_INACTIVE => {
+            with_app(|app| app.app_menu.as_mut().map(AppMenuWindow::hide));
+        }
+        WM_TIMER if wparam.0 == TIMER_ANIM => {
+            with_app(|app| app.app_menu.as_mut().map(AppMenuWindow::present));
+        }
+        WM_MOUSEMOVE => {
+            with_app(|app| {
+                let Some(menu) = app.app_menu.as_mut().filter(|m| m.visible) else {
+                    return;
+                };
+                let mut track = TRACKMOUSEEVENT {
+                    cbSize: std::mem::size_of::<TRACKMOUSEEVENT>() as u32,
+                    dwFlags: TME_LEAVE,
+                    hwndTrack: hwnd,
+                    dwHoverTime: 0,
+                };
+                let _ = TrackMouseEvent(&mut track);
+                let (x, y) = point(menu.scale);
+                let hit = menu.model.hit_test(x, y);
+                if hit != menu.model.hovered {
+                    menu.model.hovered = hit;
+                    menu.render();
+                }
+            });
+        }
+        WM_MOUSELEAVE => {
+            with_app(|app| {
+                if let Some(menu) = app.app_menu.as_mut().filter(|m| m.visible) {
+                    if menu.model.hovered.take().is_some() {
+                        menu.render();
+                    }
+                }
+            });
+        }
+        WM_LBUTTONUP => {
+            let index = with_app(|app| {
+                let menu = app.app_menu.as_ref().filter(|m| m.visible)?;
+                let (x, y) = point(menu.scale);
+                menu.model.hit_test(x, y)
+            })
+            .flatten();
+            choose(index);
+        }
+        WM_KEYDOWN => match wparam.0 {
+            // Escape
+            0x1B => {
+                with_app(|app| app.app_menu.as_mut().map(AppMenuWindow::hide));
+            }
+            // Flechas arriba y abajo
+            0x26 | 0x28 => {
+                with_app(|app| {
+                    if let Some(menu) = app.app_menu.as_mut().filter(|m| m.visible) {
+                        menu.model.move_hover(wparam.0 == 0x28);
+                        menu.render();
+                    }
+                });
+            }
+            // Enter
+            0x0D => {
+                let index = with_app(|app| {
+                    app.app_menu
+                        .as_ref()
+                        .filter(|m| m.visible)
+                        .and_then(|m| m.model.hovered)
+                })
+                .flatten();
+                choose(index);
+            }
+            _ => {}
+        },
+        _ => return DefWindowProcW(hwnd, msg, wparam, lparam),
+    }
+    LRESULT(0)
+}
+
 impl Drop for TrayWindow {
     fn drop(&mut self) {
         unsafe {
@@ -3231,6 +3670,11 @@ fn handle_app_command(app: &mut App, target: HoverTarget, cmd: u32) {
             apps::update_running_apps(&mut app.bar.primary_apps, &mut app.bar.open_apps);
             app.pins_changed();
         }
+        (CMD_APP_END_TASK, _) => {
+            if let Some(item) = app.bar.item_mut(target) {
+                item.end_task();
+            }
+        }
         (CMD_APP_CLOSE, _) => {
             if let Some(item) = app.bar.item_mut(target) {
                 item.close_windows();
@@ -3420,6 +3864,18 @@ fn main() -> Result<()> {
             ..Default::default()
         };
         if RegisterClassExW(&quick_class) == 0 {
+            return Err(windows::core::Error::from_thread());
+        }
+
+        let app_menu_class = WNDCLASSEXW {
+            cbSize: std::mem::size_of::<WNDCLASSEXW>() as u32,
+            lpfnWndProc: Some(app_menu_wndproc),
+            hInstance: instance.into(),
+            hCursor: LoadCursorW(None, IDC_ARROW)?,
+            lpszClassName: w!("GlassBarAppMenu"),
+            ..Default::default()
+        };
+        if RegisterClassExW(&app_menu_class) == 0 {
             return Err(windows::core::Error::from_thread());
         }
 

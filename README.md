@@ -6,10 +6,15 @@ Dock minimalista para Windows 10/11: iconos reales con vista previa de sus venta
 
 Arrastra un `.exe`, `.lnk` o `.url` desde el Explorador o el escritorio y suéltalo sobre la barra. Puedes soltar varios archivos a la vez. Si está oculta, mantén el arrastre junto al borde inferior para desplegarla y después suelta sobre ella. Agregar un programa lo ancla sin ejecutarlo. Los documentos y carpetas se ignoran.
 
-Clic derecho sobre una app del dock, anclada o abierta, abre su menú, como en la barra de Windows:
+Clic derecho sobre una app del dock, anclada o abierta, abre su menú encima de su icono. Es un menú propio dibujado como el de la barra de Windows 11: panel oscuro redondeado, títulos de sección en gris, un icono por opción (el propio de cada tarea, el de cada tipo de archivo o glifos de Segoe Fluent Icons) y resaltado al pasar el cursor. Entra con la misma animación que los demás paneles, se recorre con las flechas y Enter, y se cierra con Escape o un clic fuera. Contiene:
 
+- **Su jump list:** lo mismo que muestra la barra de Windows, por el AppUserModelID de la app.
+  - **Categorías propias y tareas:** por ejemplo "Más visitado", "Cerrado recientemente", "Nueva ventana" o "Nueva ventana de incógnito" en Chrome, y "Recent Folders" o "New Window" en VS Code. Se leen con la interfaz interna de la barra (`IInternalCustomDestinationList`, sin documentar), probando su versión de Windows 10/11 y la anterior, y cada tarea ejecuta el programa y los argumentos que guardó la app.
+  - **Recientes o Frecuentes:** cuando la app los pide en su lista o no tiene lista propia. Se leen con la API pública (`IApplicationDocumentLists`), como las carpetas recientes del Explorador. Los archivos se abren con la propia app; las direcciones internas que guardan algunas apps (p. ej. `whatsapp://…`) no se muestran, igual que en Windows.
+  - **Orden:** las tareas van siempre al final, como en Windows, y los títulos de más de 60 caracteres se recortan. Si la interfaz interna no está disponible, el menú se queda con Recientes o Frecuentes.
 - **Su nombre:** la abre, o abre otra ventana si ya está abierta.
 - **Anclar a la barra** o **Desanclar de la barra.**
+- **Finalizar tarea,** si está activada en Windows (Configuración > Sistema > Para programadores), como en su barra. Termina a la fuerza el proceso de la app, como el Administrador de tareas, aunque no responda, y se pierde lo no guardado. En las apps de Store termina la app, no el marco que comparten todas. Nunca se ofrece para el Explorador, que es el escritorio.
 - **Cerrar ventana** o **Cerrar todas las ventanas,** si tiene alguna abierta. Se les pide cerrarse como desde Windows, así que preguntan si hay cambios sin guardar.
 
 Las apps de Microsoft Store se anclan por su identificador de aplicación. El clic derecho en el resto del dock abre el menú de GlassBar (iniciar con Windows y salir). La selección se conserva en `%LOCALAPPDATA%\GlassBar\apps.json`. Los accesos directos mantienen su icono, argumentos y directorio de trabajo. No se descargan ni recrean logos. Los archivos que ya no existen muestran el icono genérico de Windows.

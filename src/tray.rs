@@ -19,20 +19,6 @@ const TRAY_ID: u32 = 101;
 
 pub const CMD_AUTOSTART: u32 = 2;
 pub const CMD_EXIT: u32 = 3;
-/// Opciones del menú de una app del dock.
-pub const CMD_APP_OPEN: u32 = 10;
-pub const CMD_APP_PIN: u32 = 11;
-pub const CMD_APP_UNPIN: u32 = 12;
-pub const CMD_APP_CLOSE: u32 = 13;
-
-/// Texto de una opción de menú, terminado en cero como lo pide Windows.
-fn wide(text: &str) -> Vec<u16> {
-    // "&" marca la tecla de acceso en los menús; se dobla para que se vea tal cual.
-    text.replace('&', "&&")
-        .encode_utf16()
-        .chain(Some(0))
-        .collect()
-}
 
 pub struct Tray {
     hwnd: HWND,
@@ -76,47 +62,6 @@ impl Tray {
 
         unsafe {
             let _ = Shell_NotifyIconW(NIM_ADD, &nid);
-        }
-    }
-
-    /// Menú de una app del dock, como el de la barra de Windows: su nombre (lo abre,
-    /// o abre otra ventana si ya está abierto), anclar o desanclar y, si tiene
-    /// ventanas, cerrarlas. Devuelve la opción elegida.
-    pub fn show_app_menu(&self, name: &str, pinned: bool, windows: usize) -> Option<u32> {
-        unsafe {
-            let menu: HMENU = CreatePopupMenu().ok()?;
-            let name = wide(name);
-            let _ = AppendMenuW(
-                menu,
-                MF_STRING,
-                CMD_APP_OPEN as usize,
-                PCWSTR(name.as_ptr()),
-            );
-            let _ = if pinned {
-                AppendMenuW(
-                    menu,
-                    MF_STRING,
-                    CMD_APP_UNPIN as usize,
-                    w!("Desanclar de la barra"),
-                )
-            } else {
-                AppendMenuW(
-                    menu,
-                    MF_STRING,
-                    CMD_APP_PIN as usize,
-                    w!("Anclar a la barra"),
-                )
-            };
-            if windows > 0 {
-                let _ = AppendMenuW(menu, MF_SEPARATOR, 0, None);
-                let close = if windows == 1 {
-                    w!("Cerrar ventana")
-                } else {
-                    w!("Cerrar todas las ventanas")
-                };
-                let _ = AppendMenuW(menu, MF_STRING, CMD_APP_CLOSE as usize, close);
-            }
-            self.track(menu)
         }
     }
 

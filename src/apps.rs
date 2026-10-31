@@ -126,6 +126,34 @@ impl AppItem {
         }
     }
 
+    /// Procesos de sus ventanas que "Finalizar tarea" puede terminar, sin repetir.
+    pub fn task_processes(&self) -> Vec<u32> {
+        let mut pids = Vec::new();
+        for &hwnd in &self.windows {
+            if let Some((pid, exe, _)) = unsafe { window_process(HWND(hwnd as *mut _)) } {
+                if can_end(pid, &exe) && !pids.contains(&pid) {
+                    pids.push(pid);
+                }
+            }
+        }
+        pids
+    }
+
+    /// "Finalizar tarea": termina a la fuerza los procesos de sus ventanas, como el
+    /// Administrador de tareas, aunque no respondan. Se pierde lo que no estuviera
+    /// guardado. Los procesos con más permisos (como administrador) no se pueden.
+    pub fn end_task(&self) {
+        use windows::Win32::System::Threading::{OpenProcess, TerminateProcess, PROCESS_TERMINATE};
+        for pid in self.task_processes() {
+            unsafe {
+                if let Ok(process) = OpenProcess(PROCESS_TERMINATE, false, pid) {
+                    let _ = TerminateProcess(process, 1);
+                    let _ = windows::Win32::Foundation::CloseHandle(process);
+                }
+            }
+        }
+    }
+
     /// Pide a cada ventana del programa que se cierre, como "Cerrar ventana" en la
     /// barra de Windows: el programa puede preguntar antes si hay cambios sin guardar.
     pub fn close_windows(&self) {
@@ -382,23 +410,70 @@ unsafe fn taskbar_window_process(hwnd: HWND) -> Option<(String, Option<String>)>
     {
         return None;
     }
+    let (pid, exe, app_id) = window_process(hwnd)?;
+    if pid == GetCurrentProcessId() {
+        return None;
+    }
+    Some((exe, app_id))
+}
+
+/// Proceso real de una ventana (número, ejecutable y AppUserModelID). Las apps de
+/// Store se alojan en un marco de ApplicationFrameHost, compartido por todas: su
+/// proceso es el de la ventana hija.
+unsafe fn window_process(hwnd: HWND) -> Option<(u32, String, Option<String>)> {
     let mut pid = 0;
     GetWindowThreadProcessId(hwnd, Some(&mut pid));
-    if pid == 0 || pid == GetCurrentProcessId() {
+    if pid == 0 {
         return None;
     }
     let (exe, app_id) = process_info(pid)?;
     if !file_name(&exe).eq_ignore_ascii_case("ApplicationFrameHost.exe") {
-        return Some((exe, app_id));
+        return Some((pid, exe, app_id));
     }
-    // Las apps de Store se alojan en un marco; el proceso real es el de la ventana hija.
     let mut search = (pid, 0u32);
     let _ = EnumChildWindows(
         Some(hwnd),
         Some(find_hosted_process),
         LPARAM(&mut search as *mut (u32, u32) as isize),
     );
-    process_info(search.1)
+    let (exe, app_id) = process_info(search.1)?;
+    Some((search.1, exe, app_id))
+}
+
+/// "Finalizar tarea" está activado en Windows (Configuración > Sistema > Para
+/// programadores). Windows 11 lo guarda en `TaskbarDeveloperSettings`; antes, en
+/// `Advanced`.
+pub fn end_task_enabled() -> bool {
+    use windows::Win32::System::Registry::{RegGetValueW, HKEY_CURRENT_USER, RRF_RT_REG_DWORD};
+    let read = |key: PCWSTR| unsafe {
+        let mut value = 0u32;
+        let mut size = std::mem::size_of::<u32>() as u32;
+        RegGetValueW(
+            HKEY_CURRENT_USER,
+            key,
+            w!("TaskbarEndTask"),
+            RRF_RT_REG_DWORD,
+            None,
+            Some(&mut value as *mut u32 as *mut _),
+            Some(&mut size),
+        )
+        .is_ok()
+        .then_some(value)
+    };
+    read(w!(
+        "Software\\Microsoft\\Windows\\CurrentVersion\\Explorer\\Advanced\\TaskbarDeveloperSettings"
+    ))
+    .or_else(|| {
+        read(w!(
+            "Software\\Microsoft\\Windows\\CurrentVersion\\Explorer\\Advanced"
+        ))
+    }) == Some(1)
+}
+
+/// Si "Finalizar tarea" puede terminar el proceso `exe` (`pid`): nunca el Explorador,
+/// que es el escritorio y la barra, ni GlassBar.
+fn can_end(pid: u32, exe: &str) -> bool {
+    pid != unsafe { GetCurrentProcessId() } && !file_name(exe).eq_ignore_ascii_case("explorer.exe")
 }
 
 unsafe extern "system" fn find_hosted_process(child: HWND, lparam: LPARAM) -> BOOL {
@@ -646,6 +721,20 @@ pub fn rounded_rect(x: f32, y: f32, w: f32, h: f32, r: f32) -> Option<Path> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn end_task_never_ends_explorer_or_glassbar() {
+        // GlassBar mismo.
+        assert!(!can_end(std::process::id(), r"C:\GlassBar\glassbar.exe"));
+        // El Explorador es el escritorio y la barra: terminarlo dejaría Windows sin ellos.
+        assert!(!can_end(1234, r"C:\Windows\explorer.exe"));
+        assert!(!can_end(1234, r"C:\WINDOWS\EXPLORER.EXE"));
+        // Cualquier otro programa, sí.
+        assert!(can_end(
+            1234,
+            r"C:\Program Files\Google\Chrome\Application\chrome.exe"
+        ));
+    }
 
     #[test]
     fn pinning_from_the_menu_keeps_how_to_open_the_app() {
