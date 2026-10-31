@@ -420,7 +420,7 @@ unsafe fn taskbar_window_process(hwnd: HWND) -> Option<(String, Option<String>)>
 /// Proceso real de una ventana (número, ejecutable y AppUserModelID). Las apps de
 /// Store se alojan en un marco de ApplicationFrameHost, compartido por todas: su
 /// proceso es el de la ventana hija.
-unsafe fn window_process(hwnd: HWND) -> Option<(u32, String, Option<String>)> {
+pub unsafe fn window_process(hwnd: HWND) -> Option<(u32, String, Option<String>)> {
     let mut pid = 0;
     GetWindowThreadProcessId(hwnd, Some(&mut pid));
     if pid == 0 {
