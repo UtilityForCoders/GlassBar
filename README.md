@@ -6,7 +6,13 @@ Dock minimalista para Windows 10/11: iconos reales con vista previa de sus venta
 
 Arrastra un `.exe`, `.lnk` o `.url` desde el Explorador o el escritorio y suéltalo sobre la barra. Puedes soltar varios archivos a la vez. Si está oculta, mantén el arrastre junto al borde inferior para desplegarla y después suelta sobre ella. Agregar un programa lo ancla sin ejecutarlo. Los documentos y carpetas se ignoran.
 
-Clic derecho sobre un icono → **Quitar este programa**. La selección se conserva en `%LOCALAPPDATA%\GlassBar\apps.json`. Los accesos directos mantienen su icono, argumentos y directorio de trabajo. No se descargan ni recrean logos. Los archivos que ya no existen muestran el icono genérico de Windows.
+Clic derecho sobre una app del dock, anclada o abierta, abre su menú, como en la barra de Windows:
+
+- **Su nombre:** la abre, o abre otra ventana si ya está abierta.
+- **Anclar a la barra** o **Desanclar de la barra.**
+- **Cerrar ventana** o **Cerrar todas las ventanas,** si tiene alguna abierta. Se les pide cerrarse como desde Windows, así que preguntan si hay cambios sin guardar.
+
+Las apps de Microsoft Store se anclan por su identificador de aplicación. El clic derecho en el resto del dock abre el menú de GlassBar (iniciar con Windows y salir). La selección se conserva en `%LOCALAPPDATA%\GlassBar\apps.json`. Los accesos directos mantienen su icono, argumentos y directorio de trabajo. No se descargan ni recrean logos. Los archivos que ya no existen muestran el icono genérico de Windows.
 
 ## Lanzador propio
 

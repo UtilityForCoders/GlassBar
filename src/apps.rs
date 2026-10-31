@@ -39,6 +39,9 @@ pub struct AppItem {
     pub window: Option<isize>,
     /// Todas sus ventanas abiertas, de la más reciente a la más antigua.
     pub windows: Vec<isize>,
+    /// Para las apps de Store abiertas sin anclar: su ruta de AppsFolder, con la que
+    /// se abren (su .exe no se puede abrir directamente).
+    shell_path: Option<String>,
     pub hover_spring: Spring,
     pub press_spring: Spring,
     /// Desplazamiento horizontal mientras se reordena la barra.
@@ -62,6 +65,7 @@ impl AppItem {
             is_running: false,
             window: None,
             windows: Vec::new(),
+            shell_path: None,
             hover_spring: Spring::new(1.0, 260.0, 18.0),
             press_spring: Spring::new(1.0, 340.0, 20.0),
             slide: Spring::new(0.0, 420.0, 36.0),
@@ -99,6 +103,7 @@ impl AppItem {
             is_running: true,
             window: Some(window.hwnd),
             windows: vec![window.hwnd],
+            shell_path,
             hover_spring: Spring::new(1.0, 260.0, 18.0),
             press_spring: Spring::new(1.0, 340.0, 20.0),
             slide: Spring::new(0.0, 420.0, 36.0),
@@ -107,6 +112,34 @@ impl AppItem {
 
     pub fn launch(&self) -> bool {
         launch_entry(&self.entry)
+    }
+
+    /// Cómo abrir otra vez el programa o anclarlo: las apps de Store por su ruta de
+    /// AppsFolder y las demás por su ejecutable.
+    pub fn pin_entry(&self) -> AppEntry {
+        AppEntry {
+            name: self.entry.name.clone(),
+            command: self
+                .shell_path
+                .clone()
+                .unwrap_or_else(|| self.entry.command.clone()),
+        }
+    }
+
+    /// Pide a cada ventana del programa que se cierre, como "Cerrar ventana" en la
+    /// barra de Windows: el programa puede preguntar antes si hay cambios sin guardar.
+    pub fn close_windows(&self) {
+        use windows::Win32::UI::WindowsAndMessaging::{PostMessageW, SC_CLOSE, WM_SYSCOMMAND};
+        for &hwnd in &self.windows {
+            unsafe {
+                let _ = PostMessageW(
+                    Some(HWND(hwnd as *mut _)),
+                    WM_SYSCOMMAND,
+                    windows::Win32::Foundation::WPARAM(SC_CLOSE as usize),
+                    windows::Win32::Foundation::LPARAM(0),
+                );
+            }
+        }
     }
 
     /// Trae al frente la ventana abierta o, si no hay ninguna, inicia el programa.
@@ -608,4 +641,36 @@ pub fn rounded_rect(x: f32, y: f32, w: f32, h: f32, r: f32) -> Option<Path> {
     pb.cubic_to(x, y + r - c, x + r - c, y, x + r, y);
     pb.close();
     pb.finish()
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn pinning_from_the_menu_keeps_how_to_open_the_app() {
+        // App de Store abierta sin anclar: se ancla y se reabre por su AppUserModelID,
+        // y la versión anclada sigue reconociendo su ventana.
+        let store = OpenWindow {
+            hwnd: 0,
+            exe: r"C:\Program Files\WindowsApps\WhatsApp_1.0_x64\WhatsApp.Root.exe".into(),
+            app_id: Some("5319275A.WhatsAppDesktop_cv1g1gvanyjgm!App".into()),
+        };
+        let entry = AppItem::open(&store).pin_entry();
+        assert_eq!(
+            entry.command,
+            r"shell:AppsFolder\5319275A.WhatsAppDesktop_cv1g1gvanyjgm!App"
+        );
+        assert!(store.belongs_to(&AppItem::new(entry)));
+
+        // Programa de escritorio: por su ejecutable.
+        let desktop = OpenWindow {
+            hwnd: 0,
+            exe: r"C:\Program Files\Google\Chrome\Application\chrome.exe".into(),
+            app_id: None,
+        };
+        let entry = AppItem::open(&desktop).pin_entry();
+        assert_eq!(entry.command, desktop.exe);
+        assert!(desktop.belongs_to(&AppItem::new(entry)));
+    }
 }

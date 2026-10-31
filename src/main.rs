@@ -71,7 +71,9 @@ use windows::Win32::UI::WindowsAndMessaging::{
 use crate::autohide::AutoHide;
 use crate::bar::{BarState, HoverTarget, BOTTOM_MARGIN};
 use crate::shell::TaskbarReplacer;
-use crate::tray::{Tray, CMD_AUTOSTART, CMD_EXIT, CMD_REMOVE, WM_TRAY};
+use crate::tray::{
+    Tray, CMD_APP_CLOSE, CMD_APP_OPEN, CMD_APP_PIN, CMD_APP_UNPIN, CMD_AUTOSTART, CMD_EXIT, WM_TRAY,
+};
 
 const WM_MOUSELEAVE: u32 = 0x02A3;
 const WM_SHOW_LAUNCHER: u32 = windows::Win32::UI::WindowsAndMessaging::WM_APP + 2;
@@ -2109,12 +2111,33 @@ unsafe extern "system" fn wndproc(hwnd: HWND, msg: u32, wparam: WPARAM, lparam: 
             with_app(|app| {
                 let x = (lparam.0 & 0xffff) as i16 as f32;
                 let y = ((lparam.0 >> 16) & 0xffff) as i16 as f32;
-                app.bar.hovered = app.bar.hit_test(x, y, app.scale);
-                if let Some(cmd) = app
-                    .tray
-                    .show_context_menu(matches!(app.bar.hovered, Some(HoverTarget::PrimaryApp(_))))
-                {
-                    handle_menu_command(app, cmd);
+                let target = app.bar.hit_test(x, y, app.scale);
+                app.bar.hovered = target;
+                // El nombre o la vista previa taparían el menú.
+                if let Some(tip) = &mut app.tooltip {
+                    tip.hide();
+                }
+                if let Some(preview) = &mut app.preview {
+                    preview.hide();
+                }
+                match target {
+                    // Sobre una app: su propio menú, como en la barra de Windows.
+                    Some(target @ (HoverTarget::PrimaryApp(_) | HoverTarget::OpenApp(_))) => {
+                        let Some(item) = app.bar.item_mut(target) else {
+                            return;
+                        };
+                        let (name, windows) = (item.entry.name.clone(), item.windows.len());
+                        let pinned = matches!(target, HoverTarget::PrimaryApp(_));
+                        if let Some(cmd) = app.tray.show_app_menu(&name, pinned, windows) {
+                            handle_app_command(app, target, cmd);
+                        }
+                    }
+                    // En el resto del dock, el de GlassBar.
+                    _ => {
+                        if let Some(cmd) = app.tray.show_context_menu() {
+                            handle_menu_command(app, cmd);
+                        }
+                    }
                 }
             });
             LRESULT(0)
@@ -2266,7 +2289,7 @@ unsafe extern "system" fn wndproc(hwnd: HWND, msg: u32, wparam: WPARAM, lparam: 
             let event = (lparam.0 & 0xffff) as u32;
             if event == WM_RBUTTONUP {
                 with_app(|app| {
-                    if let Some(cmd) = app.tray.show_context_menu(false) {
+                    if let Some(cmd) = app.tray.show_context_menu() {
                         handle_menu_command(app, cmd);
                     }
                 });
@@ -3182,16 +3205,43 @@ unsafe extern "system" fn tooltip_wndproc(
     DefWindowProcW(hwnd, msg, wparam, lparam)
 }
 
-fn handle_menu_command(app: &mut App, cmd: u32) {
-    match cmd {
-        CMD_REMOVE => {
-            if let Some(HoverTarget::PrimaryApp(i)) = app.bar.hovered {
-                if i < app.bar.primary_apps.len() {
-                    app.bar.primary_apps.remove(i);
-                    app.pins_changed();
+/// Opción elegida en el menú de la app `target` del dock.
+fn handle_app_command(app: &mut App, target: HoverTarget, cmd: u32) {
+    match (cmd, target) {
+        (CMD_APP_OPEN, _) => {
+            if let Some(item) = app.bar.item_mut(target) {
+                let entry = item.pin_entry();
+                if apps::launch_entry(&entry) {
+                    let _ = catalog::record(&entry);
                 }
             }
         }
+        (CMD_APP_PIN, HoverTarget::OpenApp(i)) => {
+            if let Some(item) = app.bar.open_apps.get(i) {
+                let entry = item.pin_entry();
+                app.bar.primary_apps.push(apps::AppItem::new(entry));
+                // Sus ventanas pasan al anclado y deja de salir entre los abiertos.
+                apps::update_running_apps(&mut app.bar.primary_apps, &mut app.bar.open_apps);
+                app.pins_changed();
+            }
+        }
+        (CMD_APP_UNPIN, HoverTarget::PrimaryApp(i)) if i < app.bar.primary_apps.len() => {
+            app.bar.primary_apps.remove(i);
+            // Si sigue abierto, vuelve a salir entre los abiertos.
+            apps::update_running_apps(&mut app.bar.primary_apps, &mut app.bar.open_apps);
+            app.pins_changed();
+        }
+        (CMD_APP_CLOSE, _) => {
+            if let Some(item) = app.bar.item_mut(target) {
+                item.close_windows();
+            }
+        }
+        _ => {}
+    }
+}
+
+fn handle_menu_command(app: &mut App, cmd: u32) {
+    match cmd {
         CMD_AUTOSTART => {
             let active = autostart::is_enabled();
             autostart::set(!active);
