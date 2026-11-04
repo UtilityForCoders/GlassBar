@@ -335,7 +335,7 @@ pub struct Updates {
 pub fn glassbar(styles: &Styles, autostart: bool, updates: &Updates) -> AppMenu {
     let mut entries = vec![
         Entry::Header(format!(
-            "GlassBar v{} — Liquid Glass",
+            "GlassBar v{}",
             env!("CARGO_PKG_VERSION")
         )),
         Entry::Separator,

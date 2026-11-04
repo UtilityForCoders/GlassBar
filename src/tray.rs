@@ -40,7 +40,7 @@ impl Tray {
     /// (Explorer reiniciado, o la bandeja propia pidiendo los iconos).
     pub fn register(&self) {
         let mut tip = [0u16; 128];
-        let tip_str = "GlassBar - Liquid Glass Taskbar";
+        let tip_str = "GlassBar";
         for (i, c) in tip_str.encode_utf16().enumerate().take(127) {
             tip[i] = c;
         }
