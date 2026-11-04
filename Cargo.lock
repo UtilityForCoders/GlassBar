@@ -74,6 +74,7 @@ dependencies = [
  "unicode-normalization",
  "windows",
  "windows-core",
+ "windows-numerics",
 ]
 
 [[package]]
