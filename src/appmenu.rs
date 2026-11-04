@@ -334,10 +334,7 @@ pub struct Updates {
 /// TranslucentTB), iniciar con Windows, actualizaciones y salir.
 pub fn glassbar(styles: &Styles, autostart: bool, updates: &Updates) -> AppMenu {
     let mut entries = vec![
-        Entry::Header(format!(
-            "GlassBar v{} — Liquid Glass",
-            env!("CARGO_PKG_VERSION")
-        )),
+        Entry::Header(format!("GlassBar v{}", env!("CARGO_PKG_VERSION"))),
         Entry::Separator,
     ];
     for state in State::ALL {

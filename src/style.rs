@@ -355,13 +355,30 @@ fn overlaps(a: RECT, b: RECT) -> bool {
 
 /// Desenfoque de Windows detrás del dock (apariencias Desenfoque y Acrílico). El
 /// dock es una ventana con transparencia por píxel, y en ellas Windows desenfoca el
-/// rectángulo entero sin respetar su forma ni su región. Por eso el desenfoque va
-/// en una ventana normal aparte, recortada a la forma redondeada del dock y justo
-/// debajo de él.
+/// rectángulo entero sin respetar su forma. Por eso el desenfoque va en una ventana
+/// aparte, justo debajo del dock y con su misma forma.
+///
+/// La forma se recorta con Windows.UI.Composition: un pincel con el fondo
+/// desenfocado del sistema (`HostBackdropBrush`) dentro de un rectángulo redondeado
+/// con los bordes suavizados. El desenfoque clásico (`SetWindowCompositionAttribute`)
+/// no respeta la región de la ventana en Windows 11 y asomaban las esquinas
+/// cuadradas; solo se usa si la composición no está disponible.
 pub struct Backdrop {
     hwnd: HWND,
+    /// Ventana recortada por composición; `None` si se usa el desenfoque clásico.
+    composition: Option<Composition>,
     /// Apariencia y tamaño aplicados, para no repetir el trabajo en cada fotograma.
     applied: std::cell::Cell<Option<(Appearance, i32, i32)>>,
+}
+
+/// Lo que la composición necesita mantener vivo, y lo que se cambia después.
+struct Composition {
+    _queue: Option<windows::System::DispatcherQueueController>,
+    _target: windows::UI::Composition::Desktop::DesktopWindowTarget,
+    /// Forma del recorte: se ajusta al tamaño y al radio del dock.
+    shape: windows::UI::Composition::CompositionRoundedRectangleGeometry,
+    /// Capa de color encima del desenfoque, solo en Acrílico.
+    tint: windows::UI::Composition::SpriteVisual,
 }
 
 impl Backdrop {
@@ -370,12 +387,11 @@ impl Backdrop {
         use windows::Win32::Graphics::Gdi::{GetStockObject, BLACK_BRUSH, HBRUSH};
         use windows::Win32::System::LibraryLoader::GetModuleHandleW;
         use windows::Win32::UI::WindowsAndMessaging::{
-            CreateWindowExW, RegisterClassExW, WNDCLASSEXW, WS_EX_NOACTIVATE, WS_EX_TOPMOST,
-            WS_EX_TRANSPARENT, WS_POPUP,
+            RegisterClassExW, WNDCLASSEXW, WS_EX_NOREDIRECTIONBITMAP,
         };
         unsafe {
             let instance = GetModuleHandleW(None).ok()?;
-            // Negro: con el acento de Windows, lo negro deja ver el desenfoque.
+            // Negro: con el desenfoque clásico, lo negro deja ver el desenfoque.
             let class = WNDCLASSEXW {
                 cbSize: std::mem::size_of::<WNDCLASSEXW>() as u32,
                 lpfnWndProc: Some(backdrop_wndproc),
@@ -385,23 +401,26 @@ impl Backdrop {
                 ..Default::default()
             };
             RegisterClassExW(&class);
-            let hwnd = CreateWindowExW(
-                WS_EX_TOOLWINDOW | WS_EX_NOACTIVATE | WS_EX_TOPMOST | WS_EX_TRANSPARENT,
-                w!("GlassBarBackdrop"),
-                w!("GlassBar — Fondo"),
-                WS_POPUP,
-                0,
-                0,
-                1,
-                1,
-                None,
-                None,
-                Some(instance.into()),
-                None,
-            )
-            .ok()?;
+            // Primero con composición: la ventana no tiene imagen propia, solo la
+            // que le pone la composición.
+            if let Some(hwnd) = backdrop_window(WS_EX_NOREDIRECTIONBITMAP) {
+                match compose(hwnd) {
+                    Ok(composition) => {
+                        return Some(Self {
+                            hwnd,
+                            composition: Some(composition),
+                            applied: std::cell::Cell::new(None),
+                        })
+                    }
+                    Err(_) => {
+                        let _ = windows::Win32::UI::WindowsAndMessaging::DestroyWindow(hwnd);
+                    }
+                }
+            }
+            let hwnd = backdrop_window(Default::default())?;
             Some(Self {
                 hwnd,
+                composition: None,
                 applied: std::cell::Cell::new(None),
             })
         }
@@ -423,21 +442,35 @@ impl Backdrop {
         }
         let (width, height) = (rect.right - rect.left, rect.bottom - rect.top);
         let applied = self.applied.get();
+        let acrylic = appearance == Appearance::Acrylic;
         unsafe {
-            if applied.map(|(a, _, _)| a) != Some(appearance) {
-                // ACCENT_ENABLE_ACRYLICBLURBEHIND y ACCENT_ENABLE_BLURBEHIND.
-                let state = if appearance == Appearance::Acrylic {
-                    4
-                } else {
-                    3
-                };
-                set_accent(self.hwnd, state, ACRYLIC_TINT);
-            }
-            if applied.map(|(_, w, h)| (w, h)) != Some((width, height)) {
-                let region =
-                    CreateRoundRectRgn(0, 0, width + 1, height + 1, radius * 2, radius * 2);
-                // Windows se queda con la región.
-                let _ = SetWindowRgn(self.hwnd, Some(region), true);
+            match &self.composition {
+                Some(composition) => {
+                    if applied.map(|(a, _, _)| a) != Some(appearance) {
+                        let _ = composition.tint.SetIsVisible(acrylic);
+                    }
+                    if applied.map(|(_, w, h)| (w, h)) != Some((width, height)) {
+                        let vector = |x: f32, y: f32| windows_numerics::Vector2 { X: x, Y: y };
+                        let _ = composition
+                            .shape
+                            .SetSize(vector(width as f32, height as f32));
+                        let _ = composition
+                            .shape
+                            .SetCornerRadius(vector(radius as f32, radius as f32));
+                    }
+                }
+                None => {
+                    if applied.map(|(a, _, _)| a) != Some(appearance) {
+                        // ACCENT_ENABLE_ACRYLICBLURBEHIND y ACCENT_ENABLE_BLURBEHIND.
+                        set_accent(self.hwnd, if acrylic { 4 } else { 3 }, ACRYLIC_TINT);
+                    }
+                    if applied.map(|(_, w, h)| (w, h)) != Some((width, height)) {
+                        let region =
+                            CreateRoundRectRgn(0, 0, width + 1, height + 1, radius * 2, radius * 2);
+                        // Windows se queda con la región.
+                        let _ = SetWindowRgn(self.hwnd, Some(region), true);
+                    }
+                }
             }
             // Justo debajo del dock, aunque otra ventana "siempre encima" se haya
             // puesto entre medias.
@@ -452,6 +485,97 @@ impl Backdrop {
             );
         }
         self.applied.set(Some((appearance, width, height)));
+    }
+}
+
+/// Ventana del desenfoque: sin bordes, siempre encima, sin activarse ni recibir
+/// clics. `extra` se suma a los estilos de siempre.
+unsafe fn backdrop_window(
+    extra: windows::Win32::UI::WindowsAndMessaging::WINDOW_EX_STYLE,
+) -> Option<HWND> {
+    use windows::core::w;
+    use windows::Win32::System::LibraryLoader::GetModuleHandleW;
+    use windows::Win32::UI::WindowsAndMessaging::{
+        CreateWindowExW, WS_EX_NOACTIVATE, WS_EX_TOPMOST, WS_EX_TRANSPARENT, WS_POPUP,
+    };
+    let instance = GetModuleHandleW(None).ok()?;
+    CreateWindowExW(
+        WS_EX_TOOLWINDOW | WS_EX_NOACTIVATE | WS_EX_TOPMOST | WS_EX_TRANSPARENT | extra,
+        w!("GlassBarBackdrop"),
+        w!("GlassBar — Fondo"),
+        WS_POPUP,
+        0,
+        0,
+        1,
+        1,
+        None,
+        None,
+        Some(instance.into()),
+        None,
+    )
+    .ok()
+}
+
+/// Monta en `hwnd` el fondo desenfocado del sistema, recortado a un rectángulo
+/// redondeado, y encima el tinte del acrílico (oculto hasta que haga falta).
+fn compose(hwnd: HWND) -> windows::core::Result<Composition> {
+    use windows::core::Interface;
+    use windows::Win32::Graphics::Dwm::{DwmSetWindowAttribute, DWMWA_USE_HOSTBACKDROPBRUSH};
+    use windows::Win32::System::WinRT::Composition::ICompositorDesktopInterop;
+    use windows::Win32::System::WinRT::{
+        CreateDispatcherQueueController, DispatcherQueueOptions, DQTAT_COM_NONE,
+        DQTYPE_THREAD_CURRENT,
+    };
+    let one = windows_numerics::Vector2 { X: 1.0, Y: 1.0 };
+    unsafe {
+        // Que el pincel del fondo del sistema muestre lo que hay detrás.
+        let enable = BOOL(1);
+        DwmSetWindowAttribute(
+            hwnd,
+            DWMWA_USE_HOSTBACKDROPBRUSH,
+            &enable as *const BOOL as *const _,
+            std::mem::size_of::<BOOL>() as u32,
+        )?;
+        // La composición necesita una cola de mensajes de WinRT en este hilo.
+        let queue = match windows::System::DispatcherQueue::GetForCurrentThread() {
+            Ok(_) => None,
+            Err(_) => Some(CreateDispatcherQueueController(DispatcherQueueOptions {
+                dwSize: std::mem::size_of::<DispatcherQueueOptions>() as u32,
+                threadType: DQTYPE_THREAD_CURRENT,
+                apartmentType: DQTAT_COM_NONE,
+            })?),
+        };
+        let compositor = windows::UI::Composition::Compositor::new()?;
+        let target = compositor
+            .cast::<ICompositorDesktopInterop>()?
+            .CreateDesktopWindowTarget(hwnd, false)?;
+        let root = compositor.CreateContainerVisual()?;
+        root.SetRelativeSizeAdjustment(one)?;
+        let blur = compositor.CreateSpriteVisual()?;
+        blur.SetRelativeSizeAdjustment(one)?;
+        blur.SetBrush(&compositor.CreateHostBackdropBrush()?)?;
+        let tint = compositor.CreateSpriteVisual()?;
+        tint.SetRelativeSizeAdjustment(one)?;
+        // ACRYLIC_TINT va en AABBGGRR.
+        tint.SetBrush(&compositor.CreateColorBrushWithColor(windows::UI::Color {
+            A: (ACRYLIC_TINT >> 24) as u8,
+            B: (ACRYLIC_TINT >> 16) as u8,
+            G: (ACRYLIC_TINT >> 8) as u8,
+            R: ACRYLIC_TINT as u8,
+        })?)?;
+        tint.SetIsVisible(false)?;
+        let children = root.Children()?;
+        children.InsertAtTop(&blur)?;
+        children.InsertAtTop(&tint)?;
+        let shape = compositor.CreateRoundedRectangleGeometry()?;
+        root.SetClip(&compositor.CreateGeometricClipWithGeometry(&shape)?)?;
+        target.SetRoot(&root)?;
+        Ok(Composition {
+            _queue: queue,
+            _target: target,
+            shape,
+            tint,
+        })
     }
 }
 

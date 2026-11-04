@@ -2996,14 +2996,21 @@ impl TrayWindow {
     /// Vuelve a leer los iconos (al abrirlo, o si un programa cambió el suyo) y
     /// ajusta el tamaño a cuántos hay.
     fn refresh(&mut self) {
+        // Mientras se arrastra un icono la lista no cambia; al soltarlo se relee.
+        if self.model.dragging() {
+            return;
+        }
+        self.model.drag = None;
         self.model.icons = systray::shown()
             .into_iter()
             .map(|icon| traypanel::TrayIcon {
                 key: icon.key,
+                id: icon.id,
                 image: icon.image,
                 tip: icon.tip,
             })
             .collect();
+        traypanel::sort_icons(&mut self.model.icons, &traypanel::load_order());
         if self
             .model
             .hovered
@@ -3065,6 +3072,7 @@ impl TrayWindow {
         self.menu = None;
         self.close_after = None;
         self.model.hovered = None;
+        self.model.drag = None;
         self.transition.close(Instant::now());
         self.present();
     }
@@ -3590,7 +3598,7 @@ unsafe extern "system" fn tray_wndproc(
     lparam: LPARAM,
 ) -> LRESULT {
     use windows::Win32::UI::WindowsAndMessaging::{
-        WA_INACTIVE, WM_ACTIVATE, WM_KEYDOWN, WM_LBUTTONDBLCLK,
+        WA_INACTIVE, WM_ACTIVATE, WM_CAPTURECHANGED, WM_KEYDOWN, WM_LBUTTONDBLCLK,
     };
     let point = |scale: f32| {
         (
@@ -3651,11 +3659,37 @@ unsafe extern "system" fn tray_wndproc(
         WM_TIMER if wparam.0 == TIMER_ANIM => {
             with_app(|app| app.tray_panel.as_mut().map(TrayWindow::present));
         }
+        WM_LBUTTONDOWN => {
+            let pressed = with_app(|app| {
+                let Some(panel) = app.tray_panel.as_mut().filter(|p| p.visible) else {
+                    return false;
+                };
+                let (x, y) = point(panel.scale);
+                panel.model.press(x, y);
+                panel.model.drag.is_some()
+            });
+            // Captura el ratón para seguir el arrastre aunque salga del panel.
+            if pressed == Some(true) {
+                SetCapture(hwnd);
+            }
+        }
         WM_MOUSEMOVE => {
             with_app(|app| {
                 let Some(panel) = app.tray_panel.as_mut().filter(|p| p.visible) else {
                     return;
                 };
+                // Con el botón pulsado sobre un icono: arrastre, sin nombres ni avisos.
+                if panel.model.drag.is_some() {
+                    let (x, y) = point(panel.scale);
+                    if panel.model.drag_to(x, y) {
+                        let _ = KillTimer(Some(hwnd), TIMER_TIP);
+                        panel.render();
+                        if let Some(tip) = &mut app.tooltip {
+                            tip.hide();
+                        }
+                    }
+                    return;
+                }
                 let mut track = TRACKMOUSEEVENT {
                     cbSize: std::mem::size_of::<TRACKMOUSEEVENT>() as u32,
                     dwFlags: TME_LEAVE,
@@ -3705,7 +3739,34 @@ unsafe extern "system" fn tray_wndproc(
                 }
             });
         }
-        WM_LBUTTONUP => press(systray::Click::Left),
+        WM_LBUTTONUP => {
+            let dragged = with_app(|app| {
+                let panel = app.tray_panel.as_mut().filter(|p| p.visible)?;
+                let dragged = panel.model.release();
+                if dragged {
+                    let _ = traypanel::save_order(&panel.model.order());
+                    panel.refresh();
+                }
+                Some(dragged)
+            })
+            .flatten();
+            let _ = ReleaseCapture();
+            // Soltar tras arrastrar no es un clic en el icono.
+            if dragged != Some(true) {
+                press(systray::Click::Left);
+            }
+        }
+        WM_CAPTURECHANGED => {
+            // Otra ventana se llevó el ratón: el icono se queda donde estaba al soltarlo.
+            with_app(|app| {
+                if let Some(panel) = app.tray_panel.as_mut() {
+                    if panel.model.release() {
+                        let _ = traypanel::save_order(&panel.model.order());
+                        panel.refresh();
+                    }
+                }
+            });
+        }
         WM_LBUTTONDBLCLK => press(systray::Click::Double),
         WM_RBUTTONUP => press(systray::Click::Right),
         WM_KEYDOWN if wparam.0 == 0x1B => {
