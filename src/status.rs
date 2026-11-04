@@ -146,9 +146,11 @@ pub fn battery_glyph(battery: Battery) -> char {
     }
 }
 
-/// Icono de batería centrado en (`cx`, `cy`), con un rayo encima si está enchufada.
-/// El rayo se dibuja aparte, con un borde oscuro para que se vea también sobre la
-/// parte llena, en lugar de depender de los iconos de carga de cada versión de Windows.
+/// Icono de batería centrado en (`cx`, `cy`), dibujado a mano como el de Windows 11:
+/// contorno blanco, relleno gris tan largo como la carga y, si está cargando, un
+/// rayo encima con un hueco recortado alrededor para que se lea sobre cualquier
+/// parte. Todo se dibuja en una imagen aparte y se pega con la opacidad pedida,
+/// así el recorte no borra el fondo del dock.
 pub fn draw_battery(
     pixmap: &mut tiny_skia::Pixmap,
     battery: Battery,
@@ -157,49 +159,153 @@ pub fn draw_battery(
     size: f32,
     opacity: f32,
 ) {
-    crate::clock::draw_icon_aligned(pixmap, battery_glyph(battery), cx, cy, size, opacity);
-    if !battery.plugged {
+    use tiny_skia::{
+        BlendMode, FillRule, LineCap, LineJoin, Paint, PathBuilder, Pixmap, PixmapPaint, Stroke,
+        Transform,
+    };
+    let (pw, ph) = ((size * 1.3).ceil() as u32, (size * 1.1).ceil() as u32);
+    let Some(mut image) = Pixmap::new(pw.max(1), ph.max(1)) else {
         return;
+    };
+    let identity = Transform::identity();
+    // Grosor del contorno en píxeles enteros, para que salga nítido.
+    let line = (size / 16.0 * 0.9).round().max(1.0);
+    let half = line / 2.0;
+    // Cuerpo, ajustado a la rejilla de píxeles: el trazo cae en medio de cada píxel.
+    let (body_w, body_h) = ((size * 0.9).round(), (size * 0.56).round());
+    let nub_w = (size * 0.09).round().max(1.0);
+    let left = ((pw as f32 - body_w - nub_w) / 2.0).round();
+    let top = ((ph as f32 - body_h) / 2.0).round();
+    let radius = (body_h * 0.26).max(1.5);
+    let white = |alpha: u8| {
+        let mut paint = Paint {
+            anti_alias: true,
+            ..Default::default()
+        };
+        paint.set_color_rgba8(255, 255, 255, alpha);
+        paint
+    };
+    if let Some(path) = rounded_path(
+        left + half,
+        top + half,
+        body_w - line,
+        body_h - line,
+        radius,
+    ) {
+        let stroke = Stroke {
+            width: line,
+            ..Default::default()
+        };
+        image.stroke_path(&path, &white(255), &stroke, identity, None);
     }
-    // Rayo en coordenadas de 0 a 1, de arriba abajo.
-    const BOLT: [(f32, f32); 7] = [
-        (0.62, 0.0),
-        (0.14, 0.56),
-        (0.46, 0.56),
-        (0.36, 1.0),
-        (0.86, 0.42),
-        (0.54, 0.42),
-        (0.68, 0.0),
-    ];
-    let height = size * 0.72;
-    let (left, top) = (cx - size * 0.06 - height * 0.5, cy - height / 2.0);
-    let mut pb = tiny_skia::PathBuilder::new();
-    for (i, (x, y)) in BOLT.iter().enumerate() {
-        let (px, py) = (left + x * height, top + y * height);
-        if i == 0 {
-            pb.move_to(px, py);
-        } else {
-            pb.line_to(px, py);
+    // Borne a la derecha, pegado al cuerpo.
+    let nub_h = (body_h * 0.4).round().max(2.0);
+    if let Some(path) = rounded_path(
+        left + body_w,
+        top + ((body_h - nub_h) / 2.0).round(),
+        nub_w,
+        nub_h,
+        nub_w.min(nub_h) * 0.45,
+    ) {
+        image.fill_path(&path, &white(255), FillRule::Winding, identity, None);
+    }
+    // Relleno gris dentro del contorno, con un píxel de aire, tan largo como la carga.
+    let inset = line + (size / 16.0).round().max(1.0);
+    let inner_w = body_w - inset * 2.0;
+    // Aunque quede poca carga se ve una raya, como en Windows.
+    let fill_w = (inner_w * battery.percent.min(100) as f32 / 100.0).max(line * 1.5);
+    if battery.percent > 0 {
+        let mut grey = white(255);
+        grey.set_color_rgba8(160, 160, 166, 255);
+        let inner_r = (radius - inset * 0.6).max(0.8);
+        if let Some(path) = rounded_path(
+            left + inset,
+            top + inset,
+            fill_w.min(inner_w),
+            body_h - inset * 2.0,
+            inner_r,
+        ) {
+            image.fill_path(&path, &grey, FillRule::Winding, identity, None);
         }
     }
+    if battery.plugged {
+        // Rayo en coordenadas de 0 a 1, de arriba abajo, centrado en el cuerpo.
+        const BOLT: [(f32, f32); 6] = [
+            (0.62, 0.0),
+            (0.08, 0.58),
+            (0.46, 0.58),
+            (0.38, 1.0),
+            (0.92, 0.42),
+            (0.54, 0.42),
+        ];
+        let height = body_h * 1.15;
+        let width = height * 0.6;
+        let (bx, by) = (
+            left + body_w / 2.0 - width / 2.0,
+            top + body_h / 2.0 - height / 2.0,
+        );
+        let mut pb = PathBuilder::new();
+        for (i, (x, y)) in BOLT.iter().enumerate() {
+            let (px, py) = (bx + x * width, by + y * height);
+            if i == 0 {
+                pb.move_to(px, py);
+            } else {
+                pb.line_to(px, py);
+            }
+        }
+        pb.close();
+        if let Some(path) = pb.finish() {
+            // Primero se abre un hueco transparente alrededor del rayo…
+            let mut clear = white(255);
+            clear.blend_mode = BlendMode::Clear;
+            let gap = Stroke {
+                width: line * 1.7,
+                line_join: LineJoin::Round,
+                line_cap: LineCap::Round,
+                ..Default::default()
+            };
+            image.stroke_path(&path, &clear, &gap, identity, None);
+            image.fill_path(&path, &clear, FillRule::Winding, identity, None);
+            // …y luego se pinta el rayo, con las puntas algo redondeadas.
+            let soft = Stroke {
+                width: line * 0.5,
+                line_join: LineJoin::Round,
+                ..Default::default()
+            };
+            image.fill_path(&path, &white(255), FillRule::Winding, identity, None);
+            image.stroke_path(&path, &white(255), &soft, identity, None);
+        }
+    }
+    pixmap.draw_pixmap(
+        (cx - pw as f32 / 2.0).round() as i32,
+        (cy - ph as f32 / 2.0).round() as i32,
+        image.as_ref(),
+        &PixmapPaint {
+            opacity,
+            ..Default::default()
+        },
+        identity,
+        None,
+    );
+}
+
+/// Rectángulo de esquinas redondeadas como trazado.
+fn rounded_path(x: f32, y: f32, w: f32, h: f32, r: f32) -> Option<tiny_skia::Path> {
+    let r = r.min(w / 2.0).min(h / 2.0).max(0.0);
+    // Constante de las curvas de Bézier que aproximan un cuarto de círculo.
+    let k = r * 0.552_284_8;
+    let mut pb = tiny_skia::PathBuilder::new();
+    pb.move_to(x + r, y);
+    pb.line_to(x + w - r, y);
+    pb.cubic_to(x + w - r + k, y, x + w, y + r - k, x + w, y + r);
+    pb.line_to(x + w, y + h - r);
+    pb.cubic_to(x + w, y + h - r + k, x + w - r + k, y + h, x + w - r, y + h);
+    pb.line_to(x + r, y + h);
+    pb.cubic_to(x + r - k, y + h, x, y + h - r + k, x, y + h - r);
+    pb.line_to(x, y + r);
+    pb.cubic_to(x, y + r - k, x + r - k, y, x + r, y);
     pb.close();
-    let Some(path) = pb.finish() else {
-        return;
-    };
-    let mut paint = tiny_skia::Paint {
-        anti_alias: true,
-        ..Default::default()
-    };
-    paint.set_color_rgba8(28, 28, 30, (230.0 * opacity) as u8);
-    let outline = tiny_skia::Stroke {
-        width: size * 0.16,
-        line_join: tiny_skia::LineJoin::Round,
-        ..Default::default()
-    };
-    let identity = tiny_skia::Transform::identity();
-    pixmap.stroke_path(&path, &paint, &outline, identity, None);
-    paint.set_color_rgba8(255, 255, 255, (245.0 * opacity) as u8);
-    pixmap.fill_path(&path, &paint, tiny_skia::FillRule::Winding, identity, None);
+    pb.finish()
 }
 
 /// Lee el estado una vez por segundo reutilizando los objetos de Windows: crear el
