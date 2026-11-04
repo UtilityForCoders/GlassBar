@@ -41,6 +41,7 @@ mod update;
 mod usage;
 mod wifi;
 mod winkey;
+mod winx;
 
 use std::cell::RefCell;
 use std::time::{Duration, Instant};
@@ -1606,6 +1607,25 @@ impl App {
         }
     }
 
+    /// Abre en el cursor el menú del botón de inicio, cerrando los paneles abiertos.
+    fn open_windows_menu(&mut self) {
+        self.close_popups();
+        if self.app_menu.is_none() {
+            match AppMenuWindow::new(self.hwnd) {
+                Ok(menu) => self.app_menu = Some(menu),
+                Err(_) => return,
+            }
+        }
+        let mut cursor = POINT::default();
+        unsafe {
+            let _ = GetCursorPos(&mut cursor);
+        }
+        let bounds = (self.screen_left, self.screen_right);
+        if let Some(menu) = &mut self.app_menu {
+            menu.open_windows(cursor, bounds);
+        }
+    }
+
     /// Busca en un hilo aparte si hay una versión nueva; responde con `WM_UPDATE`.
     fn check_updates(&mut self) {
         if !self.update_settings.check || self.checking || self.updating {
@@ -2462,6 +2482,8 @@ unsafe extern "system" fn wndproc(hwnd: HWND, msg: u32, wparam: WPARAM, lparam: 
                         }
                         app.expand();
                     }
+                    // Sobre el botón de inicio, el de Windows (Win+X).
+                    Some(HoverTarget::Launcher) => app.open_windows_menu(),
                     // En el resto del dock, el de GlassBar.
                     _ => {
                         app.open_glassbar_menu();
@@ -3100,6 +3122,8 @@ enum MenuPurpose {
     App(MenuApp),
     /// El de GlassBar: estilos, iniciar con Windows y salir.
     GlassBar,
+    /// El del botón de inicio, con las opciones del de Windows (Win+X).
+    Windows,
 }
 
 /// Menú propio (ver `appmenu`), con el estilo de Windows 11: el de cada app del
@@ -3274,10 +3298,26 @@ impl AppMenuWindow {
         cursor: POINT,
         (left, right): (i32, i32),
     ) {
+        let root = appmenu::glassbar(styles, autostart, updates);
+        self.open_at_cursor(root, MenuPurpose::GlassBar, cursor, (left, right));
+    }
+
+    /// Abre el menú del botón de inicio en el cursor, como el de Windows (Win+X).
+    fn open_windows(&mut self, cursor: POINT, bounds: (i32, i32)) {
+        self.open_at_cursor(winx::menu(), MenuPurpose::Windows, cursor, bounds);
+    }
+
+    /// Abre `root` con su esquina inferior izquierda en el cursor.
+    fn open_at_cursor(
+        &mut self,
+        root: appmenu::AppMenu,
+        purpose: MenuPurpose,
+        cursor: POINT,
+        (left, right): (i32, i32),
+    ) {
         let (_, dpi) = monitors::get_info(monitors::primary());
         self.scale = dpi.max(0.3);
         // Los submenús, a la derecha si caben; si no, a la izquierda.
-        let root = appmenu::glassbar(styles, autostart, updates);
         let wide = appmenu::Cascade::new(root, false);
         let room = cursor.x + (wide.size().0 * self.scale).ceil() as i32 <= right;
         self.model = if room {
@@ -3285,7 +3325,7 @@ impl AppMenuWindow {
         } else {
             appmenu::Cascade::new(wide.root, true)
         };
-        self.purpose = Some(MenuPurpose::GlassBar);
+        self.purpose = Some(purpose);
         // Con los submenús a la izquierda, el menú principal sigue en el cursor.
         let root_x = (self.model.root_origin().0 * self.scale).round() as i32;
         self.show(cursor.x - root_x, cursor.y, (left, right));
@@ -3430,6 +3470,16 @@ unsafe extern "system" fn app_menu_wndproc(
             }
             Some((command, MenuPurpose::GlassBar)) => {
                 with_app(|app| handle_menu_command(app, command));
+            }
+            Some((command, MenuPurpose::Windows)) => {
+                with_app(|app| match winx::Action::from_command(command) {
+                    // Buscar abre el lanzador, que tiene su propio buscador.
+                    Some(winx::Action::Search) => app.toggle_launcher(),
+                    Some(action) => {
+                        action.run();
+                    }
+                    None => {}
+                });
             }
             None => {}
         }
