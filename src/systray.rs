@@ -623,9 +623,24 @@ fn visible(icon: &Icon) -> bool {
         && (icon.callback != 0 || !process_name(icon.window()).eq_ignore_ascii_case("explorer.exe"))
 }
 
+/// Identidad de un icono que no cambia al reiniciar el programa o Windows: su GUID
+/// si lo dio; si no, el ejecutable dueño y el número del icono.
+fn stable_id(icon: &Icon) -> String {
+    match icon.guid {
+        Some(guid) => format!("guid:{guid:032x}"),
+        None => format!(
+            "exe:{}:{}",
+            process_name(icon.window()).to_lowercase(),
+            icon.id
+        ),
+    }
+}
+
 /// Icono que se muestra en el panel: quién es, su imagen y su nombre.
 pub struct Shown {
     pub key: Key,
+    /// Identidad que se mantiene entre arranques (para guardar el orden del panel).
+    pub id: String,
     pub image: Option<Pixmap>,
     pub tip: String,
 }
@@ -640,6 +655,7 @@ pub fn shown() -> Vec<Shown> {
         .filter(|i| visible(i))
         .map(|i| Shown {
             key: i.key(),
+            id: stable_id(i),
             image: i.image.clone(),
             tip: i.tip.clone(),
         })
