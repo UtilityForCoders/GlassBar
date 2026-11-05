@@ -1391,6 +1391,8 @@ struct App {
     styles: style::Styles,
     /// Cuándo se miró la pantalla por última vez para elegir la apariencia.
     scene_read: Instant,
+    /// Última vez que se miró si la bandeja propia sigue delante de la de Explorer.
+    tray_checked: Instant,
     /// Ventana con el desenfoque de Windows que va debajo del dock con las
     /// apariencias Desenfoque y Acrílico.
     backdrop: Option<style::Backdrop>,
@@ -1498,6 +1500,7 @@ impl App {
             status: status_reader,
             styles,
             scene_read: Instant::now(),
+            tray_checked: Instant::now(),
             backdrop: style::Backdrop::new(),
             update_settings: update::Settings::load(),
             new_release: None,
@@ -2063,7 +2066,12 @@ impl App {
     }
 
     fn expand(&mut self) {
+        let hidden = !self.visibility.expanded;
         self.visibility.reveal();
+        // Escondido no se mira la pantalla (ver `TIMER_TICK`): se mira al salir.
+        if hidden {
+            self.update_style();
+        }
         self.start_animating();
     }
 
@@ -2557,8 +2565,11 @@ unsafe extern "system" fn wndproc(hwnd: HWND, msg: u32, wparam: WPARAM, lparam: 
                     let status = app.status.read();
                     // El idioma también cambia con atajos (Win+Espacio, Alt+Mayús).
                     app.update_keyboard();
-                    // Maximizar o restaurar no cambia la ventana activa.
-                    app.update_style();
+                    // Maximizar o restaurar no cambia la ventana activa. Con el dock
+                    // escondido no se ve: se mira al empezar a mostrarse.
+                    if app.visibility.expanded {
+                        app.update_style();
+                    }
                     let resized = status.items().len() != app.bar.status.items().len();
                     let status_changed = status != app.bar.status;
                     app.bar.status = status;
@@ -2639,9 +2650,15 @@ unsafe extern "system" fn wndproc(hwnd: HWND, msg: u32, wparam: WPARAM, lparam: 
                         panel.watch_menu();
                     }
                     // Que los iconos de los demás programas sigan llegando a la bandeja propia.
-                    if let Some(host) = &app.systray {
-                        host.keep_in_front();
+                    // Cinco veces por segundo basta: mirarlo cada 40 ms era la mitad del
+                    // gasto de este temporizador.
+                    if app.tray_checked.elapsed() >= Duration::from_millis(200) {
+                        app.tray_checked = Instant::now();
+                        if let Some(host) = &app.systray {
+                            host.keep_in_front();
+                        }
                     }
+                    let was_expanded = app.visibility.expanded;
                     let inside = app.visibility.expanded
                         && pt.x >= app.pos.x
                         && pt.x < app.pos.x + app.surface.width as i32
@@ -2669,6 +2686,10 @@ unsafe extern "system" fn wndproc(hwnd: HWND, msg: u32, wparam: WPARAM, lparam: 
                                 .is_some_and(|at| at.elapsed() < Duration::from_millis(1500)),
                         Instant::now(),
                     );
+                    // Empieza a mostrarse: la apariencia, al día desde el primer fotograma.
+                    if app.visibility.expanded && !was_expanded {
+                        app.update_style();
+                    }
                     if app.visibility.active() {
                         app.start_animating();
                     }
