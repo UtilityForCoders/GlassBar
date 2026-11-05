@@ -41,6 +41,7 @@ mod update;
 mod usage;
 mod wifi;
 mod winkey;
+mod winx;
 
 use std::cell::RefCell;
 use std::time::{Duration, Instant};
@@ -1606,6 +1607,25 @@ impl App {
         }
     }
 
+    /// Abre en el cursor el menú del botón de inicio, cerrando los paneles abiertos.
+    fn open_windows_menu(&mut self) {
+        self.close_popups();
+        if self.app_menu.is_none() {
+            match AppMenuWindow::new(self.hwnd) {
+                Ok(menu) => self.app_menu = Some(menu),
+                Err(_) => return,
+            }
+        }
+        let mut cursor = POINT::default();
+        unsafe {
+            let _ = GetCursorPos(&mut cursor);
+        }
+        let bounds = (self.screen_left, self.screen_right);
+        if let Some(menu) = &mut self.app_menu {
+            menu.open_windows(cursor, bounds);
+        }
+    }
+
     /// Busca en un hilo aparte si hay una versión nueva; responde con `WM_UPDATE`.
     fn check_updates(&mut self) {
         if !self.update_settings.check || self.checking || self.updating {
@@ -2462,6 +2482,8 @@ unsafe extern "system" fn wndproc(hwnd: HWND, msg: u32, wparam: WPARAM, lparam: 
                         }
                         app.expand();
                     }
+                    // Sobre el botón de inicio, el de Windows (Win+X).
+                    Some(HoverTarget::Launcher) => app.open_windows_menu(),
                     // En el resto del dock, el de GlassBar.
                     _ => {
                         app.open_glassbar_menu();
@@ -2974,14 +2996,21 @@ impl TrayWindow {
     /// Vuelve a leer los iconos (al abrirlo, o si un programa cambió el suyo) y
     /// ajusta el tamaño a cuántos hay.
     fn refresh(&mut self) {
+        // Mientras se arrastra un icono la lista no cambia; al soltarlo se relee.
+        if self.model.dragging() {
+            return;
+        }
+        self.model.drag = None;
         self.model.icons = systray::shown()
             .into_iter()
             .map(|icon| traypanel::TrayIcon {
                 key: icon.key,
+                id: icon.id,
                 image: icon.image,
                 tip: icon.tip,
             })
             .collect();
+        traypanel::sort_icons(&mut self.model.icons, &traypanel::load_order());
         if self
             .model
             .hovered
@@ -3043,6 +3072,7 @@ impl TrayWindow {
         self.menu = None;
         self.close_after = None;
         self.model.hovered = None;
+        self.model.drag = None;
         self.transition.close(Instant::now());
         self.present();
     }
@@ -3100,6 +3130,8 @@ enum MenuPurpose {
     App(MenuApp),
     /// El de GlassBar: estilos, iniciar con Windows y salir.
     GlassBar,
+    /// El del botón de inicio, con las opciones del de Windows (Win+X).
+    Windows,
 }
 
 /// Menú propio (ver `appmenu`), con el estilo de Windows 11: el de cada app del
@@ -3274,10 +3306,26 @@ impl AppMenuWindow {
         cursor: POINT,
         (left, right): (i32, i32),
     ) {
+        let root = appmenu::glassbar(styles, autostart, updates);
+        self.open_at_cursor(root, MenuPurpose::GlassBar, cursor, (left, right));
+    }
+
+    /// Abre el menú del botón de inicio en el cursor, como el de Windows (Win+X).
+    fn open_windows(&mut self, cursor: POINT, bounds: (i32, i32)) {
+        self.open_at_cursor(winx::menu(), MenuPurpose::Windows, cursor, bounds);
+    }
+
+    /// Abre `root` con su esquina inferior izquierda en el cursor.
+    fn open_at_cursor(
+        &mut self,
+        root: appmenu::AppMenu,
+        purpose: MenuPurpose,
+        cursor: POINT,
+        (left, right): (i32, i32),
+    ) {
         let (_, dpi) = monitors::get_info(monitors::primary());
         self.scale = dpi.max(0.3);
         // Los submenús, a la derecha si caben; si no, a la izquierda.
-        let root = appmenu::glassbar(styles, autostart, updates);
         let wide = appmenu::Cascade::new(root, false);
         let room = cursor.x + (wide.size().0 * self.scale).ceil() as i32 <= right;
         self.model = if room {
@@ -3285,7 +3333,7 @@ impl AppMenuWindow {
         } else {
             appmenu::Cascade::new(wide.root, true)
         };
-        self.purpose = Some(MenuPurpose::GlassBar);
+        self.purpose = Some(purpose);
         // Con los submenús a la izquierda, el menú principal sigue en el cursor.
         let root_x = (self.model.root_origin().0 * self.scale).round() as i32;
         self.show(cursor.x - root_x, cursor.y, (left, right));
@@ -3431,6 +3479,16 @@ unsafe extern "system" fn app_menu_wndproc(
             Some((command, MenuPurpose::GlassBar)) => {
                 with_app(|app| handle_menu_command(app, command));
             }
+            Some((command, MenuPurpose::Windows)) => {
+                with_app(|app| match winx::Action::from_command(command) {
+                    // Buscar abre el lanzador, que tiene su propio buscador.
+                    Some(winx::Action::Search) => app.toggle_launcher(),
+                    Some(action) => {
+                        action.run();
+                    }
+                    None => {}
+                });
+            }
             None => {}
         }
     };
@@ -3540,7 +3598,7 @@ unsafe extern "system" fn tray_wndproc(
     lparam: LPARAM,
 ) -> LRESULT {
     use windows::Win32::UI::WindowsAndMessaging::{
-        WA_INACTIVE, WM_ACTIVATE, WM_KEYDOWN, WM_LBUTTONDBLCLK,
+        WA_INACTIVE, WM_ACTIVATE, WM_CAPTURECHANGED, WM_KEYDOWN, WM_LBUTTONDBLCLK,
     };
     let point = |scale: f32| {
         (
@@ -3601,11 +3659,37 @@ unsafe extern "system" fn tray_wndproc(
         WM_TIMER if wparam.0 == TIMER_ANIM => {
             with_app(|app| app.tray_panel.as_mut().map(TrayWindow::present));
         }
+        WM_LBUTTONDOWN => {
+            let pressed = with_app(|app| {
+                let Some(panel) = app.tray_panel.as_mut().filter(|p| p.visible) else {
+                    return false;
+                };
+                let (x, y) = point(panel.scale);
+                panel.model.press(x, y);
+                panel.model.drag.is_some()
+            });
+            // Captura el ratón para seguir el arrastre aunque salga del panel.
+            if pressed == Some(true) {
+                SetCapture(hwnd);
+            }
+        }
         WM_MOUSEMOVE => {
             with_app(|app| {
                 let Some(panel) = app.tray_panel.as_mut().filter(|p| p.visible) else {
                     return;
                 };
+                // Con el botón pulsado sobre un icono: arrastre, sin nombres ni avisos.
+                if panel.model.drag.is_some() {
+                    let (x, y) = point(panel.scale);
+                    if panel.model.drag_to(x, y) {
+                        let _ = KillTimer(Some(hwnd), TIMER_TIP);
+                        panel.render();
+                        if let Some(tip) = &mut app.tooltip {
+                            tip.hide();
+                        }
+                    }
+                    return;
+                }
                 let mut track = TRACKMOUSEEVENT {
                     cbSize: std::mem::size_of::<TRACKMOUSEEVENT>() as u32,
                     dwFlags: TME_LEAVE,
@@ -3655,7 +3739,34 @@ unsafe extern "system" fn tray_wndproc(
                 }
             });
         }
-        WM_LBUTTONUP => press(systray::Click::Left),
+        WM_LBUTTONUP => {
+            let dragged = with_app(|app| {
+                let panel = app.tray_panel.as_mut().filter(|p| p.visible)?;
+                let dragged = panel.model.release();
+                if dragged {
+                    let _ = traypanel::save_order(&panel.model.order());
+                    panel.refresh();
+                }
+                Some(dragged)
+            })
+            .flatten();
+            let _ = ReleaseCapture();
+            // Soltar tras arrastrar no es un clic en el icono.
+            if dragged != Some(true) {
+                press(systray::Click::Left);
+            }
+        }
+        WM_CAPTURECHANGED => {
+            // Otra ventana se llevó el ratón: el icono se queda donde estaba al soltarlo.
+            with_app(|app| {
+                if let Some(panel) = app.tray_panel.as_mut() {
+                    if panel.model.release() {
+                        let _ = traypanel::save_order(&panel.model.order());
+                        panel.refresh();
+                    }
+                }
+            });
+        }
         WM_LBUTTONDBLCLK => press(systray::Click::Double),
         WM_RBUTTONUP => press(systray::Click::Right),
         WM_KEYDOWN if wparam.0 == 0x1B => {
