@@ -26,6 +26,7 @@ pub const GLYPH_CHECK: char = '\u{E73E}';
 const GLYPH_CHEVRON: char = '\u{E76C}';
 const GLYPH_EXIT: char = '\u{E7E8}';
 const GLYPH_DOWNLOAD: char = '\u{E896}';
+const GLYPH_REFRESH: char = '\u{E72C}';
 
 /// Lado de los iconos, en unidades lógicas (los iconos pequeños de Windows).
 pub const ICON: f32 = 16.0;
@@ -322,8 +323,8 @@ pub const CMD_UPDATE_CHECK: u32 = 5;
 /// Estado de las actualizaciones que muestra el menú de GlassBar.
 #[derive(Default)]
 pub struct Updates {
-    /// Buscar versiones nuevas sola.
-    pub check: bool,
+    /// Buscando ahora la última versión publicada.
+    pub checking: bool,
     /// Versión nueva publicada ("0.3.0").
     pub available: Option<String>,
     /// Descargando o instalando.
@@ -368,11 +369,6 @@ pub fn glassbar(styles: &Styles, autostart: bool, updates: &Updates) -> AppMenu 
         label: "Iniciar con Windows".into(),
         command: CMD_AUTOSTART,
     });
-    entries.push(Entry::Item {
-        icon: Icon::check(updates.check),
-        label: "Buscar actualizaciones".into(),
-        command: CMD_UPDATE_CHECK,
-    });
     match (&updates.available, updates.busy) {
         (_, true) => entries.push(Entry::Header("Descargando la actualización…".into())),
         (Some(version), false) => entries.push(Entry::Item {
@@ -380,7 +376,15 @@ pub fn glassbar(styles: &Styles, autostart: bool, updates: &Updates) -> AppMenu 
             label: format!("Actualizar a v{version}"),
             command: CMD_UPDATE,
         }),
-        (None, false) => {}
+        (None, false) if updates.checking => {
+            entries.push(Entry::Header("Buscando actualizaciones…".into()))
+        }
+        // La búsqueda sola no se puede apagar: esto solo mira ya, sin esperar.
+        (None, false) => entries.push(Entry::Item {
+            icon: Icon::Glyph(GLYPH_REFRESH),
+            label: "Buscar actualizaciones".into(),
+            command: CMD_UPDATE_CHECK,
+        }),
     }
     entries.push(Entry::Separator);
     entries.push(Entry::Item {

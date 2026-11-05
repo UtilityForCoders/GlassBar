@@ -1394,13 +1394,14 @@ struct App {
     /// Ventana con el desenfoque de Windows que va debajo del dock con las
     /// apariencias Desenfoque y Acrílico.
     backdrop: Option<style::Backdrop>,
-    /// Actualizaciones (ver `update`): ajustes, versión nueva encontrada y los
-    /// hilos que buscan o descargan, que responden por `update_events`.
-    update_settings: update::Settings,
+    /// Actualizaciones (ver `update`): versión nueva encontrada y los hilos que
+    /// buscan o descargan, que responden por `update_events`.
     new_release: Option<update::Release>,
     /// Versión de la que ya se avisó, para no repetirlo cada 6 horas.
     notified: Option<update::Version>,
     checking: bool,
+    /// La búsqueda en curso la pidió el usuario desde el menú: se le dice qué salió.
+    manual_check: bool,
     updating: bool,
     update_sender: std::sync::mpsc::Sender<UpdateEvent>,
     update_events: std::sync::mpsc::Receiver<UpdateEvent>,
@@ -1499,10 +1500,10 @@ impl App {
             styles,
             scene_read: Instant::now(),
             backdrop: style::Backdrop::new(),
-            update_settings: update::Settings::load(),
             new_release: None,
             notified: None,
             checking: false,
+            manual_check: false,
             updating: false,
             update_sender,
             update_events,
@@ -1592,7 +1593,7 @@ impl App {
         }
         let bounds = (self.screen_left, self.screen_right);
         let updates = appmenu::Updates {
-            check: self.update_settings.check,
+            checking: self.checking,
             available: self.new_release.as_ref().map(|r| r.version.to_string()),
             busy: self.updating,
         };
@@ -1627,8 +1628,13 @@ impl App {
     }
 
     /// Busca en un hilo aparte si hay una versión nueva; responde con `WM_UPDATE`.
-    fn check_updates(&mut self) {
-        if !self.update_settings.check || self.checking || self.updating {
+    /// `manual` si lo pidió el usuario: entonces se avisa también si no hay nada.
+    fn check_updates(&mut self, manual: bool) {
+        if self.updating {
+            return;
+        }
+        self.manual_check |= manual;
+        if self.checking {
             return;
         }
         self.checking = true;
@@ -1662,13 +1668,29 @@ impl App {
             match event {
                 UpdateEvent::Checked(result) => {
                     self.checking = false;
+                    let manual = std::mem::take(&mut self.manual_check);
                     // Sin conexión o sin respuesta, se vuelve a mirar en 6 horas.
-                    let Ok(release) = result else {
-                        continue;
+                    let release = match result {
+                        Ok(release) => release,
+                        Err(error) => {
+                            if manual {
+                                self.tray.notify(
+                                    "No se pudo buscar actualizaciones",
+                                    &format!("Motivo: {error}."),
+                                );
+                            }
+                            continue;
+                        }
                     };
-                    // Se avisa una vez por versión, no cada 6 horas.
+                    if release.is_none() && manual {
+                        self.tray.notify(
+                            "GlassBar está al día",
+                            &format!("La v{} es la última versión.", update::Version::current()),
+                        );
+                    }
+                    // Sola, se avisa una vez por versión, no cada 6 horas.
                     if let Some(release) = &release {
-                        if self.notified != Some(release.version) {
+                        if manual || self.notified != Some(release.version) {
                             self.notified = Some(release.version);
                             self.tray.notify(
                                 "Hay una versión nueva de GlassBar",
@@ -2572,7 +2594,7 @@ unsafe extern "system" fn wndproc(hwnd: HWND, msg: u32, wparam: WPARAM, lparam: 
                     if id == TIMER_UPDATE_FIRST {
                         let _ = KillTimer(Some(app.hwnd), TIMER_UPDATE_FIRST);
                     }
-                    app.check_updates();
+                    app.check_updates(false);
                 });
             } else if id == TIMER_ANNOUNCE {
                 with_app(|app| {
@@ -4203,12 +4225,7 @@ fn handle_menu_command(app: &mut App, cmd: u32) {
             }
         }
         CMD_UPDATE => app.start_update(),
-        CMD_UPDATE_CHECK => {
-            app.update_settings.check = !app.update_settings.check;
-            let _ = app.update_settings.save();
-            // Al activarlo, se mira ya.
-            app.check_updates();
-        }
+        CMD_UPDATE_CHECK => app.check_updates(true),
         _ => {
             if let Some(choice) = style::Choice::from_command(cmd) {
                 choice.apply(&mut app.styles);
