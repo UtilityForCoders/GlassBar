@@ -2098,6 +2098,31 @@ impl App {
         self.sync_backdrop();
     }
 
+    /// Mueve el dock a `pos` sin volver a enviar su imagen: al mostrarse o esconderse
+    /// solo cambia la posición, y subir la imagen entera costaba ~0,6 ms por fotograma.
+    fn move_window(&self) {
+        let blend = BLENDFUNCTION {
+            BlendOp: AC_SRC_OVER as u8,
+            BlendFlags: 0,
+            SourceConstantAlpha: 255,
+            AlphaFormat: AC_SRC_ALPHA as u8,
+        };
+        unsafe {
+            let _ = UpdateLayeredWindow(
+                self.hwnd,
+                None,
+                Some(&self.pos),
+                None,
+                None,
+                None,
+                COLORREF(0),
+                Some(&blend),
+                ULW_ALPHA,
+            );
+        }
+        self.sync_backdrop();
+    }
+
     /// Redibuja el dock en la superficie y lo envía al compositor
     fn render(&mut self) {
         self.bar.draw(&mut self.surface.pixmap, self.scale);
@@ -2511,13 +2536,12 @@ unsafe extern "system" fn wndproc(hwnd: HWND, msg: u32, wparam: WPARAM, lparam: 
                         + (app.y_shown - app.y_hidden) as f32 * app.visibility.motion.value)
                         .round() as i32;
 
-                    if current_y != app.pos.y {
-                        app.pos.y = current_y;
-                        app.update_position();
-                    }
-
+                    let moved = current_y != app.pos.y;
+                    app.pos.y = current_y;
                     if bar_moving {
                         app.render();
+                    } else if moved {
+                        app.move_window();
                     }
 
                     if !bar_moving && !slide_moving && !app.visibility.waiting() {
