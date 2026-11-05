@@ -183,7 +183,7 @@ unsafe fn session_processes(enumerator: &IMMDeviceEnumerator, id: &str) -> Vec<u
 }
 
 /// Padre y nombre del ejecutable de cada proceso en marcha.
-fn processes() -> std::collections::HashMap<u32, (u32, String)> {
+pub(crate) fn processes() -> std::collections::HashMap<u32, (u32, String)> {
     use windows::Win32::Foundation::CloseHandle;
     use windows::Win32::System::Diagnostics::ToolHelp::{
         CreateToolhelp32Snapshot, Process32FirstW, Process32NextW, PROCESSENTRY32W,

@@ -2926,12 +2926,29 @@ fn taskbar_created() -> u32 {
 }
 
 /// Hay un menú emergente abierto (clase `#32768`), de cualquier programa.
+/// Distancia máxima (en píxeles lógicos) entre el punto del clic derecho en un icono
+/// y el menú que abre su programa.
+const MENU_REACH: f32 = 48.0;
+
 fn menu_open() -> bool {
     unsafe {
         windows::Win32::UI::WindowsAndMessaging::FindWindowW(w!("#32768"), None).is_ok_and(|menu| {
             windows::Win32::UI::WindowsAndMessaging::IsWindowVisible(menu).as_bool()
         })
     }
+}
+
+/// El menú de un icono del panel, abierto con clic derecho.
+struct TrayMenu {
+    /// Cuándo se pulsó, y si ya se vio el menú abierto.
+    since: Instant,
+    seen: bool,
+    /// Proceso del programa del icono, y punto de la pantalla donde se pulsó: su
+    /// menú es una ventana suya (o de un proceso que abrió) junto a ese punto.
+    pid: Option<u32>,
+    at: POINT,
+    /// Procesos ajenos ya vistos junto al punto, y si son del programa.
+    known: std::collections::HashMap<u32, bool>,
 }
 
 /// Panel de las apps en segundo plano (ver `traypanel` y `systray`).
@@ -2945,9 +2962,9 @@ struct TrayWindow {
     transition: launcher::Transition,
     /// Dónde abrirlo: centro de la flecha, borde superior del dock y bordes de la pantalla.
     anchor: (i32, i32, (i32, i32)),
-    /// Clic derecho en un icono: cuándo, y si ya se vio su menú abierto. Mientras
-    /// tanto el panel sigue abierto aunque el menú se lleve el foco.
-    menu: Option<(Instant, bool)>,
+    /// Clic derecho en un icono, mientras su menú sigue abierto (o por abrirse): el
+    /// panel sigue abierto aunque el menú se lleve el foco.
+    menu: Option<TrayMenu>,
     /// Tras un clic izquierdo el panel espera el tiempo de doble clic de Windows
     /// antes de cerrarse: si llega el segundo clic, se le manda al programa como
     /// doble clic (algunos solo abren su ventana así).
@@ -3086,15 +3103,22 @@ impl TrayWindow {
             self.hide();
             return;
         }
-        let Some((since, seen)) = self.menu else {
+        let reach = (MENU_REACH * self.scale).round() as i32;
+        let Some(menu) = self.menu.as_mut() else {
             return;
         };
-        if menu_open() {
-            self.menu = Some((since, true));
+        // El menú de Windows (#32768), o uno propio del programa (Qt, Java, Steam,
+        // XAML...), que no es de esa clase.
+        let open = menu_open()
+            || menu
+                .pid
+                .is_some_and(|pid| systray::menu_of(pid, menu.at, reach, &mut menu.known));
+        if open {
+            menu.seen = true;
             return;
         }
         // Algunos programas tardan en abrirlo; si no llega a abrirse, se deja de esperar.
-        if !seen && since.elapsed() < Duration::from_millis(1500) {
+        if !menu.seen && menu.since.elapsed() < Duration::from_millis(1500) {
             return;
         }
         self.menu = None;
@@ -3110,7 +3134,14 @@ impl TrayWindow {
         if elsewhere {
             self.hide();
         } else {
-            take_focus(self.hwnd);
+            // Sin compartir la entrada con la ventana activa (como `take_focus`):
+            // suele ser del programa, que puede seguir ocupado con su menú y dejaría
+            // a GlassBar sin responder. Si Windows niega el foco, el panel se cierra
+            // igual al pulsar fuera.
+            unsafe {
+                let _ = windows::Win32::UI::WindowsAndMessaging::SetForegroundWindow(self.hwnd);
+                let _ = windows::Win32::UI::Input::KeyboardAndMouse::SetFocus(Some(self.hwnd));
+            }
         }
     }
 }
@@ -3625,9 +3656,19 @@ unsafe extern "system" fn tray_wndproc(
                 }
                 app.tray_clicked = Some(Instant::now());
                 let key = panel.model.icons[index].key;
+                let at = cursor();
                 match click {
-                    // Sigue abierto mientras está el menú del icono.
-                    systray::Click::Right => panel.menu = Some((Instant::now(), false)),
+                    // Sigue abierto mientras está el menú del icono (el proceso se
+                    // pone al mandarle el clic, justo después).
+                    systray::Click::Right => {
+                        panel.menu = Some(TrayMenu {
+                            since: Instant::now(),
+                            seen: false,
+                            pid: None,
+                            at,
+                            known: Default::default(),
+                        })
+                    }
                     // Espera un posible segundo clic; si el programa abre su ventana,
                     // el panel pierde el foco y se cierra antes.
                     systray::Click::Left => {
@@ -3639,7 +3680,10 @@ unsafe extern "system" fn tray_wndproc(
                     }
                     systray::Click::Double => panel.hide(),
                 }
-                systray::click(key, click, cursor());
+                let pid = systray::click(key, click, at);
+                if let Some(menu) = panel.menu.as_mut() {
+                    menu.pid = pid;
+                }
             }
         });
     };
