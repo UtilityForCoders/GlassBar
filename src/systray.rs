@@ -672,11 +672,13 @@ fn target(key: Key) -> Option<(HWND, u32, u32, u32)> {
 
 /// Pulsa el icono `key`, como en la bandeja de Windows: el programa recibe el clic
 /// y puede abrir su ventana o su menú. `at` es el punto de la pantalla donde se
-/// pulsó.
-pub fn click(key: Key, click: Click, at: POINT) {
-    let Some((window, callback, version, id)) = target(key) else {
-        return;
-    };
+/// pulsó. Devuelve el proceso del programa, para seguir el menú que abra.
+pub fn click(key: Key, click: Click, at: POINT) -> Option<u32> {
+    let (window, callback, version, id) = target(key)?;
+    let mut pid = 0;
+    unsafe {
+        GetWindowThreadProcessId(window, Some(&mut pid));
+    }
     if callback == 0 {
         log(|| {
             format!(
@@ -684,12 +686,10 @@ pub fn click(key: Key, click: Click, at: POINT) {
                 process_name(window)
             )
         });
-        return;
+        return None;
     }
     unsafe {
         // Para que el programa pueda traer su ventana o su menú al frente.
-        let mut pid = 0;
-        GetWindowThreadProcessId(window, Some(&mut pid));
         let allowed = AllowSetForegroundWindow(if pid != 0 { pid } else { ASFW_ANY });
         // Y se pone ya delante su ventana (aunque esté oculta), como hacen los
         // programas antes de abrir su menú: si no lo consiguen a tiempo, el menú no
@@ -715,6 +715,124 @@ pub fn click(key: Key, click: Click, at: POINT) {
             )
         });
     }
+    (pid != 0).then_some(pid)
+}
+
+// ---------------------------------------------------------------------------
+// El menú que abre un programa con el clic derecho en su icono.
+// ---------------------------------------------------------------------------
+
+/// Ventana de primer nivel que puede ser el menú de un icono.
+#[derive(Clone, Copy, Debug)]
+pub struct Candidate {
+    pub pid: u32,
+    pub rect: RECT,
+    /// `WS_EX_TOPMOST` o `WS_EX_TOOLWINDOW`: así son los menús que no usan el de
+    /// Windows (#32768), como los de Qt, Java, CEF (Steam) o XAML.
+    pub floating: bool,
+}
+
+/// Distancia en píxeles del punto `at` al rectángulo (0 si está dentro).
+fn distance(rect: RECT, at: POINT) -> i32 {
+    let dx = (rect.left - at.x).max(at.x - rect.right + 1).max(0);
+    let dy = (rect.top - at.y).max(at.y - rect.bottom + 1).max(0);
+    dx.max(dy)
+}
+
+/// Si la ventana parece el menú abierto con el clic en `at`: flotante, con tamaño
+/// y junto al punto (los menús se abren con una esquina en el cursor).
+pub fn looks_like_menu(window: &Candidate, at: POINT, reach: i32) -> bool {
+    window.floating
+        && window.rect.right > window.rect.left
+        && window.rect.bottom > window.rect.top
+        && distance(window.rect, at) <= reach
+}
+
+/// Si `pid` es `app` o un proceso que abrió (algunos dibujan el menú en otro
+/// proceso, como Steam con steamwebhelper). `parent` da el padre de cada proceso.
+pub fn related(pid: u32, app: u32, parent: impl Fn(u32) -> Option<u32>) -> bool {
+    let mut current = pid;
+    // Pocos niveles: programa → ayudante → sus procesos de dibujo.
+    for _ in 0..4 {
+        if current == app {
+            return true;
+        }
+        match parent(current) {
+            Some(up) if up != 0 && up != current => current = up,
+            _ => return false,
+        }
+    }
+    false
+}
+
+/// Ventanas flotantes, visibles y a la vista (no ocultas por DWM) de otros
+/// procesos, de primer nivel.
+fn candidates() -> Vec<Candidate> {
+    use windows::core::BOOL;
+    use windows::Win32::Graphics::Dwm::{DwmGetWindowAttribute, DWMWA_CLOAKED};
+    unsafe extern "system" fn visit(hwnd: HWND, lparam: LPARAM) -> BOOL {
+        let list = &mut *(lparam.0 as *mut Vec<Candidate>);
+        if !IsWindowVisible(hwnd).as_bool() {
+            return true.into();
+        }
+        let mut cloaked = 0u32;
+        if DwmGetWindowAttribute(
+            hwnd,
+            DWMWA_CLOAKED,
+            &mut cloaked as *mut u32 as *mut _,
+            std::mem::size_of::<u32>() as u32,
+        )
+        .is_ok()
+            && cloaked != 0
+        {
+            return true.into();
+        }
+        let mut pid = 0;
+        GetWindowThreadProcessId(hwnd, Some(&mut pid));
+        let mut rect = RECT::default();
+        if pid == 0 || pid == std::process::id() || GetWindowRect(hwnd, &mut rect).is_err() {
+            return true.into();
+        }
+        let ex = GetWindowLongPtrW(hwnd, GWL_EXSTYLE) as u32;
+        list.push(Candidate {
+            pid,
+            rect,
+            floating: ex & (WS_EX_TOPMOST.0 | WS_EX_TOOLWINDOW.0) != 0,
+        });
+        true.into()
+    }
+    let mut list = Vec::new();
+    unsafe {
+        let _ = EnumWindows(
+            Some(visit),
+            LPARAM(&mut list as *mut Vec<Candidate> as isize),
+        );
+    }
+    list
+}
+
+/// Si sigue abierto un menú del programa `app` junto a `at`, el punto del clic.
+/// `known` guarda qué procesos ajenos son suyos, para no recorrer los procesos
+/// cada vez.
+pub fn menu_of(
+    app: u32,
+    at: POINT,
+    reach: i32,
+    known: &mut std::collections::HashMap<u32, bool>,
+) -> bool {
+    if app == 0 || app == std::process::id() {
+        return false;
+    }
+    let mut processes = None;
+    candidates()
+        .into_iter()
+        .filter(|w| looks_like_menu(w, at, reach))
+        .any(|w| {
+            *known.entry(w.pid).or_insert_with(|| {
+                let processes = processes.get_or_insert_with(crate::audio::processes);
+                related(w.pid, app, |pid| processes.get(&pid).map(|(up, _)| *up))
+            })
+        })
 }
 
 /// Avisa al programa de que el cursor pasa por su icono (algunos ponen al día su
@@ -873,5 +991,53 @@ mod tests {
             callback_params(0, 7, WM_LBUTTONUP, at),
             (7, WM_LBUTTONUP as isize)
         );
+    }
+
+    #[test]
+    fn the_menu_is_a_floating_window_next_to_the_click() {
+        let at = POINT { x: 1500, y: 900 };
+        let window = |left, top, right, bottom, floating| Candidate {
+            pid: 1,
+            rect: RECT {
+                left,
+                top,
+                right,
+                bottom,
+                ..Default::default()
+            },
+            floating,
+        };
+        // Con una esquina en el cursor, encima o a un lado.
+        assert!(looks_like_menu(&window(1500, 600, 1700, 900, true), at, 48));
+        assert!(looks_like_menu(&window(1300, 620, 1490, 890, true), at, 48));
+        // Lejos del clic, o no flotante (la ventana principal del programa): no.
+        assert!(!looks_like_menu(&window(100, 100, 400, 400, true), at, 48));
+        assert!(!looks_like_menu(
+            &window(1400, 600, 1800, 950, false),
+            at,
+            48
+        ));
+        // Sin tamaño: no.
+        assert!(!looks_like_menu(
+            &window(1500, 900, 1500, 900, true),
+            at,
+            48
+        ));
+    }
+
+    #[test]
+    fn a_menu_drawn_by_a_child_process_counts() {
+        // steam (10) → steamwebhelper (20) → proceso de dibujo (30).
+        let parent = |pid| match pid {
+            30 => Some(20),
+            20 => Some(10),
+            10 => Some(4),
+            _ => None,
+        };
+        assert!(related(10, 10, parent));
+        assert!(related(30, 10, parent));
+        // Otro programa, o un padre que se señala a sí mismo: no.
+        assert!(!related(30, 99, parent));
+        assert!(!related(5, 10, |_| Some(5)));
     }
 }
