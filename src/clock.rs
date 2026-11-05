@@ -70,6 +70,14 @@ fn semibold_font() -> &'static Font {
     FONT.get_or_init(|| font_file("seguisb.ttf").unwrap_or_else(|| system_font().clone()))
 }
 
+/// El minuto actual (con el día), para saber si lo dibujado con la hora sigue al día.
+pub fn minute() -> u64 {
+    let now = unsafe { GetLocalTime() };
+    ((now.wYear as u64 * 13 + now.wMonth as u64) * 32 + now.wDay as u64) * 1440
+        + now.wHour as u64 * 60
+        + now.wMinute as u64
+}
+
 /// Hora y, debajo, la fecha corta, como la barra de Windows. Las dos líneas se
 /// rasterizan solo cuando cambian (una vez por minuto).
 pub struct ClockRenderer {
