@@ -1408,6 +1408,8 @@ struct App {
     /// Ventana con el desenfoque de Windows que va debajo del dock con las
     /// apariencias Desenfoque y Acrílico.
     backdrop: Option<style::Backdrop>,
+    /// Dónde y con qué apariencia se puso el desenfoque la última vez.
+    backdrop_at: std::cell::Cell<Option<(windows::Win32::Foundation::RECT, style::Appearance)>>,
     /// Actualizaciones (ver `update`): ajustes, versión nueva encontrada y los
     /// hilos que buscan o descargan, que responden por `update_events`.
     update_settings: update::Settings,
@@ -1514,6 +1516,7 @@ impl App {
             scene_read: Instant::now(),
             tray_checked: Instant::now(),
             backdrop: style::Backdrop::new(),
+            backdrop_at: std::cell::Cell::new(None),
             update_settings: update::Settings::load(),
             new_release: None,
             notified: None,
@@ -1751,14 +1754,34 @@ impl App {
         let Some(backdrop) = &self.backdrop else {
             return;
         };
+        let rect = self.backdrop_rect();
+        backdrop.update(
+            self.hwnd,
+            self.bar.appearance,
+            rect,
+            (glass::DOCK_RADIUS * self.scale).round() as i32,
+        );
+        self.backdrop_at.set(Some((rect, self.bar.appearance)));
+    }
+
+    /// Como `sync_backdrop`, pero solo si el dock se movió, cambió de tamaño o de
+    /// apariencia: al redibujarlo en su sitio (pasar el cursor por los iconos), mover
+    /// el desenfoque en cada fotograma costaba 0,06-0,3 ms.
+    fn sync_backdrop_if_changed(&self) {
+        if self.backdrop_at.get() != Some((self.backdrop_rect(), self.bar.appearance)) {
+            self.sync_backdrop();
+        }
+    }
+
+    /// Rectángulo del dock en pantalla, sin el margen de la sombra.
+    fn backdrop_rect(&self) -> windows::Win32::Foundation::RECT {
         let px = |v: f32| (v * self.scale).round() as i32;
-        let rect = windows::Win32::Foundation::RECT {
+        windows::Win32::Foundation::RECT {
             left: self.pos.x + px(bar::SHADOW_PAD_X),
             top: self.pos.y + px(bar::SHADOW_PAD_Y),
             right: self.pos.x + self.surface.width as i32 - px(bar::SHADOW_PAD_X),
             bottom: self.pos.y + self.surface.height as i32 - px(bar::SHADOW_PAD_Y),
-        };
-        backdrop.update(self.hwnd, self.bar.appearance, rect, px(glass::DOCK_RADIUS));
+        }
     }
 
     /// Abre o cierra el panel rápido sobre los iconos de red, volumen y batería.
@@ -2115,7 +2138,7 @@ impl App {
             );
         }
         // El desenfoque acompaña al dock al aparecer, ocultarse o cambiar de ancho.
-        self.sync_backdrop();
+        self.sync_backdrop_if_changed();
     }
 
     /// Mueve el dock a `pos` sin volver a enviar su imagen: al mostrarse o esconderse
