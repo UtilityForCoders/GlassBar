@@ -497,13 +497,25 @@ fn take_focus(hwnd: HWND) {
     unsafe {
         use windows::Win32::System::Threading::{AttachThreadInput, GetCurrentThreadId};
         use windows::Win32::UI::WindowsAndMessaging::{
-            GetForegroundWindow, GetWindowThreadProcessId, SetForegroundWindow, SW_SHOW,
+            GetForegroundWindow, GetWindowThreadProcessId, IsHungAppWindow, SetForegroundWindow,
+            SW_SHOW,
         };
         let _ = ShowWindow(hwnd, SW_SHOW);
+        // Normalmente basta con pedirlo: tras un clic en GlassBar, Windows lo da.
+        if SetForegroundWindow(hwnd).as_bool() && GetForegroundWindow() == hwnd {
+            let _ = windows::Win32::UI::Input::KeyboardAndMouse::SetFocus(Some(hwnd));
+            return;
+        }
         // Abierto con la tecla Windows no hubo clic en GlassBar y Windows puede
-        // negar el foco; compartir la entrada con la ventana activa lo permite.
+        // negar el foco; compartir la entrada con la ventana activa lo permite. Eso
+        // hace esperar a su hilo: con una ventana colgada, GlassBar dejaría de
+        // responder, así que entonces no se intenta.
+        let active = GetForegroundWindow();
+        if IsHungAppWindow(active).as_bool() {
+            return;
+        }
         let current = GetCurrentThreadId();
-        let foreground = GetWindowThreadProcessId(GetForegroundWindow(), None);
+        let foreground = GetWindowThreadProcessId(active, None);
         let attached = foreground != 0
             && foreground != current
             && AttachThreadInput(current, foreground, true).as_bool();
@@ -1391,9 +1403,13 @@ struct App {
     styles: style::Styles,
     /// Cuándo se miró la pantalla por última vez para elegir la apariencia.
     scene_read: Instant,
+    /// Última vez que se miró si la bandeja propia sigue delante de la de Explorer.
+    tray_checked: Instant,
     /// Ventana con el desenfoque de Windows que va debajo del dock con las
     /// apariencias Desenfoque y Acrílico.
     backdrop: Option<style::Backdrop>,
+    /// Dónde y con qué apariencia se puso el desenfoque la última vez.
+    backdrop_at: std::cell::Cell<Option<(windows::Win32::Foundation::RECT, style::Appearance)>>,
     /// Actualizaciones (ver `update`): ajustes, versión nueva encontrada y los
     /// hilos que buscan o descargan, que responden por `update_events`.
     update_settings: update::Settings,
@@ -1498,7 +1514,9 @@ impl App {
             status: status_reader,
             styles,
             scene_read: Instant::now(),
+            tray_checked: Instant::now(),
             backdrop: style::Backdrop::new(),
+            backdrop_at: std::cell::Cell::new(None),
             update_settings: update::Settings::load(),
             new_release: None,
             notified: None,
@@ -1736,14 +1754,34 @@ impl App {
         let Some(backdrop) = &self.backdrop else {
             return;
         };
+        let rect = self.backdrop_rect();
+        backdrop.update(
+            self.hwnd,
+            self.bar.appearance,
+            rect,
+            (glass::DOCK_RADIUS * self.scale).round() as i32,
+        );
+        self.backdrop_at.set(Some((rect, self.bar.appearance)));
+    }
+
+    /// Como `sync_backdrop`, pero solo si el dock se movió, cambió de tamaño o de
+    /// apariencia: al redibujarlo en su sitio (pasar el cursor por los iconos), mover
+    /// el desenfoque en cada fotograma costaba 0,06-0,3 ms.
+    fn sync_backdrop_if_changed(&self) {
+        if self.backdrop_at.get() != Some((self.backdrop_rect(), self.bar.appearance)) {
+            self.sync_backdrop();
+        }
+    }
+
+    /// Rectángulo del dock en pantalla, sin el margen de la sombra.
+    fn backdrop_rect(&self) -> windows::Win32::Foundation::RECT {
         let px = |v: f32| (v * self.scale).round() as i32;
-        let rect = windows::Win32::Foundation::RECT {
+        windows::Win32::Foundation::RECT {
             left: self.pos.x + px(bar::SHADOW_PAD_X),
             top: self.pos.y + px(bar::SHADOW_PAD_Y),
             right: self.pos.x + self.surface.width as i32 - px(bar::SHADOW_PAD_X),
             bottom: self.pos.y + self.surface.height as i32 - px(bar::SHADOW_PAD_Y),
-        };
-        backdrop.update(self.hwnd, self.bar.appearance, rect, px(glass::DOCK_RADIUS));
+        }
     }
 
     /// Abre o cierra el panel rápido sobre los iconos de red, volumen y batería.
@@ -2063,7 +2101,12 @@ impl App {
     }
 
     fn expand(&mut self) {
+        let hidden = !self.visibility.expanded;
         self.visibility.reveal();
+        // Escondido no se mira la pantalla (ver `TIMER_TICK`): se mira al salir.
+        if hidden {
+            self.update_style();
+        }
         self.start_animating();
     }
 
@@ -2095,6 +2138,31 @@ impl App {
             );
         }
         // El desenfoque acompaña al dock al aparecer, ocultarse o cambiar de ancho.
+        self.sync_backdrop_if_changed();
+    }
+
+    /// Mueve el dock a `pos` sin volver a enviar su imagen: al mostrarse o esconderse
+    /// solo cambia la posición, y subir la imagen entera costaba ~0,6 ms por fotograma.
+    fn move_window(&self) {
+        let blend = BLENDFUNCTION {
+            BlendOp: AC_SRC_OVER as u8,
+            BlendFlags: 0,
+            SourceConstantAlpha: 255,
+            AlphaFormat: AC_SRC_ALPHA as u8,
+        };
+        unsafe {
+            let _ = UpdateLayeredWindow(
+                self.hwnd,
+                None,
+                Some(&self.pos),
+                None,
+                None,
+                None,
+                COLORREF(0),
+                Some(&blend),
+                ULW_ALPHA,
+            );
+        }
         self.sync_backdrop();
     }
 
@@ -2511,13 +2579,12 @@ unsafe extern "system" fn wndproc(hwnd: HWND, msg: u32, wparam: WPARAM, lparam: 
                         + (app.y_shown - app.y_hidden) as f32 * app.visibility.motion.value)
                         .round() as i32;
 
-                    if current_y != app.pos.y {
-                        app.pos.y = current_y;
-                        app.update_position();
-                    }
-
+                    let moved = current_y != app.pos.y;
+                    app.pos.y = current_y;
                     if bar_moving {
                         app.render();
+                    } else if moved {
+                        app.move_window();
                     }
 
                     if !bar_moving && !slide_moving && !app.visibility.waiting() {
@@ -2533,8 +2600,11 @@ unsafe extern "system" fn wndproc(hwnd: HWND, msg: u32, wparam: WPARAM, lparam: 
                     let status = app.status.read();
                     // El idioma también cambia con atajos (Win+Espacio, Alt+Mayús).
                     app.update_keyboard();
-                    // Maximizar o restaurar no cambia la ventana activa.
-                    app.update_style();
+                    // Maximizar o restaurar no cambia la ventana activa. Con el dock
+                    // escondido no se ve: se mira al empezar a mostrarse.
+                    if app.visibility.expanded {
+                        app.update_style();
+                    }
                     let resized = status.items().len() != app.bar.status.items().len();
                     let status_changed = status != app.bar.status;
                     app.bar.status = status;
@@ -2615,9 +2685,15 @@ unsafe extern "system" fn wndproc(hwnd: HWND, msg: u32, wparam: WPARAM, lparam: 
                         panel.watch_menu();
                     }
                     // Que los iconos de los demás programas sigan llegando a la bandeja propia.
-                    if let Some(host) = &app.systray {
-                        host.keep_in_front();
+                    // Cinco veces por segundo basta: mirarlo cada 40 ms era la mitad del
+                    // gasto de este temporizador.
+                    if app.tray_checked.elapsed() >= Duration::from_millis(200) {
+                        app.tray_checked = Instant::now();
+                        if let Some(host) = &app.systray {
+                            host.keep_in_front();
+                        }
                     }
+                    let was_expanded = app.visibility.expanded;
                     let inside = app.visibility.expanded
                         && pt.x >= app.pos.x
                         && pt.x < app.pos.x + app.surface.width as i32
@@ -2645,6 +2721,10 @@ unsafe extern "system" fn wndproc(hwnd: HWND, msg: u32, wparam: WPARAM, lparam: 
                                 .is_some_and(|at| at.elapsed() < Duration::from_millis(1500)),
                         Instant::now(),
                     );
+                    // Empieza a mostrarse: la apariencia, al día desde el primer fotograma.
+                    if app.visibility.expanded && !was_expanded {
+                        app.update_style();
+                    }
                     if app.visibility.active() {
                         app.start_animating();
                     }

@@ -309,9 +309,11 @@ fn rounded_path(x: f32, y: f32, w: f32, h: f32, r: f32) -> Option<tiny_skia::Pat
 }
 
 /// Lee el estado una vez por segundo reutilizando los objetos de Windows: crear el
-/// de audio y el de red en cada lectura costaba unos 11 ms por segundo. La red,
-/// que es lo más lento de mirar, solo se vuelve a leer cuando Windows avisa de que
-/// cambió alguna dirección IP, o cada 10 s por si cambió otra cosa (Internet).
+/// de audio y el de red en cada lectura costaba unos 11 ms por segundo. El tipo de
+/// conexión, que es lo más lento de mirar (5-7 ms), solo se vuelve a leer cuando
+/// Windows avisa de que cambió alguna dirección IP, o cada minuto; si hay Internet,
+/// cada 10 s. La salida de audio predeterminada solo se vuelve a pedir cuando
+/// Windows avisa de que cambió.
 pub struct Reader {
     devices: Option<windows::Win32::Media::Audio::IMMDeviceEnumerator>,
     /// Salida predeterminada (su id) y su control de volumen.
@@ -319,13 +321,102 @@ pub struct Reader {
         String,
         windows::Win32::Media::Audio::Endpoints::IAudioEndpointVolume,
     )>,
+    /// Aviso de Windows al cambiar de salida predeterminada; `None` si no se pudo
+    /// registrar, y entonces se pide en cada lectura.
+    outputs: Option<OutputChanges>,
     network: Option<windows::Win32::Networking::NetworkListManager::INetworkListManager>,
     changes: Option<AddressChanges>,
-    /// Última lectura de la red y cuándo se hizo.
-    last_network: Option<(std::time::Instant, Link, bool)>,
+    /// Último tipo de conexión leído y cuándo.
+    last_link: Option<(std::time::Instant, Link)>,
+    /// Última comprobación de Internet y cuándo.
+    last_internet: Option<(std::time::Instant, bool)>,
 }
 
-const NETWORK_EVERY: std::time::Duration = std::time::Duration::from_secs(10);
+const LINK_EVERY: std::time::Duration = std::time::Duration::from_secs(60);
+const INTERNET_EVERY: std::time::Duration = std::time::Duration::from_secs(10);
+
+/// Registro de `DefaultOutput` en el enumerador de dispositivos; se quita al soltarlo.
+struct OutputChanges {
+    devices: windows::Win32::Media::Audio::IMMDeviceEnumerator,
+    client: windows::Win32::Media::Audio::IMMNotificationClient,
+    changed: std::sync::Arc<std::sync::atomic::AtomicBool>,
+}
+
+impl OutputChanges {
+    fn register(devices: &windows::Win32::Media::Audio::IMMDeviceEnumerator) -> Option<Self> {
+        let changed = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(true));
+        let client: windows::Win32::Media::Audio::IMMNotificationClient =
+            DefaultOutput(changed.clone()).into();
+        unsafe { devices.RegisterEndpointNotificationCallback(&client) }.ok()?;
+        Some(Self {
+            devices: devices.clone(),
+            client,
+            changed,
+        })
+    }
+
+    /// Si cambió algo desde la última vez que se preguntó.
+    fn take(&self) -> bool {
+        self.changed
+            .swap(false, std::sync::atomic::Ordering::Relaxed)
+    }
+}
+
+impl Drop for OutputChanges {
+    fn drop(&mut self) {
+        unsafe {
+            let _ = self
+                .devices
+                .UnregisterEndpointNotificationCallback(&self.client);
+        }
+    }
+}
+
+/// Marca que hay que volver a pedir la salida. Windows lo llama desde otro hilo.
+#[windows::core::implement(windows::Win32::Media::Audio::IMMNotificationClient)]
+struct DefaultOutput(std::sync::Arc<std::sync::atomic::AtomicBool>);
+
+impl DefaultOutput {
+    fn mark(&self) {
+        self.0.store(true, std::sync::atomic::Ordering::Relaxed);
+    }
+}
+
+impl windows::Win32::Media::Audio::IMMNotificationClient_Impl for DefaultOutput_Impl {
+    fn OnDeviceStateChanged(
+        &self,
+        _: &windows::core::PCWSTR,
+        _: windows::Win32::Media::Audio::DEVICE_STATE,
+    ) -> windows::core::Result<()> {
+        self.mark();
+        Ok(())
+    }
+    fn OnDeviceAdded(&self, _: &windows::core::PCWSTR) -> windows::core::Result<()> {
+        Ok(())
+    }
+    fn OnDeviceRemoved(&self, _: &windows::core::PCWSTR) -> windows::core::Result<()> {
+        self.mark();
+        Ok(())
+    }
+    fn OnDefaultDeviceChanged(
+        &self,
+        flow: windows::Win32::Media::Audio::EDataFlow,
+        _: windows::Win32::Media::Audio::ERole,
+        _: &windows::core::PCWSTR,
+    ) -> windows::core::Result<()> {
+        if flow == windows::Win32::Media::Audio::eRender {
+            self.mark();
+        }
+        Ok(())
+    }
+    fn OnPropertyValueChanged(
+        &self,
+        _: &windows::core::PCWSTR,
+        _: &windows::Win32::Foundation::PROPERTYKEY,
+    ) -> windows::core::Result<()> {
+        Ok(())
+    }
+}
 
 impl Reader {
     /// Se crea en el hilo de la interfaz, que queda con COM iniciado para siempre.
@@ -337,12 +428,16 @@ impl Reader {
         };
         unsafe {
             let _ = CoInitializeEx(None, COINIT_APARTMENTTHREADED);
+            let devices: Option<windows::Win32::Media::Audio::IMMDeviceEnumerator> =
+                CoCreateInstance(&MMDeviceEnumerator, None, CLSCTX_ALL).ok();
             Self {
-                devices: CoCreateInstance(&MMDeviceEnumerator, None, CLSCTX_ALL).ok(),
+                outputs: devices.as_ref().and_then(OutputChanges::register),
+                devices,
                 endpoint: None,
                 network: CoCreateInstance(&NetworkListManager, None, CLSCTX_ALL).ok(),
                 changes: AddressChanges::new(),
-                last_network: None,
+                last_link: None,
+                last_internet: None,
             }
         }
     }
@@ -351,15 +446,20 @@ impl Reader {
         let now = std::time::Instant::now();
         // Se mira el aviso siempre, para volver a vigilar aunque toque leer igual.
         let changed = self.changes.as_mut().is_some_and(AddressChanges::changed);
-        let (link, internet) = match self.last_network {
-            Some((at, link, internet)) if !changed && now.duration_since(at) < NETWORK_EVERY => {
-                (link, internet)
-            }
+        let link = match self.last_link {
+            Some((at, link)) if !changed && now.duration_since(at) < LINK_EVERY => link,
             _ => {
                 let link = unsafe { link() };
+                self.last_link = Some((now, link));
+                link
+            }
+        };
+        let internet = match self.last_internet {
+            Some((at, internet)) if !changed && now.duration_since(at) < INTERNET_EVERY => internet,
+            _ => {
                 let internet = self.internet();
-                self.last_network = Some((now, link, internet));
-                (link, internet)
+                self.last_internet = Some((now, internet));
+                internet
             }
         };
         Status {
@@ -382,28 +482,49 @@ impl Reader {
         })
     }
 
-    /// Volumen de la salida predeterminada. Su control solo se vuelve a pedir si la
-    /// salida cambió (otro dispositivo, o se desconectó).
+    /// Volumen de la salida predeterminada. Pedir cuál es cuesta ~0,8 ms y leer su
+    /// control ~0,07 ms: la salida solo se vuelve a pedir si Windows avisó de un
+    /// cambio, si no hay aviso, o si su control dejó de responder (se desconectó).
     fn volume(&mut self) -> Option<Volume> {
+        let ask = self.endpoint.is_none() || self.outputs.as_ref().is_none_or(OutputChanges::take);
+        if ask {
+            self.refresh_endpoint();
+        }
+        let (_, control) = self.endpoint.as_ref()?;
+        let read = unsafe {
+            control
+                .GetMasterVolumeLevelScalar()
+                .and_then(|level| Ok((level, control.GetMute()?.as_bool())))
+        };
+        match read {
+            Ok((level, muted)) => Some(Volume { level, muted }),
+            Err(_) => {
+                self.endpoint = None;
+                None
+            }
+        }
+    }
+
+    fn refresh_endpoint(&mut self) {
         use windows::Win32::Media::Audio::{eConsole, eRender};
         use windows::Win32::System::Com::{CoTaskMemFree, CLSCTX_ALL};
-        let devices = self.devices.as_ref()?;
+        let Some(devices) = self.devices.as_ref() else {
+            return;
+        };
         unsafe {
             let Ok(device) = devices.GetDefaultAudioEndpoint(eRender, eConsole) else {
                 self.endpoint = None;
-                return None;
+                return;
             };
-            let raw = device.GetId().ok()?;
+            let Ok(raw) = device.GetId() else {
+                self.endpoint = None;
+                return;
+            };
             let id = raw.to_string().unwrap_or_default();
             CoTaskMemFree(Some(raw.0 as *const _));
             if self.endpoint.as_ref().is_none_or(|(known, _)| *known != id) {
                 self.endpoint = device.Activate(CLSCTX_ALL, None).ok().map(|v| (id, v));
             }
-            let (_, control) = self.endpoint.as_ref()?;
-            Some(Volume {
-                level: control.GetMasterVolumeLevelScalar().ok()?,
-                muted: control.GetMute().ok()?.as_bool(),
-            })
         }
     }
 }

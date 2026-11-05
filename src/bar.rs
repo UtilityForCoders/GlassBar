@@ -63,6 +63,23 @@ pub struct BarState {
     /// Apariencia del fondo según lo que pasa en pantalla (ver `style`).
     pub appearance: crate::style::Appearance,
     clock: ClockRenderer,
+    /// Lo que no se mueve al pasar el cursor por los iconos (fondo, flecha, idioma,
+    /// estado y reloj), ya dibujado. Cada fotograma lo copia en vez de repintarlo.
+    fixed: std::cell::RefCell<Option<(FixedKey, Pixmap)>>,
+}
+
+/// Todo lo que cambia la capa fija del dock: si es igual, la guardada sirve.
+#[derive(Clone, PartialEq)]
+struct FixedKey {
+    size: (u32, u32),
+    scale: u32,
+    appearance: crate::style::Appearance,
+    status: Status,
+    keyboard: Option<crate::keyboard::Layout>,
+    items: usize,
+    /// Resaltado de la flecha, el idioma o el estado: se dibuja debajo de su icono.
+    hovered: Option<HoverTarget>,
+    minute: u64,
 }
 
 impl BarState {
@@ -79,6 +96,7 @@ impl BarState {
             keyboard: None,
             appearance: Default::default(),
             clock: ClockRenderer::new(),
+            fixed: std::cell::RefCell::new(None),
         }
     }
     pub fn dock_width(&self) -> f32 {
@@ -309,19 +327,10 @@ impl BarState {
         }
     }
     pub fn draw(&self, pixmap: &mut Pixmap, scale: f32) {
-        pixmap.fill(tiny_skia::Color::TRANSPARENT);
         let x = SHADOW_PAD_X * scale;
         let y = SHADOW_PAD_Y * scale;
         let cy = y + DOCK_H * scale / 2.0;
-        draw_dock(
-            pixmap,
-            self.appearance,
-            x,
-            y,
-            self.dock_width() * scale,
-            DOCK_H * scale,
-            scale,
-        );
+        self.draw_fixed(pixmap, scale);
         let launcher_x = x + APP_START * scale / 2.0;
         if self.hovered == Some(HoverTarget::Launcher) {
             draw_hover(pixmap, launcher_x, cy, scale);
@@ -366,6 +375,53 @@ impl BarState {
             draw_hover(pixmap, cx, cy, scale);
             draw_app_icon(pixmap, app, cx, cy, ICON_SIZE, ICON_SIZE * 1.1, scale);
         }
+    }
+
+    /// Copia en `pixmap` la capa fija; solo la vuelve a dibujar si cambió algo de ella.
+    fn draw_fixed(&self, pixmap: &mut Pixmap, scale: f32) {
+        let key = FixedKey {
+            size: (pixmap.width(), pixmap.height()),
+            scale: scale.to_bits(),
+            appearance: self.appearance,
+            status: self.status,
+            keyboard: self.keyboard.clone(),
+            items: self.item_count(),
+            hovered: self.hovered.filter(|h| {
+                matches!(
+                    h,
+                    HoverTarget::Overflow | HoverTarget::Language | HoverTarget::Status(_)
+                )
+            }),
+            minute: crate::clock::minute(),
+        };
+        let mut fixed = self.fixed.borrow_mut();
+        if fixed.as_ref().is_none_or(|(k, _)| *k != key) {
+            let Some(mut layer) = Pixmap::new(pixmap.width(), pixmap.height()) else {
+                self.paint_fixed(pixmap, scale);
+                return;
+            };
+            self.paint_fixed(&mut layer, scale);
+            *fixed = Some((key, layer));
+        }
+        if let Some((_, layer)) = fixed.as_ref() {
+            pixmap.data_mut().copy_from_slice(layer.data());
+        }
+    }
+
+    fn paint_fixed(&self, pixmap: &mut Pixmap, scale: f32) {
+        pixmap.fill(tiny_skia::Color::TRANSPARENT);
+        let x = SHADOW_PAD_X * scale;
+        let y = SHADOW_PAD_Y * scale;
+        let cy = y + DOCK_H * scale / 2.0;
+        draw_dock(
+            pixmap,
+            self.appearance,
+            x,
+            y,
+            self.dock_width() * scale,
+            DOCK_H * scale,
+            scale,
+        );
         let arrow_x = self.overflow_center(scale);
         if self.hovered == Some(HoverTarget::Overflow) {
             draw_hover(pixmap, arrow_x, cy, scale);
@@ -497,6 +553,26 @@ mod tests {
             name: command.into(),
             command: command.into(),
         })
+    }
+
+    #[test]
+    fn fixed_layer_is_reused_until_something_in_it_changes() {
+        let mut bar = BarState::new();
+        bar.primary_apps = vec![item("a.exe")];
+        let (w, h) = bar.window_size(1.0);
+        let draw = |bar: &BarState| {
+            let mut image = Pixmap::new(w, h).unwrap();
+            bar.draw(&mut image, 1.0);
+            image
+        };
+        let first = draw(&bar);
+        assert_eq!(first.data(), draw(&bar).data());
+        // El resaltado del estado va en la capa fija: tiene que verse.
+        bar.hovered = Some(HoverTarget::Status(0));
+        let hovered = draw(&bar);
+        assert_ne!(first.data(), hovered.data());
+        bar.hovered = None;
+        assert_eq!(first.data(), draw(&bar).data());
     }
 
     #[test]
