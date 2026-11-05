@@ -497,13 +497,25 @@ fn take_focus(hwnd: HWND) {
     unsafe {
         use windows::Win32::System::Threading::{AttachThreadInput, GetCurrentThreadId};
         use windows::Win32::UI::WindowsAndMessaging::{
-            GetForegroundWindow, GetWindowThreadProcessId, SetForegroundWindow, SW_SHOW,
+            GetForegroundWindow, GetWindowThreadProcessId, IsHungAppWindow, SetForegroundWindow,
+            SW_SHOW,
         };
         let _ = ShowWindow(hwnd, SW_SHOW);
+        // Normalmente basta con pedirlo: tras un clic en GlassBar, Windows lo da.
+        if SetForegroundWindow(hwnd).as_bool() && GetForegroundWindow() == hwnd {
+            let _ = windows::Win32::UI::Input::KeyboardAndMouse::SetFocus(Some(hwnd));
+            return;
+        }
         // Abierto con la tecla Windows no hubo clic en GlassBar y Windows puede
-        // negar el foco; compartir la entrada con la ventana activa lo permite.
+        // negar el foco; compartir la entrada con la ventana activa lo permite. Eso
+        // hace esperar a su hilo: con una ventana colgada, GlassBar dejaría de
+        // responder, así que entonces no se intenta.
+        let active = GetForegroundWindow();
+        if IsHungAppWindow(active).as_bool() {
+            return;
+        }
         let current = GetCurrentThreadId();
-        let foreground = GetWindowThreadProcessId(GetForegroundWindow(), None);
+        let foreground = GetWindowThreadProcessId(active, None);
         let attached = foreground != 0
             && foreground != current
             && AttachThreadInput(current, foreground, true).as_bool();
