@@ -246,42 +246,6 @@ fn get(url: &str) -> Result<Vec<u8>, String> {
     }
 }
 
-/// Ajustes de las actualizaciones, en `%LOCALAPPDATA%\GlassBar\updates.json`.
-#[derive(Clone, Copy, Debug, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
-pub struct Settings {
-    /// Buscar versiones nuevas al arrancar y cada 6 horas.
-    pub check: bool,
-}
-
-impl Default for Settings {
-    fn default() -> Self {
-        Self { check: true }
-    }
-}
-
-impl Settings {
-    pub fn load() -> Self {
-        settings_path()
-            .and_then(|p| std::fs::read(p).ok())
-            .and_then(|data| serde_json::from_slice(&data).ok())
-            .unwrap_or_default()
-    }
-    pub fn save(&self) -> std::io::Result<()> {
-        let path =
-            settings_path().ok_or_else(|| std::io::Error::other("LOCALAPPDATA no disponible"))?;
-        std::fs::create_dir_all(path.parent().unwrap())?;
-        std::fs::write(path, serde_json::to_vec_pretty(self)?)
-    }
-}
-
-fn settings_path() -> Option<PathBuf> {
-    Some(
-        PathBuf::from(std::env::var_os("LOCALAPPDATA")?)
-            .join("GlassBar")
-            .join("updates.json"),
-    )
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;

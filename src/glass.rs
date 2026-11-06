@@ -1,5 +1,5 @@
-//! Cristal plano de opacidad media: sin sombras ni reflejo superior.
-use crate::apps::{fill_rounded, stroke_rounded};
+//! Cristal gris de opacidad media: sin sombras ni reflejo superior.
+use crate::apps::{fill_rounded, fill_rounded_gradient, stroke_rounded};
 use crate::style::Appearance;
 use tiny_skia::Pixmap;
 
@@ -17,19 +17,20 @@ pub fn draw_dock(
     h: f32,
     scale: f32,
 ) {
-    let (fill, stroke) = appearance.colors();
-    fill_rounded(pixmap, fill, x, y, w, h, DOCK_RADIUS * scale);
+    let ([left, middle, right], stroke) = appearance.colors();
+    fill_rounded_gradient(
+        pixmap,
+        &[(0.0, left), (0.5, middle), (1.0, right)],
+        (x, y),
+        (x + w, y),
+        x,
+        y,
+        w,
+        h,
+        DOCK_RADIUS * scale,
+    );
     if stroke[3] > 0 {
-        stroke_rounded(
-            pixmap,
-            stroke,
-            x,
-            y,
-            w,
-            h,
-            DOCK_RADIUS * scale,
-            0.75 * scale,
-        );
+        stroke_rounded(pixmap, stroke, x, y, w, h, DOCK_RADIUS * scale, scale);
     }
 }
 pub fn draw_hover(pixmap: &mut Pixmap, cx: f32, cy: f32, scale: f32) {

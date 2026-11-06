@@ -127,7 +127,7 @@ GlassBar busca versiones nuevas poco después de arrancar y luego cada 6 horas. 
 2. Comprueba su suma SHA-256.
 3. Lo ejecuta en silencio y GlassBar se vuelve a abrir solo.
 
-Se desactiva con **Buscar actualizaciones** en ese mismo menú. Ver [PRIVACY.md](PRIVACY.md).
+**Buscar actualizaciones**, en ese mismo menú, mira ya la última versión publicada y avisa también si no hay ninguna nueva. Ver [PRIVACY.md](PRIVACY.md).
 
 Las versiones se publican solas en [Releases](https://github.com/UtilityForCoders/GlassBar/releases). Cada una trae `glassbar-X.Y.Z-x64.exe` (el programa, sin instalar), `glassbar-setup-X.Y.Z-x64.exe` (el instalador, para el usuario actual) y `SHA256SUMS.txt` para comprobarlos.
 
