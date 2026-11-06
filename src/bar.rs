@@ -62,6 +62,7 @@ pub struct BarState {
     pub keyboard: Option<crate::keyboard::Layout>,
     /// Apariencia del fondo según lo que pasa en pantalla (ver `style`).
     pub appearance: crate::style::Appearance,
+    pub blur_tint: crate::style::BlurTint,
     clock: ClockRenderer,
 }
 
@@ -78,6 +79,7 @@ impl BarState {
             status: Status::default(),
             keyboard: None,
             appearance: Default::default(),
+            blur_tint: Default::default(),
             clock: ClockRenderer::new(),
         }
     }
@@ -315,7 +317,7 @@ impl BarState {
         let cy = y + DOCK_H * scale / 2.0;
         draw_dock(
             pixmap,
-            self.appearance,
+            self.appearance.colors(self.blur_tint),
             x,
             y,
             self.dock_width() * scale,

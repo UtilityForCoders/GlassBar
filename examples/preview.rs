@@ -174,7 +174,7 @@ fn main() {
             available: Some("9.9.9".into()),
             busy: false,
         };
-        let root = appmenu::glassbar(&styles, autostart::is_enabled(), &updates);
+        let root = appmenu::glassbar(&styles, style::State::Desktop, autostart::is_enabled(), &updates);
         let mut menu = appmenu::Cascade::new(root, false);
         menu.key(0x28);
         menu.key(0x28);

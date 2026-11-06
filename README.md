@@ -94,6 +94,8 @@ Como en TranslucentTB, el aspecto del dock cambia según lo que pasa en pantalla
 
 En cada una se elige la apariencia: **Normal** (el cristal de siempre), **Opaca**, **Transparente**, **Desenfoque** o **Acrílico**. Las dos últimas usan el desenfoque de Windows recortado a la forma del dock. Si se dan varias situaciones, gana la activada de mayor prioridad. Elegir una apariencia activa la situación, y **Activado** la quita sin perder la apariencia elegida. Por defecto solo cuenta el Escritorio con el aspecto Normal. Los ajustes se guardan en `%LOCALAPPDATA%\GlassBar\styles.json`.
 
+En **Tinte del desenfoque**, elige **Suave**, **Medio** u **Oscuro** para activar el desenfoque en la situación en uso y ajustar su contraste. El tinte se comparte entre las situaciones que usan ese modo. Windows aplica el desenfoque y GlassBar oculta el fondo al retraer la barra. El menú ofrece un acceso a **Efectos visuales** si Windows tiene desactivados los efectos de transparencia.
+
 ## Comportamiento
 
 Acerca el cursor a los últimos 6 píxeles lógicos del borde inferior del monitor principal para desplegar la barra. Al alejarlo, espera 300 ms y se oculta con una animación suave sin rebote. El margen entre la barra y el borde también permite mantenerla abierta. Se oculta por completo, incluso si activaste el borde sin entrar en ella.

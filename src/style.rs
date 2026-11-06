@@ -42,6 +42,17 @@ impl State {
             State::TaskView => "Vista de tareas abierta",
         }
     }
+    pub fn description(self) -> &'static str {
+        match self {
+            State::Desktop => "Aspecto base de la barra",
+            State::VisibleWindow => "Hay una ventana visible en este monitor",
+            State::Maximized => "La ventana de delante está maximizada",
+            State::Start => "El lanzador de GlassBar está abierto",
+            State::Search => "Búsqueda de Inicio o de Windows (Win+S)",
+            State::TaskView => "Vista de tareas de Windows (Win+Tab)",
+        }
+    }
+
     /// Icono de Segoe Fluent Icons para el menú.
     pub fn glyph(self) -> char {
         match self {
@@ -85,19 +96,48 @@ impl Appearance {
     }
     /// Relleno y borde del dock. Nunca del todo transparente: con alfa 0 los clics
     /// atravesarían la ventana.
-    pub fn colors(self) -> ([u8; 4], [u8; 4]) {
+    pub fn colors(self, tint: BlurTint) -> ([u8; 4], [u8; 4]) {
         match self {
             Appearance::Normal => ([23, 28, 36, 130], [255, 255, 255, 32]),
             Appearance::Opaque => ([32, 32, 32, 255], [255, 255, 255, 24]),
             Appearance::Clear => ([0, 0, 0, 1], [0, 0, 0, 0]),
             // El desenfoque lo pone Windows debajo; encima, un velo para el contraste.
-            Appearance::Blur => ([23, 28, 36, 70], [255, 255, 255, 32]),
+            Appearance::Blur => ([23, 28, 36, tint.alpha()], [255, 255, 255, 32]),
             Appearance::Acrylic => ([0, 0, 0, 1], [255, 255, 255, 32]),
         }
     }
     /// Necesita que Windows desenfoque lo que hay detrás.
     fn backdrop(self) -> bool {
         matches!(self, Appearance::Blur | Appearance::Acrylic)
+    }
+}
+
+/// Opacidad del velo sobre el fondo desenfocado.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+pub enum BlurTint {
+    Light,
+    #[default]
+    Medium,
+    Dark,
+}
+
+impl BlurTint {
+    pub const ALL: [Self; 3] = [Self::Light, Self::Medium, Self::Dark];
+
+    pub fn name(self) -> &'static str {
+        match self {
+            Self::Light => "Suave",
+            Self::Medium => "Medio",
+            Self::Dark => "Oscuro",
+        }
+    }
+
+    fn alpha(self) -> u8 {
+        match self {
+            Self::Light => 28,
+            Self::Medium => 70,
+            Self::Dark => 130,
+        }
     }
 }
 
@@ -112,6 +152,8 @@ pub struct Look {
 #[derive(Clone, Debug, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
 pub struct Styles {
     looks: Vec<Look>,
+    #[serde(default)]
+    pub blur_tint: BlurTint,
 }
 
 impl Default for Styles {
@@ -119,7 +161,10 @@ impl Default for Styles {
     fn default() -> Self {
         let mut looks = vec![Look::default(); State::ALL.len()];
         looks[0].enabled = true;
-        Self { looks }
+        Self {
+            looks,
+            blur_tint: BlurTint::default(),
+        }
     }
 }
 
@@ -155,14 +200,14 @@ impl Styles {
         }
     }
     /// La apariencia de la situación activada de mayor prioridad de las que se dan.
-    pub fn resolve(&self, scene: &Scene) -> Appearance {
+    pub fn resolve(&self, scene: &Scene) -> (State, Appearance) {
         State::ALL
             .iter()
             .rev()
             .map(|&state| (state, self.look(state)))
             .find(|(state, look)| look.enabled && scene.has(*state))
-            .map(|(_, look)| look.appearance)
-            .unwrap_or_default()
+            .map(|(state, look)| (state, look.appearance))
+            .unwrap_or((State::Desktop, self.look(State::Desktop).appearance))
     }
 
     pub fn load() -> Self {
@@ -184,16 +229,19 @@ impl Styles {
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum Choice {
     Toggle(State),
+    BlurTint(State, BlurTint),
     Set(State, Appearance),
 }
 
-/// Órdenes del menú: `COMMANDS + situación * 10 + apariencia`, y `+ 9` para activarla.
+/// Cada situación tiene diez órdenes: apariencias, tintes y activación.
 const COMMANDS: u32 = 200;
 const TOGGLE: u32 = 9;
+const FIRST_TINT: u32 = Appearance::ALL.len() as u32;
 
 impl Choice {
     pub fn command(self) -> u32 {
         match self {
+            Choice::BlurTint(state, tint) => COMMANDS + state as u32 * 10 + FIRST_TINT + tint as u32,
             Choice::Toggle(state) => COMMANDS + state as u32 * 10 + TOGGLE,
             Choice::Set(state, appearance) => COMMANDS + state as u32 * 10 + appearance as u32,
         }
@@ -203,6 +251,9 @@ impl Choice {
         let state = *State::ALL.get((offset / 10) as usize)?;
         match offset % 10 {
             TOGGLE => Some(Choice::Toggle(state)),
+            index if index >= FIRST_TINT => BlurTint::ALL
+                .get((index - FIRST_TINT) as usize)
+                .map(|&tint| Choice::BlurTint(state, tint)),
             index => Appearance::ALL
                 .get(index as usize)
                 .map(|&appearance| Choice::Set(state, appearance)),
@@ -210,6 +261,10 @@ impl Choice {
     }
     pub fn apply(self, styles: &mut Styles) {
         match self {
+            Choice::BlurTint(state, tint) => {
+                styles.set_appearance(state, Appearance::Blur);
+                styles.blur_tint = tint;
+            }
             Choice::Toggle(state) => styles.toggle(state),
             Choice::Set(state, appearance) => styles.set_appearance(state, appearance),
         }
@@ -222,6 +277,27 @@ fn path() -> Option<PathBuf> {
             .join("GlassBar")
             .join("styles.json"),
     )
+}
+
+/// Se consulta al abrir el menú para explicar por qué Windows puede omitir el efecto.
+pub fn transparency_disabled() -> bool {
+    use windows::core::w;
+    use windows::Win32::System::Registry::{RegGetValueW, HKEY_CURRENT_USER, RRF_RT_REG_DWORD};
+
+    let mut enabled = 1u32;
+    let mut size = std::mem::size_of_val(&enabled) as u32;
+    let result = unsafe {
+        RegGetValueW(
+            HKEY_CURRENT_USER,
+            w!("Software\\Microsoft\\Windows\\CurrentVersion\\Themes\\Personalize"),
+            w!("EnableTransparency"),
+            RRF_RT_REG_DWORD,
+            None,
+            Some((&mut enabled as *mut u32).cast()),
+            Some(&mut size),
+        )
+    };
+    result.is_ok() && enabled == 0
 }
 
 /// Lo que está pasando en pantalla.
@@ -663,8 +739,8 @@ mod tests {
             search: true,
             task_view: true,
         };
-        assert_eq!(styles.resolve(&busy), Appearance::Normal);
-        assert_eq!(styles.resolve(&Scene::default()), Appearance::Normal);
+        assert_eq!(styles.resolve(&busy), (State::Desktop, Appearance::Normal));
+        assert_eq!(styles.resolve(&Scene::default()), (State::Desktop, Appearance::Normal));
     }
 
     #[test]
@@ -675,16 +751,16 @@ mod tests {
         styles.set_appearance(State::Maximized, Appearance::Opaque);
         styles.set_appearance(State::Start, Appearance::Acrylic);
         let mut scene = Scene::default();
-        assert_eq!(styles.resolve(&scene), Appearance::Clear);
+        assert_eq!(styles.resolve(&scene), (State::Desktop, Appearance::Clear));
         scene.visible_window = true;
-        assert_eq!(styles.resolve(&scene), Appearance::Blur);
+        assert_eq!(styles.resolve(&scene), (State::VisibleWindow, Appearance::Blur));
         scene.maximized = true;
-        assert_eq!(styles.resolve(&scene), Appearance::Opaque);
+        assert_eq!(styles.resolve(&scene), (State::Maximized, Appearance::Opaque));
         scene.start = true;
-        assert_eq!(styles.resolve(&scene), Appearance::Acrylic);
+        assert_eq!(styles.resolve(&scene), (State::Start, Appearance::Acrylic));
         // Desactivada, la situación no cuenta y gana la siguiente.
         styles.toggle(State::Start);
-        assert_eq!(styles.resolve(&scene), Appearance::Opaque);
+        assert_eq!(styles.resolve(&scene), (State::Maximized, Appearance::Opaque));
         // El escritorio no se puede desactivar.
         styles.toggle(State::Desktop);
         assert!(styles.look(State::Desktop).enabled);
@@ -715,7 +791,7 @@ mod tests {
         }
         // Las demás órdenes del menú de GlassBar no son de estilos.
         assert_eq!(Choice::from_command(2), None);
-        assert_eq!(Choice::from_command(COMMANDS + 5), None);
+        assert_eq!(Choice::from_command(COMMANDS + 8), None);
         assert_eq!(Choice::from_command(COMMANDS + 60), None);
         // Solo hace falta mirar la pantalla con alguna situación activada.
         let mut styles = Styles::default();
@@ -733,3 +809,9 @@ mod tests {
         assert!(!is_search("explorer.exe"));
     }
 }
+        styles.blur_tint = BlurTint::Dark;
+        assert_eq!(short.blur_tint, BlurTint::Medium);
+            for tint in BlurTint::ALL {
+                let choice = Choice::BlurTint(state, tint);
+                assert_eq!(Choice::from_command(choice.command()), Some(choice));
+            }

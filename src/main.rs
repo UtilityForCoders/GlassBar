@@ -1389,6 +1389,7 @@ struct App {
     status: status::Reader,
     /// Apariencia de cada situación (escritorio, ventana maximizada…).
     styles: style::Styles,
+    active_style: style::State,
     /// Cuándo se miró la pantalla por última vez para elegir la apariencia.
     scene_read: Instant,
     /// Ventana con el desenfoque de Windows que va debajo del dock con las
@@ -1437,6 +1438,7 @@ impl App {
         bar.keyboard = keyboard::current();
         let styles = style::Styles::load();
         bar.appearance = styles.look(style::State::Desktop).appearance;
+        bar.blur_tint = styles.blur_tint;
         let (update_sender, update_events) = std::sync::mpsc::channel();
         let scale = scale.min((rc.right - rc.left) as f32 / (bar.dock_width() + 40.0));
         let (width, height) = bar.window_size(scale);
@@ -1498,6 +1500,7 @@ impl App {
             mouse_down: false,
             status: status_reader,
             styles,
+            active_style: style::State::Desktop,
             scene_read: Instant::now(),
             backdrop: style::Backdrop::new(),
             new_release: None,
@@ -1591,6 +1594,7 @@ impl App {
         unsafe {
             let _ = GetCursorPos(&mut cursor);
         }
+        self.update_style();
         let bounds = (self.screen_left, self.screen_right);
         let updates = appmenu::Updates {
             checking: self.checking,
@@ -1600,6 +1604,7 @@ impl App {
         if let Some(menu) = &mut self.app_menu {
             menu.open_glassbar(
                 &self.styles,
+                self.active_style,
                 autostart::is_enabled(),
                 &updates,
                 cursor,
@@ -1729,7 +1734,7 @@ impl App {
     /// Mira lo que pasa en pantalla y, si cambia la apariencia del dock, lo redibuja.
     fn update_style(&mut self) {
         self.scene_read = Instant::now();
-        let appearance = if self.styles.watches_screen() {
+        let (active, appearance) = if self.styles.watches_screen() {
             let launcher = self.launcher.as_ref().filter(|menu| menu.visible);
             let monitor = windows::Win32::Foundation::RECT {
                 left: self.screen_left,
@@ -1744,10 +1749,13 @@ impl App {
             );
             self.styles.resolve(&scene)
         } else {
-            self.styles.look(style::State::Desktop).appearance
+            let desktop = style::State::Desktop;
+            (desktop, self.styles.look(desktop).appearance)
         };
-        if appearance != self.bar.appearance {
+        self.active_style = active;
+        if appearance != self.bar.appearance || self.styles.blur_tint != self.bar.blur_tint {
             self.bar.appearance = appearance;
+            self.bar.blur_tint = self.styles.blur_tint;
             self.render();
         }
     }
@@ -3359,7 +3367,7 @@ impl AppMenuWindow {
         cursor: POINT,
         (left, right): (i32, i32),
     ) {
-        let root = appmenu::glassbar(styles, autostart, updates);
+        let root = appmenu::glassbar(styles, active, autostart, updates);
         self.open_at_cursor(root, MenuPurpose::GlassBar, cursor, (left, right));
     }
 
@@ -3379,6 +3387,7 @@ impl AppMenuWindow {
         let (_, dpi) = monitors::get_info(monitors::primary());
         self.scale = dpi.max(0.3);
         // Los submenús, a la derecha si caben; si no, a la izquierda.
+        active: style::State,
         let wide = appmenu::Cascade::new(root, false);
         let room = cursor.x + (wide.size().0 * self.scale).ceil() as i32 <= right;
         self.model = if room {
@@ -4251,6 +4260,11 @@ mod autohide_tests {
     fn edge_activation_stays_on_its_monitor_and_scales_with_dpi() {
         assert!(cursor_at_edge(
             POINT { x: 100, y: 1078 },
+        appmenu::CMD_TRANSPARENCY_SETTINGS => {
+            let _ = std::process::Command::new("explorer.exe")
+                .arg("ms-settings:easeofaccess-visualeffects")
+                .spawn();
+        }
             0,
             1920,
             1080,

@@ -4,7 +4,7 @@
 //! está solo el contenido y su dibujo; la ventana que lo muestra está en `main`.
 use crate::apps::{fill_rounded, stroke_rounded};
 use crate::clock::{draw_icon, draw_text, fit_text, text_width};
-use crate::style::{Appearance, Choice, State, Styles};
+use crate::style::{Appearance, BlurTint, Choice, State, Styles};
 use tiny_skia::{Pixmap, PixmapPaint, Transform};
 
 /// Opciones fijas del menú de una app.
@@ -319,6 +319,7 @@ pub const CMD_AUTOSTART: u32 = 2;
 pub const CMD_EXIT: u32 = 3;
 pub const CMD_UPDATE: u32 = 4;
 pub const CMD_UPDATE_CHECK: u32 = 5;
+pub const CMD_TRANSPARENCY_SETTINGS: u32 = 6;
 
 /// Estado de las actualizaciones que muestra el menú de GlassBar.
 #[derive(Default)]
@@ -333,14 +334,16 @@ pub struct Updates {
 
 /// El menú de GlassBar: un submenú por situación con su apariencia (como en
 /// TranslucentTB), iniciar con Windows, actualizaciones y salir.
-pub fn glassbar(styles: &Styles, autostart: bool, updates: &Updates) -> AppMenu {
+pub fn glassbar(styles: &Styles, active: State, autostart: bool, updates: &Updates) -> AppMenu {
+    let active_appearance = styles.look(active).appearance;
     let mut entries = vec![
         Entry::Header(format!("GlassBar v{}", env!("CARGO_PKG_VERSION"))),
+        Entry::Header(format!("En uso · {} · {}", active.name(), active_appearance.name())),
         Entry::Separator,
     ];
     for state in State::ALL {
         let look = styles.look(state);
-        let mut items = Vec::new();
+        let mut items = vec![Entry::Header(state.description().into())];
         if state != State::Desktop {
             items.push(Entry::Item {
                 icon: Icon::check(look.enabled),
@@ -363,6 +366,29 @@ pub fn glassbar(styles: &Styles, autostart: bool, updates: &Updates) -> AppMenu 
             menu: Box::new(AppMenu::new(items)),
         });
     }
+    let mut tint_items = vec![Entry::Header(format!("Aplicar desenfoque · {}", active.name()))];
+    if crate::style::transparency_disabled() {
+        entries.push(Entry::Item {
+            icon: Icon::Glyph('\u{E713}'),
+            label: "Activar transparencia de Windows".into(),
+            command: CMD_TRANSPARENCY_SETTINGS,
+        });
+        tint_items.push(Entry::Item {
+            icon: Icon::Glyph('\u{E713}'),
+            label: "Windows tiene la transparencia desactivada".into(),
+            command: CMD_TRANSPARENCY_SETTINGS,
+        });
+    }
+    tint_items.extend(BlurTint::ALL.into_iter().map(|tint| Entry::Item {
+        icon: Icon::check(active_appearance == Appearance::Blur && styles.blur_tint == tint),
+        label: tint.name().into(),
+        command: Choice::BlurTint(active, tint).command(),
+    }));
+    entries.push(Entry::Submenu {
+        icon: Icon::Glyph('\u{E790}'),
+        label: "Tinte del desenfoque".into(),
+        menu: Box::new(AppMenu::new(tint_items)),
+    });
     entries.push(Entry::Separator);
     entries.push(Entry::Item {
         icon: Icon::check(autostart),
