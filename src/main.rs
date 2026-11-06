@@ -1394,7 +1394,7 @@ struct App {
     scene_read: Instant,
     /// Ventana con el desenfoque de Windows que va debajo del dock con las
     /// apariencias Desenfoque y Acrílico.
-    backdrop: Option<style::Backdrop>,
+    backdrop: std::cell::OnceCell<Option<style::Backdrop>>,
     /// Actualizaciones (ver `update`): versión nueva encontrada y los hilos que
     /// buscan o descargan, que responden por `update_events`.
     new_release: Option<update::Release>,
@@ -1502,7 +1502,7 @@ impl App {
             styles,
             active_style: style::State::Desktop,
             scene_read: Instant::now(),
-            backdrop: style::Backdrop::new(),
+            backdrop: std::cell::OnceCell::new(),
             new_release: None,
             notified: None,
             checking: false,
@@ -1760,12 +1760,8 @@ impl App {
         }
     }
 
-    /// Pone el desenfoque de Windows detrás del dock si su apariencia lo pide, con
-    /// la forma del dock; solo cuando cambia la apariencia o el tamaño.
-    fn sync_backdrop(&self) {
-        let Some(backdrop) = &self.backdrop else {
-            return;
-        };
+    /// Mantiene el fondo desenfocado visible solo mientras se muestra el dock.
+    fn sync_backdrop(&self, raise: bool) {
         let px = |v: f32| (v * self.scale).round() as i32;
         let rect = windows::Win32::Foundation::RECT {
             left: self.pos.x + px(bar::SHADOW_PAD_X),
@@ -1773,7 +1769,15 @@ impl App {
             right: self.pos.x + self.surface.width as i32 - px(bar::SHADOW_PAD_X),
             bottom: self.pos.y + self.surface.height as i32 - px(bar::SHADOW_PAD_Y),
         };
-        backdrop.update(self.hwnd, self.bar.appearance, rect, px(glass::DOCK_RADIUS));
+        if !self.bar.appearance.backdrop() || rect.top >= self.screen_bottom {
+            if let Some(Some(backdrop)) = self.backdrop.get() {
+                backdrop.hide();
+            }
+            return;
+        }
+        if let Some(backdrop) = self.backdrop.get_or_init(style::Backdrop::new) {
+            backdrop.update(self.hwnd, self.bar.appearance, rect, px(glass::DOCK_RADIUS), raise);
+        }
     }
 
     /// Abre o cierra el panel rápido sobre los iconos de red, volumen y batería.
@@ -1910,7 +1914,7 @@ impl App {
         if raise && !self.fullscreen {
             priority::raise(self.hwnd);
             // Su desenfoque, otra vez justo debajo.
-            self.sync_backdrop();
+            self.sync_backdrop(true);
         }
     }
 
@@ -2097,8 +2101,30 @@ impl App {
         self.start_animating();
     }
 
-    /// Actualiza únicamente la posición física de la ventana en pantalla sin redibujar
-    fn update_position(&self) {
+    /// Desplaza la superficie existente durante la animación de ocultación.
+    fn move_dock(&self, dy: i32) {
+        use windows::Win32::UI::WindowsAndMessaging::{
+            SetWindowPos, SWP_NOACTIVATE, SWP_NOSIZE, SWP_NOZORDER,
+        };
+
+        if self.pos.y < self.y_hidden {
+            if let Some(Some(backdrop)) = self.backdrop.get() {
+                if backdrop.move_with_dock(self.hwnd, self.pos, dy) {
+                    return;
+                }
+            }
+        }
+        unsafe {
+            let _ = SetWindowPos(
+                self.hwnd, None, self.pos.x, self.pos.y, 0, 0,
+                SWP_NOACTIVATE | SWP_NOSIZE | SWP_NOZORDER,
+            );
+        }
+        self.sync_backdrop(false);
+    }
+
+    /// Envía los píxeles del dock al compositor.
+    fn present(&self) {
         let size = SIZE {
             cx: self.surface.width as i32,
             cy: self.surface.height as i32,
@@ -2125,14 +2151,14 @@ impl App {
             );
         }
         // El desenfoque acompaña al dock al aparecer, ocultarse o cambiar de ancho.
-        self.sync_backdrop();
+        self.sync_backdrop(false);
     }
 
     /// Redibuja el dock en la superficie y lo envía al compositor
     fn render(&mut self) {
         self.bar.draw(&mut self.surface.pixmap, self.scale);
         self.surface.copy_to_dib();
-        self.update_position();
+        self.present();
     }
 
     /// Empieza a recibir un fotograma por refresco de la pantalla (ver `frames`).
@@ -2541,13 +2567,12 @@ unsafe extern "system" fn wndproc(hwnd: HWND, msg: u32, wparam: WPARAM, lparam: 
                         + (app.y_shown - app.y_hidden) as f32 * app.visibility.motion.value)
                         .round() as i32;
 
-                    if current_y != app.pos.y {
-                        app.pos.y = current_y;
-                        app.update_position();
-                    }
-
+                    let dy = current_y - app.pos.y;
+                    app.pos.y = current_y;
                     if bar_moving {
                         app.render();
+                    } else if dy != 0 {
+                        app.move_dock(dy);
                     }
 
                     if !bar_moving && !slide_moving && !app.visibility.waiting() {
@@ -3362,6 +3387,7 @@ impl AppMenuWindow {
     fn open_glassbar(
         &mut self,
         styles: &style::Styles,
+        active: style::State,
         autostart: bool,
         updates: &appmenu::Updates,
         cursor: POINT,
@@ -3387,7 +3413,6 @@ impl AppMenuWindow {
         let (_, dpi) = monitors::get_info(monitors::primary());
         self.scale = dpi.max(0.3);
         // Los submenús, a la derecha si caben; si no, a la izquierda.
-        active: style::State,
         let wide = appmenu::Cascade::new(root, false);
         let room = cursor.x + (wide.size().0 * self.scale).ceil() as i32 <= right;
         self.model = if room {
@@ -4235,6 +4260,11 @@ fn handle_menu_command(app: &mut App, cmd: u32) {
         }
         CMD_UPDATE => app.start_update(),
         CMD_UPDATE_CHECK => app.check_updates(true),
+        appmenu::CMD_TRANSPARENCY_SETTINGS => {
+            let _ = std::process::Command::new("explorer.exe")
+                .arg("ms-settings:easeofaccess-visualeffects")
+                .spawn();
+        }
         _ => {
             if let Some(choice) = style::Choice::from_command(cmd) {
                 choice.apply(&mut app.styles);
@@ -4260,11 +4290,6 @@ mod autohide_tests {
     fn edge_activation_stays_on_its_monitor_and_scales_with_dpi() {
         assert!(cursor_at_edge(
             POINT { x: 100, y: 1078 },
-        appmenu::CMD_TRANSPARENCY_SETTINGS => {
-            let _ = std::process::Command::new("explorer.exe")
-                .arg("ms-settings:easeofaccess-visualeffects")
-                .spawn();
-        }
             0,
             1920,
             1080,

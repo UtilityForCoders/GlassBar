@@ -107,7 +107,7 @@ impl Appearance {
         }
     }
     /// Necesita que Windows desenfoque lo que hay detrás.
-    fn backdrop(self) -> bool {
+    pub fn backdrop(self) -> bool {
         matches!(self, Appearance::Blur | Appearance::Acrylic)
     }
 }
@@ -443,8 +443,21 @@ pub struct Backdrop {
     hwnd: HWND,
     /// Ventana recortada por composición; `None` si se usa el desenfoque clásico.
     composition: Option<Composition>,
-    /// Apariencia y tamaño aplicados, para no repetir el trabajo en cada fotograma.
-    applied: std::cell::Cell<Option<(Appearance, i32, i32)>>,
+    /// Estado aplicado. Los repintados de iconos no cambian el fondo.
+    applied: std::cell::Cell<Option<BackdropState>>,
+}
+
+#[derive(Clone, Copy, PartialEq)]
+struct BackdropState {
+    appearance: Appearance,
+    rect: RECT,
+    radius: i32,
+}
+
+impl BackdropState {
+    fn size(self) -> (i32, i32) {
+        (self.rect.right - self.rect.left, self.rect.bottom - self.rect.top)
+    }
 }
 
 /// Lo que la composición necesita mantener vivo, y lo que se cambia después.
@@ -502,65 +515,117 @@ impl Backdrop {
         }
     }
 
-    /// Pone el desenfoque de `appearance` bajo la ventana `dock`, en `rect` (en
-    /// pantalla) con esquinas de radio `radius`; lo quita si no lo necesita.
-    pub fn update(&self, dock: HWND, appearance: Appearance, rect: RECT, radius: i32) {
-        use windows::Win32::UI::WindowsAndMessaging::{
-            SetWindowPos, ShowWindow, SWP_NOACTIVATE, SWP_SHOWWINDOW, SW_HIDE,
-        };
-        if !appearance.backdrop() {
-            if self.applied.take().is_some() {
-                unsafe {
-                    let _ = ShowWindow(self.hwnd, SW_HIDE);
-                }
+    pub fn hide(&self) {
+        if self.applied.take().is_some() {
+            unsafe {
+                let _ = windows::Win32::UI::WindowsAndMessaging::ShowWindow(
+                    self.hwnd,
+                    windows::Win32::UI::WindowsAndMessaging::SW_HIDE,
+                );
             }
+        }
+    }
+
+    /// Desplaza el dock y el fondo ya compuesto en una sola operación de Win32.
+    pub fn move_with_dock(&self, dock: HWND, pos: windows::Win32::Foundation::POINT, dy: i32) -> bool {
+        use windows::Win32::UI::WindowsAndMessaging::{
+            BeginDeferWindowPos, DeferWindowPos, EndDeferWindowPos, SWP_NOACTIVATE, SWP_NOSIZE,
+            SWP_NOZORDER,
+        };
+
+        let Some(mut state) = self.applied.get() else {
+            return false;
+        };
+        state.rect.top += dy;
+        state.rect.bottom += dy;
+        let flags = SWP_NOACTIVATE | SWP_NOSIZE | SWP_NOZORDER;
+        let moved = unsafe {
+            BeginDeferWindowPos(2)
+                .and_then(|batch| DeferWindowPos(batch, dock, None, pos.x, pos.y, 0, 0, flags))
+                .and_then(|batch| {
+                    DeferWindowPos(batch, self.hwnd, None, state.rect.left, state.rect.top, 0, 0, flags)
+                })
+                .and_then(|batch| EndDeferWindowPos(batch))
+                .is_ok()
+        };
+        if moved {
+            self.applied.set(Some(state));
+        }
+        moved
+    }
+
+    /// Alinea el fondo con el dock. Solo reordena las ventanas al mostrar el
+    /// fondo o cuando se ha elevado el dock explícitamente.
+    pub fn update(&self, dock: HWND, appearance: Appearance, rect: RECT, radius: i32, raise: bool) {
+        use windows::Win32::Graphics::Gdi::{DeleteObject, HGDIOBJ};
+        use windows::Win32::UI::WindowsAndMessaging::{
+            SetWindowPos, GW_HWNDPREV, SWP_NOACTIVATE, SWP_NOSIZE, SWP_NOZORDER, SWP_SHOWWINDOW,
+        };
+
+        let next = BackdropState {
+            appearance,
+            rect,
+            radius,
+        };
+        let applied = self.applied.get();
+        let raise = raise && unsafe { GetWindow(self.hwnd, GW_HWNDPREV) }.ok() != Some(dock);
+        if applied == Some(next) && !raise {
             return;
         }
-        let (width, height) = (rect.right - rect.left, rect.bottom - rect.top);
-        let applied = self.applied.get();
+        let (width, height) = next.size();
+        let appearance_changed = applied.is_none_or(|state| state.appearance != appearance);
+        let shape_changed =
+            applied.is_none_or(|state| state.size() != (width, height) || state.radius != radius);
         let acrylic = appearance == Appearance::Acrylic;
+
         unsafe {
             match &self.composition {
                 Some(composition) => {
-                    if applied.map(|(a, _, _)| a) != Some(appearance) {
+                    if appearance_changed {
                         let _ = composition.tint.SetIsVisible(acrylic);
                     }
-                    if applied.map(|(_, w, h)| (w, h)) != Some((width, height)) {
-                        let vector = |x: f32, y: f32| windows_numerics::Vector2 { X: x, Y: y };
-                        let _ = composition
-                            .shape
-                            .SetSize(vector(width as f32, height as f32));
-                        let _ = composition
-                            .shape
-                            .SetCornerRadius(vector(radius as f32, radius as f32));
+                    if shape_changed {
+                        let vector = |x: i32, y: i32| windows_numerics::Vector2 {
+                            X: x as f32,
+                            Y: y as f32,
+                        };
+                        let _ = composition.shape.SetSize(vector(width, height));
+                        let _ = composition.shape.SetCornerRadius(vector(radius, radius));
                     }
                 }
                 None => {
-                    if applied.map(|(a, _, _)| a) != Some(appearance) {
+                    if appearance_changed {
                         // ACCENT_ENABLE_ACRYLICBLURBEHIND y ACCENT_ENABLE_BLURBEHIND.
                         set_accent(self.hwnd, if acrylic { 4 } else { 3 }, ACRYLIC_TINT);
                     }
-                    if applied.map(|(_, w, h)| (w, h)) != Some((width, height)) {
+                    if shape_changed {
                         let region =
                             CreateRoundRectRgn(0, 0, width + 1, height + 1, radius * 2, radius * 2);
-                        // Windows se queda con la región.
-                        let _ = SetWindowRgn(self.hwnd, Some(region), true);
+                        if !region.is_invalid() && SetWindowRgn(self.hwnd, Some(region), true) == 0 {
+                            // Windows solo toma posesión de la región si la operación tiene éxito.
+                            let _ = DeleteObject(HGDIOBJ(region.0));
+                        }
                     }
                 }
             }
-            // Justo debajo del dock, aunque otra ventana "siempre encima" se haya
-            // puesto entre medias.
-            let _ = SetWindowPos(
-                self.hwnd,
-                Some(dock),
-                rect.left,
-                rect.top,
-                width,
-                height,
-                SWP_NOACTIVATE | SWP_SHOWWINDOW,
-            );
+            let mut flags = SWP_NOACTIVATE;
+            if applied.is_some_and(|state| state.size() == (width, height)) {
+                flags |= SWP_NOSIZE;
+            }
+            if applied.is_none() {
+                flags |= SWP_SHOWWINDOW;
+            } else if !raise {
+                flags |= SWP_NOZORDER;
+            }
+            if applied.is_none_or(|state| state.rect != rect) || raise {
+                if SetWindowPos(self.hwnd, Some(dock), rect.left, rect.top, width, height, flags)
+                    .is_err()
+                {
+                    return;
+                }
+            }
         }
-        self.applied.set(Some((appearance, width, height)));
+        self.applied.set(Some(next));
     }
 }
 
@@ -770,6 +835,7 @@ mod tests {
     fn settings_survive_a_round_trip_and_short_files() {
         let mut styles = Styles::default();
         styles.set_appearance(State::TaskView, Appearance::Blur);
+        styles.blur_tint = BlurTint::Dark;
         let json = serde_json::to_vec(&styles).unwrap();
         let back: Styles = serde_json::from_slice(&json).unwrap();
         assert_eq!(back, styles);
@@ -777,6 +843,7 @@ mod tests {
         let short: Styles = serde_json::from_str(r#"{"looks":[]}"#).unwrap();
         assert_eq!(short.look(State::Maximized), Look::default());
         assert!(short.look(State::Desktop).enabled);
+        assert_eq!(short.blur_tint, BlurTint::Medium);
     }
 
     #[test]
@@ -787,6 +854,10 @@ mod tests {
             for appearance in Appearance::ALL {
                 let set = Choice::Set(state, appearance);
                 assert_eq!(Choice::from_command(set.command()), Some(set));
+            }
+            for tint in BlurTint::ALL {
+                let choice = Choice::BlurTint(state, tint);
+                assert_eq!(Choice::from_command(choice.command()), Some(choice));
             }
         }
         // Las demás órdenes del menú de GlassBar no son de estilos.
@@ -809,9 +880,3 @@ mod tests {
         assert!(!is_search("explorer.exe"));
     }
 }
-        styles.blur_tint = BlurTint::Dark;
-        assert_eq!(short.blur_tint, BlurTint::Medium);
-            for tint in BlurTint::ALL {
-                let choice = Choice::BlurTint(state, tint);
-                assert_eq!(Choice::from_command(choice.command()), Some(choice));
-            }
