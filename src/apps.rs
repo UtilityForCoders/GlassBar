@@ -539,11 +539,13 @@ pub fn draw_windows_start_icon(pixmap: &mut Pixmap, cx: f32, cy: f32, size: f32,
     let x1 = x0 + tile_w + gap;
     let y1 = y0 + tile_w + gap;
 
-    let white = [255, 255, 255, 235];
-    fill_rounded(pixmap, white, x0, y0, tile_w, tile_w, r);
-    fill_rounded(pixmap, white, x1, y0, tile_w, tile_w, r);
-    fill_rounded(pixmap, white, x0, y1, tile_w, tile_w, r);
-    fill_rounded(pixmap, white, x1, y1, tile_w, tile_w, r);
+    // El logo de Windows 11 en azul: un solo degradado de cian claro (arriba a la
+    // izquierda) a azul (abajo a la derecha) que atraviesa los cuatro cuadros.
+    let stops = [(0.0, [112, 224, 255, 255]), (1.0, [0, 120, 240, 255])];
+    let (from, to) = ((x0, y0), (x0 + s, y0 + s));
+    for (tx, ty) in [(x0, y0), (x1, y0), (x0, y1), (x1, y1)] {
+        fill_rounded_gradient(pixmap, &stops, from, to, tx, ty, tile_w, tile_w, r);
+    }
 }
 
 /// `base` es el tamaño en reposo; `size` incluye la animación de hover o pulsación.
@@ -666,6 +668,51 @@ pub fn fill_rounded(
         ..Default::default()
     };
     paint.set_color_rgba8(r, g, b, a);
+    if let Some(path) = rounded_rect(x, y, w, h, rad) {
+        pixmap.fill_path(
+            &path,
+            &paint,
+            FillRule::Winding,
+            Transform::identity(),
+            None,
+        );
+    }
+}
+
+/// Como `fill_rounded`, con un degradado lineal de `from` (en `start`) a `to` (en
+/// `end`), con paradas intermedias opcionales en `stops`: `(posición 0..1, color)`.
+#[allow(clippy::too_many_arguments)]
+pub fn fill_rounded_gradient(
+    pixmap: &mut Pixmap,
+    stops: &[(f32, [u8; 4])],
+    start: (f32, f32),
+    end: (f32, f32),
+    x: f32,
+    y: f32,
+    w: f32,
+    h: f32,
+    rad: f32,
+) {
+    let stops = stops
+        .iter()
+        .map(|&(at, [r, g, b, a])| {
+            tiny_skia::GradientStop::new(at, tiny_skia::Color::from_rgba8(r, g, b, a))
+        })
+        .collect();
+    let Some(shader) = tiny_skia::LinearGradient::new(
+        tiny_skia::Point::from_xy(start.0, start.1),
+        tiny_skia::Point::from_xy(end.0, end.1),
+        stops,
+        tiny_skia::SpreadMode::Pad,
+        Transform::identity(),
+    ) else {
+        return;
+    };
+    let paint = Paint {
+        anti_alias: true,
+        shader,
+        ..Default::default()
+    };
     if let Some(path) = rounded_rect(x, y, w, h, rad) {
         pixmap.fill_path(
             &path,

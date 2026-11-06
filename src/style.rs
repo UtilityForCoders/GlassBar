@@ -83,16 +83,23 @@ impl Appearance {
             Appearance::Acrylic => "Acrílico",
         }
     }
-    /// Relleno y borde del dock. Nunca del todo transparente: con alfa 0 los clics
-    /// atravesarían la ventana.
-    pub fn colors(self) -> ([u8; 4], [u8; 4]) {
+    /// Relleno y borde del dock. El relleno es un degradado horizontal de cristal
+    /// gris: más claro en los extremos y más oscuro en el centro, todo con la misma
+    /// opacidad. Nunca del todo transparente: con alfa 0 los clics atravesarían la
+    /// ventana.
+    pub fn colors(self) -> ([[u8; 4]; 3], [u8; 4]) {
+        const RIM: [u8; 4] = [255, 255, 255, 60];
+        let glass = |a: u8| [[58, 60, 66, a], [30, 32, 37, a], [52, 54, 60, a]];
         match self {
-            Appearance::Normal => ([23, 28, 36, 130], [255, 255, 255, 32]),
-            Appearance::Opaque => ([32, 32, 32, 255], [255, 255, 255, 24]),
-            Appearance::Clear => ([0, 0, 0, 1], [0, 0, 0, 0]),
+            Appearance::Normal => (glass(130), RIM),
+            Appearance::Opaque => (
+                [[46, 46, 50, 255], [32, 32, 35, 255], [42, 42, 46, 255]],
+                [255, 255, 255, 36],
+            ),
+            Appearance::Clear => ([[0, 0, 0, 1]; 3], [0, 0, 0, 0]),
             // El desenfoque lo pone Windows debajo; encima, un velo para el contraste.
-            Appearance::Blur => ([23, 28, 36, 70], [255, 255, 255, 32]),
-            Appearance::Acrylic => ([0, 0, 0, 1], [255, 255, 255, 32]),
+            Appearance::Blur => (glass(70), RIM),
+            Appearance::Acrylic => ([[0, 0, 0, 1]; 3], RIM),
         }
     }
     /// Necesita que Windows desenfoque lo que hay detrás.
@@ -602,8 +609,8 @@ unsafe extern "system" fn backdrop_wndproc(
     DefWindowProcW(hwnd, msg, wparam, lparam)
 }
 
-/// Tinte del acrílico (AABBGGRR): el gris oscuro del dock.
-const ACRYLIC_TINT: u32 = 0xB0_24_1c_17;
+/// Tinte del acrílico (AABBGGRR): el gris oscuro del cristal del dock.
+const ACRYLIC_TINT: u32 = 0xB0_25_20_1e;
 
 /// `SetWindowCompositionAttribute`, sin documentar pero estable desde Windows 10:
 /// es lo que usan la barra de Windows y TranslucentTB. `color` es AABBGGRR.
