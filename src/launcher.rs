@@ -130,7 +130,7 @@ struct Context {
 }
 
 /// Opciones del menú de `entry`, como el clic derecho del Inicio de Windows 11.
-fn context_entries(entry: &AppEntry, pinned: bool) -> Vec<crate::appmenu::Entry> {
+fn context_entries(entry: &AppEntry, pinned: bool, admin: bool) -> Vec<crate::appmenu::Entry> {
     use crate::appmenu::{Entry, Icon, GLYPH_PIN, GLYPH_UNPIN};
     let item = |glyph: char, label: &str, command: u32| Entry::Item {
         icon: Icon::Glyph(glyph),
@@ -138,7 +138,7 @@ fn context_entries(entry: &AppEntry, pinned: bool) -> Vec<crate::appmenu::Entry>
         command,
     };
     let mut entries = vec![item(GLYPH_OPEN, "Abrir", CMD_OPEN)];
-    if !packaged(&entry.command) {
+    if admin {
         entries.push(item(GLYPH_ADMIN, "Ejecutar como administrador", CMD_ADMIN));
     }
     if file_path(&entry.command) {
@@ -158,10 +158,16 @@ fn context_entries(entry: &AppEntry, pinned: bool) -> Vec<crate::appmenu::Entry>
     entries
 }
 
-/// App empaquetada (Store): su ruta de AppsFolder lleva "familia!app". Windows no
-/// ofrece ejecutarlas como administrador.
-fn packaged(command: &str) -> bool {
-    command
+/// Windows ofrece ejecutar la app como administrador (ver `apps::can_run_as_admin`).
+#[cfg(not(test))]
+fn admin_allowed(command: &str) -> bool {
+    crate::apps::can_run_as_admin(command)
+}
+/// En los tests no se consulta el Shell: solo las apps de la Store ("familia!app")
+/// quedan sin la opción.
+#[cfg(test)]
+fn admin_allowed(command: &str) -> bool {
+    !command
         .strip_prefix("shell:AppsFolder\\")
         .is_some_and(|id| id.contains('!'))
 }
@@ -270,6 +276,8 @@ pub struct LauncherState {
     detail_icons: HashMap<String, Option<Pixmap>>,
     /// Jump list de cada app mostrada en el detalle; se vuelve a leer en cada apertura.
     jumps: HashMap<String, Vec<crate::jumplist::Section>>,
+    /// Si cada app admite "Ejecutar como administrador", por orden de la app.
+    admin: HashMap<String, bool>,
 }
 impl LauncherState {
     pub fn new(pinned: &[AppEntry]) -> Self {
@@ -295,6 +303,7 @@ impl LauncherState {
             search_cache: RefCell::new(None),
             detail_icons: HashMap::new(),
             jumps: HashMap::new(),
+            admin: HashMap::new(),
         };
         state.refresh(pinned);
         state
@@ -687,7 +696,13 @@ impl LauncherState {
         let Some(entry) = entry.cloned() else {
             return false;
         };
-        let menu = crate::appmenu::AppMenu::new(context_entries(&entry, self.is_pinned(&entry)));
+        // Preguntarlo al Shell tarda; se recuerda por app mientras GlassBar siga abierto.
+        let admin = *self
+            .admin
+            .entry(entry.command.clone())
+            .or_insert_with(|| admin_allowed(&entry.command));
+        let menu =
+            crate::appmenu::AppMenu::new(context_entries(&entry, self.is_pinned(&entry), admin));
         let (w, h) = menu.size();
         let x = x.min(WIDTH - 8.0 - w).max(8.0);
         // Debajo del cursor si cabe; si no, encima, como los menús de Windows.
@@ -1920,6 +1935,7 @@ mod tests {
             search_cache: RefCell::new(None),
             detail_icons: HashMap::new(),
             jumps: HashMap::new(),
+            admin: HashMap::new(),
         }
     }
     fn many(prefix: &str, count: usize) -> Vec<AppEntry> {
