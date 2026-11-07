@@ -4,7 +4,7 @@
 //! está solo el contenido y su dibujo; la ventana que lo muestra está en `main`.
 use crate::apps::{fill_rounded, stroke_rounded};
 use crate::clock::{draw_icon, draw_text, fit_text, text_width};
-use crate::style::{Appearance, Choice, State, Styles};
+use crate::style::{Appearance, Choice, Shape, State, Styles};
 use tiny_skia::{Pixmap, PixmapPaint, Transform};
 
 /// Opciones fijas del menú de una app.
@@ -27,6 +27,7 @@ const GLYPH_CHEVRON: char = '\u{E76C}';
 const GLYPH_EXIT: char = '\u{E7E8}';
 const GLYPH_DOWNLOAD: char = '\u{E896}';
 const GLYPH_REFRESH: char = '\u{E72C}';
+const GLYPH_OPACITY: char = '\u{E790}';
 
 /// Lado de los iconos, en unidades lógicas (los iconos pequeños de Windows).
 pub const ICON: f32 = 16.0;
@@ -36,6 +37,11 @@ const PAD: f32 = 4.0;
 const ITEM_H: f32 = 32.0;
 const HEADER_H: f32 = 28.0;
 const SEPARATOR_H: f32 = 9.0;
+/// Fila con barra: el texto arriba y la barra debajo.
+const SLIDER_H: f32 = 52.0;
+/// Centro vertical de la barra dentro de su fila, y margen derecho de la barra.
+const TRACK_Y: f32 = 38.0;
+const TRACK_RIGHT: f32 = 16.0;
 const TEXT: f32 = 13.0;
 const HEADER_TEXT: f32 = 12.0;
 /// Margen del texto y del icono dentro de cada fila.
@@ -79,6 +85,13 @@ pub enum Entry {
         menu: Box<AppMenu>,
     },
     Separator,
+    /// Barra para elegir un valor de 0 a 1 arrastrando o con las flechas.
+    Slider {
+        icon: Icon,
+        label: String,
+        value: f32,
+        command: u32,
+    },
 }
 
 #[derive(Default)]
@@ -98,6 +111,7 @@ impl AppMenu {
                 Entry::Item { label, .. } => text_width(label, TEXT) + TEXT_X + 16.0,
                 Entry::Submenu { label, .. } => text_width(label, TEXT) + TEXT_X + CHEVRON_W,
                 Entry::Header(title) => text_width(title, HEADER_TEXT) + ICON_X * 2.0,
+                Entry::Slider { label, .. } => text_width(label, TEXT) + TEXT_X + 56.0,
                 Entry::Separator => 0.0,
             })
             .fold(0.0, f32::max);
@@ -114,6 +128,7 @@ impl AppMenu {
             Entry::Header(_) => HEADER_H,
             Entry::Item { .. } | Entry::Submenu { .. } => ITEM_H,
             Entry::Separator => SEPARATOR_H,
+            Entry::Slider { .. } => SLIDER_H,
         }
     }
 
@@ -145,11 +160,42 @@ impl AppMenu {
         self.tops()
             .into_iter()
             .zip(&self.entries)
-            .position(|(top, entry)| Self::selectable(entry) && y >= top && y < top + ITEM_H)
+            .position(|(top, entry)| {
+                Self::selectable(entry) && y >= top && y < top + Self::height_of(entry)
+            })
     }
 
     fn selectable(entry: &Entry) -> bool {
-        matches!(entry, Entry::Item { .. } | Entry::Submenu { .. })
+        matches!(
+            entry,
+            Entry::Item { .. } | Entry::Submenu { .. } | Entry::Slider { .. }
+        )
+    }
+
+    /// Orden y valor de la barra `index`, si es una barra.
+    pub fn slider(&self, index: usize) -> Option<(u32, f32)> {
+        match self.entries.get(index)? {
+            Entry::Slider { command, value, .. } => Some((*command, *value)),
+            _ => None,
+        }
+    }
+
+    /// Pone la barra `index` en `value` (de 0 a 1).
+    pub fn set_slider(&mut self, index: usize, value: f32) {
+        if let Some(Entry::Slider { value: current, .. }) = self.entries.get_mut(index) {
+            *current = value.clamp(0.0, 1.0);
+        }
+    }
+
+    /// Extremos de la barra, en unidades lógicas del menú.
+    fn track(&self) -> (f32, f32) {
+        (PAD + TEXT_X, self.width - PAD - TRACK_RIGHT)
+    }
+
+    /// Valor de la barra en la posición `x` del menú.
+    fn slider_value_at(&self, x: f32) -> f32 {
+        let (left, right) = self.track();
+        ((x - left) / (right - left).max(1.0)).clamp(0.0, 1.0)
     }
 
     /// Orden de la opción `index`, si es una opción.
@@ -202,7 +248,7 @@ impl AppMenu {
         // Panel oscuro como los menús de Windows 11.
         fill_rounded(
             image,
-            [44, 44, 44, 250],
+            crate::glass::panel_light(),
             s(ox + 0.5),
             s(oy + 0.5),
             s(w - 1.0),
@@ -246,6 +292,12 @@ impl AppMenu {
                     );
                     continue;
                 }
+                Entry::Slider {
+                    icon, label, value, ..
+                } => {
+                    self.draw_slider(image, scale, (ox, top), (icon, label, *value), index);
+                    continue;
+                }
                 Entry::Item { icon, label, .. } => (icon, label, false),
                 Entry::Submenu { icon, label, .. } => (icon, label, true),
             };
@@ -261,35 +313,7 @@ impl AppMenu {
                 );
             }
             let (icon_x, center_y) = (s(ox + PAD + ICON_X), s(top + ITEM_H / 2.0));
-            match icon {
-                Icon::Image(Some(picture)) => {
-                    let side = s(ICON).round();
-                    let factor = side / picture.width().max(1) as f32;
-                    image.draw_pixmap(
-                        0,
-                        0,
-                        picture.as_ref(),
-                        &PixmapPaint {
-                            quality: tiny_skia::FilterQuality::Bicubic,
-                            ..Default::default()
-                        },
-                        Transform::from_scale(factor, factor)
-                            .post_translate(icon_x.round(), (center_y - side / 2.0).round()),
-                        None,
-                    );
-                }
-                Icon::Image(None) => {}
-                Icon::Glyph(glyph) => {
-                    draw_icon(
-                        image,
-                        *glyph,
-                        icon_x + s(ICON / 2.0),
-                        center_y,
-                        s(14.0),
-                        0.9,
-                    );
-                }
-            }
+            draw_entry_icon(image, icon, icon_x, center_y, scale);
             let right = if submenu { CHEVRON_W } else { 12.0 };
             let label = fit_text(label, s(TEXT), s(w - PAD * 2.0 - TEXT_X - right));
             draw_text(
@@ -314,11 +338,141 @@ impl AppMenu {
     }
 }
 
+impl AppMenu {
+    /// Una fila con barra: icono y texto con el valor a la derecha, y debajo la
+    /// barra como las del panel rápido.
+    fn draw_slider(
+        &self,
+        image: &mut Pixmap,
+        scale: f32,
+        (ox, top): (f32, f32),
+        (icon, label, value): (&Icon, &str, f32),
+        index: usize,
+    ) {
+        let s = |v: f32| v * scale;
+        let w = self.width;
+        let active = self.hovered == Some(index);
+        if active {
+            fill_rounded(
+                image,
+                [255, 255, 255, 16],
+                s(ox + PAD),
+                s(top + 2.0),
+                s(w - PAD * 2.0),
+                s(SLIDER_H - 4.0),
+                s(4.0),
+            );
+        }
+        let center_y = s(top + ITEM_H / 2.0 - 2.0);
+        draw_entry_icon(image, icon, s(ox + PAD + ICON_X), center_y, scale);
+        let percent = format!("{}%", (value * 100.0).round() as u32);
+        let percent_w = text_width(&percent, s(TEXT));
+        let label = fit_text(
+            label,
+            s(TEXT),
+            s(w - PAD * 2.0 - TEXT_X - TRACK_RIGHT) - percent_w - s(8.0),
+        );
+        draw_text(
+            image,
+            &label,
+            s(ox + PAD + TEXT_X),
+            center_y - s(TEXT * 0.62),
+            s(TEXT),
+            0.95,
+        );
+        draw_text(
+            image,
+            &percent,
+            s(ox + w - PAD - TRACK_RIGHT) - percent_w,
+            center_y - s(TEXT * 0.62),
+            s(TEXT),
+            0.7,
+        );
+        let (left, right) = self.track();
+        let cy = top + TRACK_Y;
+        fill_rounded(
+            image,
+            [255, 255, 255, 60],
+            s(ox + left),
+            s(cy - 2.0),
+            s(right - left),
+            s(4.0),
+            s(2.0),
+        );
+        let color = crate::accent::current().light;
+        let thumb = left + (right - left) * value;
+        fill_rounded(
+            image,
+            color,
+            s(ox + left),
+            s(cy - 2.0),
+            s(thumb - left),
+            s(4.0),
+            s(2.0),
+        );
+        fill_rounded(
+            image,
+            [69, 69, 72, 255],
+            s(ox + thumb - 9.0),
+            s(cy - 9.0),
+            s(18.0),
+            s(18.0),
+            s(9.0),
+        );
+        let dot = if active { 6.0 } else { 5.0 };
+        fill_rounded(
+            image,
+            color,
+            s(ox + thumb - dot),
+            s(cy - dot),
+            s(dot * 2.0),
+            s(dot * 2.0),
+            s(dot),
+        );
+    }
+}
+
+/// El icono de una opción, a la izquierda de su fila y centrado en `center_y`.
+fn draw_entry_icon(image: &mut Pixmap, icon: &Icon, icon_x: f32, center_y: f32, scale: f32) {
+    let s = |v: f32| v * scale;
+    match icon {
+        Icon::Image(Some(picture)) => {
+            let side = s(ICON).round();
+            let factor = side / picture.width().max(1) as f32;
+            image.draw_pixmap(
+                0,
+                0,
+                picture.as_ref(),
+                &PixmapPaint {
+                    quality: tiny_skia::FilterQuality::Bicubic,
+                    ..Default::default()
+                },
+                Transform::from_scale(factor, factor)
+                    .post_translate(icon_x.round(), (center_y - side / 2.0).round()),
+                None,
+            );
+        }
+        Icon::Image(None) => {}
+        Icon::Glyph(glyph) => {
+            draw_icon(
+                image,
+                *glyph,
+                icon_x + s(ICON / 2.0),
+                center_y,
+                s(14.0),
+                0.9,
+            );
+        }
+    }
+}
+
 /// Opciones del menú de GlassBar.
 pub const CMD_AUTOSTART: u32 = 2;
 pub const CMD_EXIT: u32 = 3;
 pub const CMD_UPDATE: u32 = 4;
 pub const CMD_UPDATE_CHECK: u32 = 5;
+/// Barra de la opacidad de los paneles y menús.
+pub const CMD_MENU_OPACITY: u32 = 6;
 
 /// Estado de las actualizaciones que muestra el menú de GlassBar.
 #[derive(Default)]
@@ -364,6 +518,13 @@ pub fn glassbar(styles: &Styles, autostart: bool, updates: &Updates) -> AppMenu 
         });
     }
     entries.push(Entry::Separator);
+    entries.push(Entry::Slider {
+        icon: Icon::Glyph(GLYPH_OPACITY),
+        label: "Opacidad de los menús".into(),
+        value: styles.menu_opacity() as f32 / 100.0,
+        command: CMD_MENU_OPACITY,
+    });
+    entries.push(Entry::Separator);
     entries.push(Entry::Item {
         icon: Icon::check(autostart),
         label: "Iniciar con Windows".into(),
@@ -403,12 +564,14 @@ pub enum Hit {
 }
 
 /// Respuesta del menú a una tecla.
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+#[derive(Clone, Copy, Debug, PartialEq)]
 pub enum Key {
     /// Solo cambió el resaltado (o nada).
     Moved,
     Close,
     Choose(u32),
+    /// Se movió la barra con esa orden a ese valor.
+    Slide(u32, f32),
 }
 
 /// Un menú y, a su lado, el submenú de la opción abierta. Todo en una sola
@@ -551,6 +714,45 @@ impl Cascade {
         changed
     }
 
+    /// Opción resaltada del submenú abierto.
+    pub fn sub_hovered(&self) -> Option<usize> {
+        self.sub()?.hovered
+    }
+
+    /// El menú de `hit` y su esquina.
+    fn menu_of(&self, hit: Hit) -> Option<(&AppMenu, (f32, f32))> {
+        match hit {
+            Hit::Root(_) => Some((&self.root, self.root_origin())),
+            Hit::Sub(_) => Some((self.sub()?, self.sub_origin(self.open?)?)),
+        }
+    }
+
+    /// Barra bajo (`x`, `y`): dónde está y su orden.
+    pub fn slider_at(&self, x: f32, y: f32) -> Option<(Hit, u32)> {
+        let hit = self.hit_test(x, y)?;
+        let (menu, _) = self.menu_of(hit)?;
+        let (Hit::Root(index) | Hit::Sub(index)) = hit;
+        menu.slider(index).map(|(command, _)| (hit, command))
+    }
+
+    /// Lleva la barra `hit` al cursor en `x` (sirve fuera de su fila, arrastrando)
+    /// y devuelve su orden y su nuevo valor.
+    pub fn slide(&mut self, hit: Hit, x: f32) -> Option<(u32, f32)> {
+        let (menu, (ox, _)) = self.menu_of(hit)?;
+        let value = menu.slider_value_at(x - ox);
+        self.set_slider(hit, value)
+    }
+
+    /// Pone la barra `hit` en `value` y devuelve su orden y su valor.
+    pub fn set_slider(&mut self, hit: Hit, value: f32) -> Option<(u32, f32)> {
+        let (menu, index) = match hit {
+            Hit::Root(index) => (&mut self.root, index),
+            Hit::Sub(index) => (self.sub_mut()?, index),
+        };
+        menu.set_slider(index, value);
+        menu.slider(index)
+    }
+
     /// Clic en (`x`, `y`): la orden de la opción, o abre su submenú.
     pub fn click(&mut self, x: f32, y: f32) -> Option<u32> {
         match self.hit_test(x, y)? {
@@ -570,6 +772,26 @@ impl Cascade {
         const UP: usize = 0x26;
         const RIGHT: usize = 0x27;
         const DOWN: usize = 0x28;
+        // Con una barra resaltada, las flechas laterales la mueven de 5 en 5.
+        if key == LEFT || key == RIGHT {
+            let hit = if self.in_sub {
+                self.sub().and_then(|sub| sub.hovered).map(Hit::Sub)
+            } else {
+                self.root.hovered.map(Hit::Root)
+            };
+            let current = hit.and_then(|hit| {
+                let (menu, _) = self.menu_of(hit)?;
+                let (Hit::Root(index) | Hit::Sub(index)) = hit;
+                menu.slider(index).map(|(_, value)| (hit, value))
+            });
+            if let Some((hit, value)) = current {
+                let step = if key == RIGHT { 0.05 } else { -0.05 };
+                let value = ((value + step) * 20.0).round() / 20.0;
+                return self
+                    .set_slider(hit, value)
+                    .map_or(Key::Moved, |(command, value)| Key::Slide(command, value));
+            }
+        }
         match key {
             UP | DOWN if self.in_sub => {
                 if let Some(sub) = self.sub_mut() {
@@ -612,6 +834,25 @@ impl Cascade {
             _ => {}
         }
         Key::Moved
+    }
+
+    /// Paneles que se ven (el principal y el submenú abierto), en píxeles, para el
+    /// desenfoque de debajo: los mismos rectángulos que pinta `draw_at`.
+    pub fn shapes(&self, scale: f32) -> Vec<Shape> {
+        let panel = |(ox, oy): (f32, f32), (w, h): (f32, f32)| Shape {
+            x: (ox + 0.5) * scale,
+            y: (oy + 0.5) * scale,
+            width: (w - 1.0) * scale,
+            height: (h - 1.0) * scale,
+            radius: RADIUS * scale,
+        };
+        let mut shapes = vec![panel(self.root_origin(), self.root.size())];
+        if let (Some(open), Some(sub)) = (self.open, self.sub()) {
+            if let Some(origin) = self.sub_origin(open) {
+                shapes.push(panel(origin, sub.size()));
+            }
+        }
+        shapes
     }
 
     pub fn draw(&self, image: &mut Pixmap, scale: f32) {
@@ -792,5 +1033,59 @@ mod tests {
         menu.key(0x28);
         assert_eq!(menu.key(0x0D), Key::Choose(3));
         assert_eq!(menu.key(0x1B), Key::Close);
+    }
+}
+
+#[cfg(test)]
+mod slider_tests {
+    use super::*;
+
+    fn with_slider() -> Cascade {
+        Cascade::new(
+            AppMenu::new(vec![
+                Entry::Item {
+                    icon: Icon::Image(None),
+                    label: "Antes".into(),
+                    command: 1,
+                },
+                Entry::Slider {
+                    icon: Icon::Image(None),
+                    label: "Opacidad de los menús".into(),
+                    value: 0.5,
+                    command: CMD_MENU_OPACITY,
+                },
+            ]),
+            false,
+        )
+    }
+
+    #[test]
+    fn the_slider_row_is_taller_and_follows_the_cursor() {
+        let mut menu = with_slider();
+        let (w, h) = menu.size();
+        assert_eq!(h, PAD * 2.0 + ITEM_H + SLIDER_H);
+        // Toda la fila, también su parte baja (la barra), es la barra.
+        let y = PAD + ITEM_H + SLIDER_H - 4.0;
+        let (hit, command) = menu.slider_at(w / 2.0, y).unwrap();
+        assert_eq!((hit, command), (Hit::Root(1), CMD_MENU_OPACITY));
+        assert_eq!(menu.slider_at(w / 2.0, PAD + ITEM_H / 2.0), None);
+        // Arrastrando, fuera de la ventana se queda en los extremos.
+        assert_eq!(menu.slide(hit, -50.0), Some((CMD_MENU_OPACITY, 0.0)));
+        assert_eq!(menu.slide(hit, w + 50.0), Some((CMD_MENU_OPACITY, 1.0)));
+        let (left, right) = menu.root.track();
+        let (_, middle) = menu.slide(hit, (left + right) / 2.0).unwrap();
+        assert!((middle - 0.5).abs() < 1e-4);
+        // Un clic en la barra no es una orden que cierre el menú.
+        assert_eq!(menu.click(w / 2.0, y), None);
+    }
+
+    #[test]
+    fn side_arrows_move_the_highlighted_slider() {
+        let mut menu = with_slider();
+        menu.key(0x28);
+        menu.key(0x28);
+        assert_eq!(menu.root.hovered, Some(1));
+        assert_eq!(menu.key(0x27), Key::Slide(CMD_MENU_OPACITY, 0.55));
+        assert_eq!(menu.key(0x25), Key::Slide(CMD_MENU_OPACITY, 0.5));
     }
 }

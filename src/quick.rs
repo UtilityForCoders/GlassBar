@@ -35,7 +35,9 @@ const SLIDER_W: f32 = WIDTH - PAD - 76.0 - SLIDER_X;
 const AUDIO_BUTTON: f32 = 28.0;
 const FOOTER_Y: f32 = 196.0;
 const MORE_W: f32 = 112.0;
-const BACKGROUND: [u8; 4] = [32, 32, 34, 246];
+fn background() -> [u8; 4] {
+    crate::glass::panel()
+}
 // Los controles activos usan el color de énfasis de Windows (`crate::accent`).
 /// Zona de la flecha "›" a la derecha de los botones de Wi-Fi y Bluetooth.
 const ARROW_W: f32 = 36.0;
@@ -612,7 +614,7 @@ impl QuickState {
     fn draw_chrome(&self, image: &mut Pixmap, footer_y: f32, scale: f32) {
         image.fill(tiny_skia::Color::TRANSPARENT);
         let (w, h) = ((WIDTH - 2.0) * scale, (self.height() - 2.0) * scale);
-        fill_rounded(image, BACKGROUND, scale, scale, w, h, 12.0 * scale);
+        fill_rounded(image, background(), scale, scale, w, h, 12.0 * scale);
         // El pie, algo más oscuro y separado por una línea, como en Windows: el mismo
         // contorno redondeado del panel, recortado desde la línea hacia abajo.
         if let Some(mut footer) = Pixmap::new(image.width(), image.height()) {

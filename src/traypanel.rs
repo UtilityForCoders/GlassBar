@@ -146,7 +146,15 @@ impl TrayPanel {
         image.fill(tiny_skia::Color::TRANSPARENT);
         let (w, h) = self.size();
         let (w, h) = ((w - 2.0) * scale, (h - 2.0) * scale);
-        fill_rounded(image, [32, 32, 34, 246], scale, scale, w, h, 10.0 * scale);
+        fill_rounded(
+            image,
+            crate::glass::panel(),
+            scale,
+            scale,
+            w,
+            h,
+            10.0 * scale,
+        );
         stroke_rounded(
             image,
             [255, 255, 255, 34],

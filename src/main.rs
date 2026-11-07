@@ -203,6 +203,8 @@ impl Drop for Surface {
 /// Globo con el nombre del programa bajo el cursor; no recibe clics ni foco.
 struct Tooltip {
     hwnd: HWND,
+    /// Desenfoque de debajo, como el del dock.
+    backdrop: Option<style::Backdrop>,
     surface: Option<Surface>,
     visible: bool,
 }
@@ -230,6 +232,7 @@ impl Tooltip {
         };
         Ok(Self {
             hwnd,
+            backdrop: style::Backdrop::new(),
             surface: None,
             visible: false,
         })
@@ -247,7 +250,7 @@ impl Tooltip {
         surface.pixmap.fill(tiny_skia::Color::TRANSPARENT);
         apps::fill_rounded(
             &mut surface.pixmap,
-            [32, 32, 32, 235],
+            glass::panel(),
             0.5,
             0.5,
             w - 1.0,
@@ -314,6 +317,10 @@ impl Tooltip {
                 SWP_NOMOVE | SWP_NOSIZE | SWP_NOACTIVATE,
             );
         }
+        if let Some(backdrop) = &self.backdrop {
+            let shape = style::Shape::inset(width, height, 0.5, 7.0 * scale);
+            backdrop.under(self.hwnd, surface_rect(pos, &surface), &[shape], 1.0);
+        }
         self.surface = Some(surface);
         self.visible = true;
     }
@@ -322,6 +329,9 @@ impl Tooltip {
             unsafe {
                 let _ = ShowWindow(self.hwnd, SW_HIDE);
             }
+            if let Some(backdrop) = &self.backdrop {
+                backdrop.hide();
+            }
             self.visible = false;
         }
     }
@@ -329,6 +339,8 @@ impl Tooltip {
 
 struct LauncherWindow {
     hwnd: HWND,
+    /// Desenfoque de debajo, como el del dock.
+    backdrop: Option<style::Backdrop>,
     surface: Surface,
     pos: POINT,
     scale: f32,
@@ -380,6 +392,7 @@ impl LauncherWindow {
         ));
         Ok(Self {
             hwnd,
+            backdrop: style::Backdrop::new(),
             surface,
             pos,
             scale,
@@ -412,6 +425,8 @@ impl LauncherWindow {
             &self.transition,
             self.visible,
             animating,
+            self.backdrop.as_ref(),
+            &[panel_shape(&self.surface, self.scale, 12.0)],
         );
     }
     fn show(&mut self) {
@@ -441,6 +456,7 @@ impl Drop for LauncherWindow {
 /// Pone en pantalla un panel emergente (lanzador o panel rápido) ya dibujado, con la
 /// opacidad y la posición de su transición. Mientras algo se mueve, un temporizador
 /// pide el siguiente fotograma; al terminar de cerrarse, oculta la ventana.
+#[allow(clippy::too_many_arguments)]
 fn present_popup(
     hwnd: HWND,
     surface: &Surface,
@@ -449,6 +465,8 @@ fn present_popup(
     transition: &launcher::Transition,
     visible: bool,
     animating: bool,
+    backdrop: Option<&style::Backdrop>,
+    shapes: &[style::Shape],
 ) {
     let now = Instant::now();
     let shown = transition.shown(now);
@@ -461,6 +479,9 @@ fn present_popup(
         }
         if !visible && !running {
             let _ = ShowWindow(hwnd, SW_HIDE);
+            if let Some(backdrop) = backdrop {
+                backdrop.hide();
+            }
             return;
         }
     }
@@ -468,6 +489,9 @@ fn present_popup(
         x: pos.x,
         y: pos.y + (transition.offset(now) * scale).round() as i32,
     };
+    if let Some(backdrop) = backdrop {
+        backdrop.under(hwnd, surface_rect(pos, surface), shapes, shown);
+    }
     let blend = BLENDFUNCTION {
         BlendOp: AC_SRC_OVER as u8,
         SourceConstantAlpha: (shown * 255.0).round() as u8,
@@ -490,6 +514,22 @@ fn present_popup(
             ULW_ALPHA,
         );
     }
+}
+
+/// Rectángulo en pantalla de una superficie con su esquina en `pos`.
+fn surface_rect(pos: POINT, surface: &Surface) -> windows::Win32::Foundation::RECT {
+    windows::Win32::Foundation::RECT {
+        left: pos.x,
+        top: pos.y,
+        right: pos.x + surface.width as i32,
+        bottom: pos.y + surface.height as i32,
+    }
+}
+
+/// El panel de una superficie, dibujado a `scale` de cada borde y con esquinas de
+/// `radius` (las dos en unidades lógicas), para el desenfoque de debajo.
+fn panel_shape(surface: &Surface, scale: f32, radius: f32) -> style::Shape {
+    style::Shape::inset(surface.width, surface.height, scale, radius * scale)
 }
 
 /// Muestra un panel emergente y le da el foco, para que se cierre al hacer clic fuera.
@@ -518,6 +558,8 @@ fn take_focus(hwnd: HWND) {
 /// Panel rápido (Wi-Fi, Bluetooth, brillo y volumen) sobre los iconos de estado.
 struct QuickWindow {
     hwnd: HWND,
+    /// Desenfoque de debajo, como el del dock.
+    backdrop: Option<style::Backdrop>,
     surface: Surface,
     pos: POINT,
     scale: f32,
@@ -551,6 +593,7 @@ impl QuickWindow {
         };
         Ok(Self {
             hwnd,
+            backdrop: style::Backdrop::new(),
             surface,
             pos: POINT::default(),
             scale,
@@ -587,6 +630,8 @@ impl QuickWindow {
             &self.transition,
             self.visible,
             false,
+            self.backdrop.as_ref(),
+            &[panel_shape(&self.surface, self.scale, 12.0)],
         );
     }
     /// Cambia entre la vista principal y la de redes. La de redes es más alta: el
@@ -1437,6 +1482,7 @@ impl App {
         bar.keyboard = keyboard::current();
         let styles = style::Styles::load();
         bar.appearance = styles.look(style::State::Desktop).appearance;
+        glass::set_menu_opacity(styles.menu_opacity());
         let (update_sender, update_events) = std::sync::mpsc::channel();
         let scale = scale.min((rc.right - rc.left) as f32 / (bar.dock_width() + 40.0));
         let (width, height) = bar.window_size(scale);
@@ -2709,6 +2755,8 @@ unsafe extern "system" fn wndproc(hwnd: HWND, msg: u32, wparam: WPARAM, lparam: 
 /// Panel de idioma del teclado sobre el indicador del dock.
 struct LanguageWindow {
     hwnd: HWND,
+    /// Desenfoque de debajo, como el del dock.
+    backdrop: Option<style::Backdrop>,
     surface: Option<Surface>,
     pos: POINT,
     scale: f32,
@@ -2738,6 +2786,7 @@ impl LanguageWindow {
         };
         Ok(Self {
             hwnd,
+            backdrop: style::Backdrop::new(),
             surface: None,
             pos: POINT::default(),
             scale: 1.0,
@@ -2803,6 +2852,8 @@ impl LanguageWindow {
                 &self.transition,
                 self.visible,
                 false,
+                self.backdrop.as_ref(),
+                &[panel_shape(surface, self.scale, 12.0)],
             );
         }
     }
@@ -2976,6 +3027,8 @@ struct TrayMenu {
 /// Panel de las apps en segundo plano (ver `traypanel` y `systray`).
 struct TrayWindow {
     hwnd: HWND,
+    /// Desenfoque de debajo, como el del dock.
+    backdrop: Option<style::Backdrop>,
     surface: Option<Surface>,
     pos: POINT,
     scale: f32,
@@ -3012,6 +3065,7 @@ impl TrayWindow {
         };
         Ok(Self {
             hwnd,
+            backdrop: style::Backdrop::new(),
             surface: None,
             pos: POINT::default(),
             scale: 1.0,
@@ -3100,6 +3154,8 @@ impl TrayWindow {
                 &self.transition,
                 self.visible,
                 false,
+                self.backdrop.as_ref(),
+                &[panel_shape(surface, self.scale, 10.0)],
             );
         }
     }
@@ -3191,6 +3247,8 @@ enum MenuPurpose {
 /// dock y el de GlassBar.
 struct AppMenuWindow {
     hwnd: HWND,
+    /// Desenfoque de debajo, como el del dock.
+    backdrop: Option<style::Backdrop>,
     surface: Option<Surface>,
     pos: POINT,
     scale: f32,
@@ -3198,6 +3256,8 @@ struct AppMenuWindow {
     visible: bool,
     transition: launcher::Transition,
     purpose: Option<MenuPurpose>,
+    /// Barra que se está arrastrando; el ratón queda capturado hasta soltarla.
+    sliding: Option<appmenu::Hit>,
     /// Iconos ya reducidos al tamaño del menú, por archivo o tipo de archivo: así
     /// las siguientes aperturas no los vuelven a leer.
     icons: std::collections::HashMap<String, Option<Pixmap>>,
@@ -3223,6 +3283,7 @@ impl AppMenuWindow {
         };
         Ok(Self {
             hwnd,
+            backdrop: style::Backdrop::new(),
             surface: None,
             pos: POINT::default(),
             scale: 1.0,
@@ -3230,6 +3291,7 @@ impl AppMenuWindow {
             visible: false,
             transition: launcher::Transition::hidden(),
             purpose: None,
+            sliding: None,
             icons: std::collections::HashMap::new(),
             icons_scale: 0.0,
         })
@@ -3440,6 +3502,8 @@ impl AppMenuWindow {
                 &self.transition,
                 self.visible,
                 false,
+                self.backdrop.as_ref(),
+                &self.model.shapes(self.scale),
             );
         }
     }
@@ -3506,7 +3570,9 @@ unsafe extern "system" fn app_menu_wndproc(
     wparam: WPARAM,
     lparam: LPARAM,
 ) -> LRESULT {
-    use windows::Win32::UI::WindowsAndMessaging::{WA_INACTIVE, WM_ACTIVATE, WM_KEYDOWN};
+    use windows::Win32::UI::WindowsAndMessaging::{
+        WA_INACTIVE, WM_ACTIVATE, WM_CAPTURECHANGED, WM_KEYDOWN, WM_LBUTTONDOWN,
+    };
     let point = |scale: f32| {
         (
             (lparam.0 & 0xffff) as i16 as f32 / scale,
@@ -3565,6 +3631,13 @@ unsafe extern "system" fn app_menu_wndproc(
                 };
                 let _ = TrackMouseEvent(&mut track);
                 let (x, y) = point(menu.scale);
+                // Arrastrando una barra, la sigue aunque el cursor salga de su fila.
+                if let Some(hit) = menu.sliding {
+                    if let Some((command, value)) = menu.model.slide(hit, x) {
+                        apply_menu_slider(&mut app.styles, menu, hit, command, value);
+                    }
+                    return;
+                }
                 if menu.model.point(x, y) {
                     menu.render();
                 }
@@ -3573,11 +3646,42 @@ unsafe extern "system" fn app_menu_wndproc(
         WM_MOUSELEAVE => {
             with_app(|app| {
                 if let Some(menu) = app.app_menu.as_mut().filter(|m| m.visible) {
-                    if menu.model.leave() {
+                    if menu.sliding.is_none() && menu.model.leave() {
                         menu.render();
                     }
                 }
             });
+        }
+        WM_LBUTTONDOWN => {
+            let grabbed = with_app(|app| {
+                let menu = app.app_menu.as_mut().filter(|m| m.visible)?;
+                let (x, y) = point(menu.scale);
+                let (hit, _) = menu.model.slider_at(x, y)?;
+                menu.sliding = Some(hit);
+                let (command, value) = menu.model.slide(hit, x)?;
+                apply_menu_slider(&mut app.styles, menu, hit, command, value);
+                Some(())
+            })
+            .flatten();
+            // Fuera de `with_app`: capturar avisa a esta misma ventana.
+            if grabbed.is_some() {
+                let _ = windows::Win32::UI::Input::KeyboardAndMouse::SetCapture(hwnd);
+            }
+        }
+        // Al soltar la barra, o si Windows le quita el ratón, se guarda el valor.
+        WM_CAPTURECHANGED => {
+            with_app(|app| {
+                let menu = app.app_menu.as_mut()?;
+                menu.sliding.take()?;
+                let _ = app.styles.save();
+                Some(())
+            });
+        }
+        WM_LBUTTONUP
+            if with_app(|app| app.app_menu.as_ref().is_some_and(|m| m.sliding.is_some()))
+                == Some(true) =>
+        {
+            let _ = windows::Win32::UI::Input::KeyboardAndMouse::ReleaseCapture();
         }
         WM_LBUTTONUP => {
             let command = with_app(|app| {
@@ -3599,6 +3703,17 @@ unsafe extern "system" fn app_menu_wndproc(
                     appmenu::Key::Close => menu.hide(),
                     appmenu::Key::Moved => menu.render(),
                     appmenu::Key::Choose(_) => {}
+                    appmenu::Key::Slide(command, value) => {
+                        let hit = if menu.model.in_sub {
+                            menu.model.sub_hovered().map(appmenu::Hit::Sub)
+                        } else {
+                            menu.model.root.hovered.map(appmenu::Hit::Root)
+                        };
+                        if let Some(hit) = hit {
+                            apply_menu_slider(&mut app.styles, menu, hit, command, value);
+                            let _ = app.styles.save();
+                        }
+                    }
                 }
                 Some(key)
             })
@@ -3610,6 +3725,25 @@ unsafe extern "system" fn app_menu_wndproc(
         _ => return DefWindowProcW(hwnd, msg, wparam, lparam),
     }
     LRESULT(0)
+}
+
+/// Aplica una barra del menú de GlassBar mientras se mueve. La opacidad de los
+/// menús cambia ya, también la del propio menú; se guarda al soltar la barra.
+fn apply_menu_slider(
+    styles: &mut style::Styles,
+    menu: &mut AppMenuWindow,
+    hit: appmenu::Hit,
+    command: u32,
+    value: f32,
+) {
+    if command == appmenu::CMD_MENU_OPACITY {
+        styles.set_menu_opacity((value * 100.0).round() as u8);
+        let percent = styles.menu_opacity();
+        glass::set_menu_opacity(percent);
+        // Sin bajar del mínimo, aunque el cursor vaya más allá.
+        menu.model.set_slider(hit, percent as f32 / 100.0);
+    }
+    menu.render();
 }
 
 impl Drop for TrayWindow {
@@ -3848,6 +3982,8 @@ unsafe extern "system" fn tray_wndproc(
 /// vivo las pone Windows (DWM) encima, en el hueco de cada tarjeta.
 struct PreviewWindow {
     hwnd: HWND,
+    /// Desenfoque de debajo, como el del dock.
+    backdrop: Option<style::Backdrop>,
     surface: Option<Surface>,
     pos: POINT,
     scale: f32,
@@ -3882,6 +4018,7 @@ impl PreviewWindow {
         };
         Ok(Self {
             hwnd,
+            backdrop: style::Backdrop::new(),
             surface: None,
             pos: POINT::default(),
             scale: 1.0,
@@ -4039,6 +4176,23 @@ impl PreviewWindow {
                 ULW_ALPHA,
             );
         }
+        if let Some(backdrop) = &self.backdrop {
+            // Las tarjetas, como las pinta `preview::draw`.
+            let s = self.scale;
+            let shapes: Vec<style::Shape> = self
+                .layout
+                .cards
+                .iter()
+                .map(|card| style::Shape {
+                    x: (card.x + 1.0) * s,
+                    y: (card.y + 1.0) * s,
+                    width: (card.width - 2.0) * s,
+                    height: (card.height - 2.0) * s,
+                    radius: 8.0 * s,
+                })
+                .collect();
+            backdrop.under(self.hwnd, surface_rect(self.pos, surface), &shapes, 1.0);
+        }
     }
 
     fn hide(&mut self) {
@@ -4048,6 +4202,9 @@ impl PreviewWindow {
         self.unregister();
         unsafe {
             let _ = ShowWindow(self.hwnd, SW_HIDE);
+        }
+        if let Some(backdrop) = &self.backdrop {
+            backdrop.hide();
         }
         self.visible = false;
         self.target = None;
