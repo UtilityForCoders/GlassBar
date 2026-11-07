@@ -43,7 +43,9 @@ const MAX_FREQUENT: usize = COLS * 2;
 /// El catálogo completo (lento de leer) se reutiliza entre aperturas durante este tiempo.
 const CATALOG_TTL: Duration = Duration::from_secs(120);
 /// Fondo casi opaco, como el Inicio de Windows en modo oscuro.
-const BACKGROUND: [u8; 4] = [32, 32, 34, 246];
+fn background() -> [u8; 4] {
+    crate::glass::panel()
+}
 const MENU_W: f32 = 196.0;
 const MENU_ROW: f32 = 36.0;
 const MENU_PAD: f32 = 6.0;
@@ -559,7 +561,7 @@ impl LauncherState {
         image.fill(tiny_skia::Color::TRANSPARENT);
         fill_rounded(
             image,
-            BACKGROUND,
+            background(),
             scale,
             scale,
             (WIDTH - 2.0) * scale,
@@ -1546,7 +1548,7 @@ mod tests {
         menu.apps.clear();
         let mut image = Pixmap::new(WIDTH as u32, HEIGHT as u32).unwrap();
         menu.draw(&mut image, 1.0);
-        assert_eq!(image.pixel(320, 500).unwrap().alpha(), BACKGROUND[3]);
+        assert_eq!(image.pixel(320, 500).unwrap().alpha(), background()[3]);
         assert_eq!(image.pixel(0, 0).unwrap().alpha(), 0);
     }
 

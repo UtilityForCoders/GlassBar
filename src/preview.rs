@@ -133,9 +133,9 @@ pub fn draw(
         let (w, h) = ((card.width - 2.0) * scale, (card.height - 2.0) * scale);
         // La tarjeta bajo el cursor, algo más clara, como en Windows.
         let fill = if hovered == Some(index) {
-            [52, 52, 56, 248]
+            crate::glass::panel_light()
         } else {
-            [32, 32, 34, 246]
+            crate::glass::panel()
         };
         fill_rounded(image, fill, x, y, w, h, 8.0 * scale);
         stroke_rounded(

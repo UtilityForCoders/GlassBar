@@ -74,7 +74,15 @@ impl LanguageState {
     pub fn draw(&self, image: &mut Pixmap, scale: f32) {
         image.fill(tiny_skia::Color::TRANSPARENT);
         let (w, h) = ((WIDTH - 2.0) * scale, (self.height() - 2.0) * scale);
-        fill_rounded(image, [32, 32, 34, 246], scale, scale, w, h, 12.0 * scale);
+        fill_rounded(
+            image,
+            crate::glass::panel(),
+            scale,
+            scale,
+            w,
+            h,
+            12.0 * scale,
+        );
         // Línea sobre el pie, como en el panel rápido.
         fill_rounded(
             image,
