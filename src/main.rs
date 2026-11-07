@@ -1277,7 +1277,11 @@ unsafe extern "system" fn launcher_wndproc(
                         if menu.model.in_search(x, y) {
                             let shift =
                                 windows::Win32::UI::Input::KeyboardAndMouse::GetKeyState(0x10) < 0;
-                            menu.model.click_search(x, shift);
+                            let double = Duration::from_millis(
+                                windows::Win32::UI::Input::KeyboardAndMouse::GetDoubleClickTime()
+                                    as u64,
+                            );
+                            menu.model.press_search(x, shift, Instant::now(), double);
                             menu.model.selection = None;
                         }
                         if let Some(hit) = hit {

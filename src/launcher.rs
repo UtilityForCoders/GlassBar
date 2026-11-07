@@ -263,6 +263,9 @@ pub struct LauncherState {
     search_offset: f32,
     /// El cursor del texto se ve en esta fase del parpadeo.
     caret_on: bool,
+    /// Última pulsación en el buscador (momento, x y cuántas seguidas), para el
+    /// doble y el triple clic.
+    last_press: Option<(Instant, f32, u8)>,
     user: String,
     icons: HashMap<String, Option<Pixmap>>,
     /// Con ventana, los iconos que faltan se cargan en otro hilo (ver `IconLoader`);
@@ -297,6 +300,7 @@ impl LauncherState {
             selection: None,
             search_offset: 0.0,
             caret_on: true,
+            last_press: None,
             user: user_display_name(),
             icons: HashMap::new(),
             loader: None,
@@ -560,6 +564,37 @@ impl LauncherState {
     /// Clic en el campo de búsqueda: pone el cursor en la letra más cercana; con
     /// Mayús amplía la selección hasta ahí.
     pub fn click_search(&mut self, x: f32, extend: bool) {
+        let index = self.char_at(x);
+        self.edit(|field| field.move_to(index, extend));
+    }
+    /// Pulsación en el buscador en el momento `now`: un clic pone el cursor, dos
+    /// seguidos en el mismo sitio (dentro de `double` del anterior, como pide
+    /// Windows) seleccionan la palabra, y tres todo el texto.
+    pub fn press_search(&mut self, x: f32, extend: bool, now: Instant, double: Duration) {
+        let count = match self.last_press {
+            Some((at, px, count))
+                if !extend
+                    && now.saturating_duration_since(at) <= double
+                    && (x - px).abs() <= 4.0 =>
+            {
+                count % 3 + 1
+            }
+            _ => 1,
+        };
+        self.last_press = Some((now, x, count));
+        match count {
+            2 => {
+                let index = self.char_at(x);
+                self.edit(|field| field.select_word(index));
+            }
+            3 => {
+                self.edit(|field| field.select_all());
+            }
+            _ => self.click_search(x, extend),
+        }
+    }
+    /// Carácter del buscador más cercano a `x` (antes del que queda a la derecha).
+    fn char_at(&self, x: f32) -> usize {
         let target = x - SEARCH_TEXT_X - 1.0 + self.search_offset;
         let mut left = 0.0;
         let mut index = 0;
@@ -571,7 +606,7 @@ impl LauncherState {
             left += width;
             index += 1;
         }
-        self.edit(|field| field.move_to(index, extend));
+        index
     }
     /// Mueve la selección con las flechas: izquierda/derecha siguen el orden de lectura;
     /// arriba/abajo saltan al elemento más cercano en esa dirección, entre secciones.
@@ -1943,6 +1978,7 @@ mod tests {
             selection: None,
             search_offset: 0.0,
             caret_on: true,
+            last_press: None,
             user: "Usuario de prueba".into(),
             icons: HashMap::new(),
             loader: None,
@@ -2121,6 +2157,28 @@ mod tests {
         menu.activate(Hit::Power);
         assert!(!menu.over_text(SEARCH_TEXT_X + 10.0, y));
         assert!(!menu.blink());
+    }
+
+    #[test]
+    fn double_click_selects_a_word_and_triple_click_everything() {
+        let mut menu = state();
+        menu.insert_text("visual studio");
+        let double = Duration::from_millis(500);
+        let start = Instant::now();
+        let x = SEARCH_TEXT_X + 1.0 + text_width("visual stu", SEARCH_FONT);
+        menu.press_search(x, false, start, double);
+        assert_eq!(menu.query.selection(), None);
+        menu.press_search(x + 2.0, false, start + Duration::from_millis(200), double);
+        assert_eq!(menu.query.selected_text().as_deref(), Some("studio"));
+        menu.press_search(x, false, start + Duration::from_millis(400), double);
+        assert_eq!(menu.query.selected_text().as_deref(), Some("visual studio"));
+        // Pasado el tiempo de doble clic, vuelve a ser un clic que solo pone el cursor.
+        menu.press_search(x, false, start + Duration::from_secs(2), double);
+        assert_eq!(menu.query.selection(), None);
+        // Lejos del clic anterior tampoco cuenta como doble.
+        let far = SEARCH_TEXT_X + 5.0;
+        menu.press_search(far, false, start + Duration::from_millis(2100), double);
+        assert_eq!(menu.query.selection(), None);
     }
 
     #[test]
