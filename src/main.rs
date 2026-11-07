@@ -106,6 +106,8 @@ const TIMER_ANNOUNCE: usize = 5;
 /// Buscar actualizaciones: una vez poco después de arrancar y luego cada 6 horas.
 const TIMER_UPDATE_FIRST: usize = 6;
 const TIMER_UPDATE: usize = 7;
+/// Parpadeo del cursor del texto en el buscador del lanzador.
+const TIMER_CARET: usize = 8;
 
 /// Refresco del reloj y verificación de apps activas.
 const TICK_MS: u32 = 1000;
@@ -434,11 +436,16 @@ impl LauncherWindow {
         self.transition.open(Instant::now());
         self.render();
         take_focus(self.hwnd);
+        restart_caret(self.hwnd);
     }
     /// Empieza el cierre; la ventana se oculta cuando termina de desvanecerse.
     fn hide(&mut self) {
         if !self.visible {
             return;
+        }
+        unsafe {
+            let _ =
+                windows::Win32::UI::WindowsAndMessaging::KillTimer(Some(self.hwnd), TIMER_CARET);
         }
         self.visible = false;
         self.transition.close(Instant::now());
@@ -1152,6 +1159,20 @@ fn run_power(option: launcher::Power) -> bool {
     }
 }
 
+/// (Re)empieza el parpadeo del cursor del buscador con el ritmo que tenga Windows,
+/// para que no se apague justo al escribir. Sin parpadeo en Windows, queda fijo.
+fn restart_caret(hwnd: HWND) {
+    use windows::Win32::UI::WindowsAndMessaging::{GetCaretBlinkTime, KillTimer, SetTimer};
+    unsafe {
+        let period = GetCaretBlinkTime();
+        if period == 0 || period == u32::MAX {
+            let _ = KillTimer(Some(hwnd), TIMER_CARET);
+        } else {
+            SetTimer(Some(hwnd), TIMER_CARET, period, None);
+        }
+    }
+}
+
 /// Lee el catálogo y los iconos de la vista inicial en otro hilo.
 fn prepare_launcher(
     pinned: &[apps::AppEntry],
@@ -1173,10 +1194,46 @@ unsafe extern "system" fn launcher_wndproc(
     lparam: LPARAM,
 ) -> LRESULT {
     use windows::Win32::UI::WindowsAndMessaging::{
-        WA_INACTIVE, WM_ACTIVATE, WM_CHAR, WM_CLOSE, WM_KEYDOWN, WM_MOUSEWHEEL,
+        WA_INACTIVE, WM_ACTIVATE, WM_CHAR, WM_CLOSE, WM_KEYDOWN, WM_LBUTTONDOWN, WM_MOUSEWHEEL,
+        WM_RBUTTONUP, WM_SETCURSOR, WM_SYSKEYDOWN,
     };
     let mut action = None;
+    // Al escribir o pulsar, el cursor del texto se ve fijo y el parpadeo empieza de nuevo.
+    if matches!(msg, WM_CHAR | WM_KEYDOWN | WM_LBUTTONDOWN) {
+        restart_caret(hwnd);
+    }
     match msg {
+        WM_TIMER if wparam.0 == TIMER_CARET => {
+            with_app(|app| {
+                if let Some(menu) = app.launcher.as_mut().filter(|m| m.visible) {
+                    if menu.model.blink() {
+                        menu.render();
+                    }
+                }
+            });
+        }
+        // Sobre el buscador, el cursor de texto (I), como en cualquier cuadro de texto.
+        WM_SETCURSOR if (lparam.0 & 0xffff) as u32 == 1 => {
+            use windows::Win32::Graphics::Gdi::ScreenToClient;
+            use windows::Win32::UI::WindowsAndMessaging::{SetCursor, IDC_IBEAM};
+            let over = with_app(|app| {
+                let menu = app.launcher.as_ref().filter(|m| m.visible)?;
+                let mut point = POINT::default();
+                let _ = GetCursorPos(&mut point);
+                let _ = ScreenToClient(hwnd, &mut point);
+                Some(
+                    menu.model
+                        .over_text(point.x as f32 / menu.scale, point.y as f32 / menu.scale),
+                )
+            })
+            .flatten()
+            .unwrap_or(false);
+            let cursor = if over { IDC_IBEAM } else { IDC_ARROW };
+            if let Ok(cursor) = LoadCursorW(None, cursor) {
+                SetCursor(Some(cursor));
+            }
+            return LRESULT(1);
+        }
         WM_ACTIVATE if (wparam.0 & 0xffff) as u32 == WA_INACTIVE => {
             with_app(|app| {
                 if let Some(menu) = &mut app.launcher {
@@ -1220,22 +1277,53 @@ unsafe extern "system" fn launcher_wndproc(
                         if menu.model.in_search(x, y) {
                             let shift =
                                 windows::Win32::UI::Input::KeyboardAndMouse::GetKeyState(0x10) < 0;
-                            menu.model.click_search(x, shift);
+                            let double = Duration::from_millis(
+                                windows::Win32::UI::Input::KeyboardAndMouse::GetDoubleClickTime()
+                                    as u64,
+                            );
+                            menu.model.press_search(x, shift, Instant::now(), double);
                             menu.model.selection = None;
                         }
                         if let Some(hit) = hit {
                             action = menu.model.activate(hit);
                         }
                     }
-                    menu.model.hovered = hit;
+                    menu.model.set_hovered(hit);
                     menu.render();
+                }
+            });
+        }
+        // Clic derecho en una app: su menú contextual, como en el Inicio de Windows.
+        // Con un menú ya abierto, lo cierra.
+        WM_RBUTTONUP => {
+            with_app(|app| {
+                if let Some(menu) = app.launcher.as_mut().filter(|menu| menu.visible) {
+                    let x = (lparam.0 & 0xffff) as i16 as f32 / menu.scale;
+                    let y = ((lparam.0 >> 16) & 0xffff) as i16 as f32 / menu.scale;
+                    if !menu.model.close_overlay() {
+                        if let Some(hit) = menu.model.hit_test(x, y) {
+                            menu.model.open_context(hit, x, y);
+                        }
+                    }
+                    menu.render();
+                }
+            });
+        }
+        // Mayús+F10 abre el menú contextual de la app elegida, como en Windows.
+        WM_SYSKEYDOWN if wparam.0 == 0x79 => {
+            with_app(|app| {
+                if let Some(menu) = app.launcher.as_mut().filter(|menu| menu.visible) {
+                    use windows::Win32::UI::Input::KeyboardAndMouse::GetKeyState;
+                    if GetKeyState(0x10) < 0 && menu.model.open_context_from_keyboard() {
+                        menu.render();
+                    }
                 }
             });
         }
         WM_MOUSEWHEEL => {
             with_app(|app| {
                 if let Some(menu) = app.launcher.as_mut().filter(|menu| menu.visible) {
-                    if !menu.model.power_menu {
+                    if !menu.model.overlay_open() {
                         // 120 unidades por muesca de la rueda: algo más de una fila.
                         let delta = ((wparam.0 >> 16) & 0xffff) as i16 as f32;
                         menu.model.scroll_by(-delta / 120.0 * 96.0);
@@ -1261,19 +1349,26 @@ unsafe extern "system" fn launcher_wndproc(
                     use windows::Win32::UI::Input::KeyboardAndMouse::GetKeyState;
                     let ctrl = GetKeyState(0x11) < 0;
                     let shift = GetKeyState(0x10) < 0;
-                    let menu_open = menu.model.power_menu;
+                    let menu_open = menu.model.overlay_open();
                     match wparam.0 {
                         0x1B => {
-                            if menu_open {
-                                menu.model.power_menu = false;
+                            if menu.model.close_overlay() {
                                 menu.render();
                             } else {
                                 menu.hide();
                             }
                         }
-                        0x0D if !menu_open => {
+                        // Enter abre lo elegido; con un menú abierto, su opción resaltada.
+                        0x0D => {
                             if let Some(hit) = menu.model.first_match() {
                                 action = menu.model.activate(hit);
+                                menu.render();
+                            }
+                        }
+                        // Tecla de menú: el menú contextual de la app elegida.
+                        0x5D => {
+                            if menu.model.open_context_from_keyboard() {
+                                menu.render();
                             }
                         }
                         // Ctrl+A, Ctrl+C, Ctrl+X y Ctrl+V, como en cualquier cuadro de texto.
@@ -1333,19 +1428,19 @@ unsafe extern "system" fn launcher_wndproc(
                             menu.model.edit(|field| field.end(shift));
                             menu.render();
                         }
-                        0x28 if !menu.model.power_menu => {
+                        0x28 => {
                             menu.model.move_selection(0, 1);
                             menu.render();
                         }
-                        0x26 if !menu.model.power_menu => {
+                        0x26 => {
                             menu.model.move_selection(0, -1);
                             menu.render();
                         }
-                        0x22 if !menu.model.power_menu => {
+                        0x22 if !menu_open => {
                             menu.model.scroll_page(true);
                             menu.render();
                         }
-                        0x21 if !menu.model.power_menu => {
+                        0x21 if !menu_open => {
                             menu.model.scroll_page(false);
                             menu.render();
                         }
@@ -1358,16 +1453,38 @@ unsafe extern "system" fn launcher_wndproc(
     }
     // Ejecutar después de liberar el préstamo de APP: Shell puede reenviar eventos.
     if let Some(action) = action {
-        with_app(|app| {
-            if let Some(menu) = &mut app.launcher {
-                menu.hide();
-            }
-        });
+        if action.closes_launcher() {
+            with_app(|app| {
+                if let Some(menu) = &mut app.launcher {
+                    menu.hide();
+                }
+            });
+        }
         match action {
             launcher::Action::Launch(entry) => {
                 if apps::launch_entry(&entry) {
                     let _ = catalog::record(&entry);
                 }
+            }
+            launcher::Action::RunAsAdmin(entry) => {
+                if apps::launch_entry_as_admin(&entry) {
+                    let _ = catalog::record(&entry);
+                }
+            }
+            launcher::Action::OpenLocation(entry) => {
+                apps::open_entry_location(&entry);
+            }
+            launcher::Action::Uninstall => {
+                apps::open_uninstall();
+            }
+            launcher::Action::Jump(entry, item) => {
+                jumplist::open(&item, &entry.command);
+            }
+            launcher::Action::Pin(entry) => {
+                with_app(|app| app.pin_from_launcher(entry, true));
+            }
+            launcher::Action::Unpin(entry) => {
+                with_app(|app| app.pin_from_launcher(entry, false));
             }
             launcher::Action::Power(option) => {
                 if !run_power(option) {
@@ -1949,6 +2066,33 @@ impl App {
             priority::raise(self.hwnd);
             // Su desenfoque, otra vez justo debajo.
             self.sync_backdrop();
+        }
+    }
+
+    /// Ancla o desancla en el dock una app desde el lanzador, que sigue abierto
+    /// con su sección "Anclado" al día.
+    fn pin_from_launcher(&mut self, entry: apps::AppEntry, pin: bool) {
+        let same = |a: &apps::AppItem| a.entry.command.eq_ignore_ascii_case(&entry.command);
+        let position = self.bar.primary_apps.iter().position(same);
+        match (pin, position) {
+            (true, None) => self.bar.primary_apps.push(apps::AppItem::new(entry)),
+            (false, Some(index)) => {
+                self.bar.primary_apps.remove(index);
+            }
+            _ => return,
+        }
+        // Sus ventanas pasan al anclado (o vuelven a los abiertos).
+        apps::update_running_apps(&mut self.bar.primary_apps, &mut self.bar.open_apps);
+        self.pins_changed();
+        let pinned: Vec<_> = self
+            .bar
+            .primary_apps
+            .iter()
+            .map(|a| a.entry.clone())
+            .collect();
+        if let Some(menu) = self.launcher.as_mut().filter(|m| m.visible) {
+            menu.model.set_pinned(&pinned);
+            menu.render();
         }
     }
 

@@ -168,6 +168,27 @@ impl TextField {
         self.move_to(len, extend);
     }
 
+    /// Selecciona la palabra bajo el carácter `at` (doble clic), o los espacios
+    /// seguidos si cae en ellos. Al final del texto, la palabra anterior.
+    pub fn select_word(&mut self, at: usize) {
+        let chars: Vec<char> = self.text.chars().collect();
+        if chars.is_empty() {
+            return;
+        }
+        let at = at.min(chars.len() - 1);
+        let kind = class(chars[at]);
+        let mut start = at;
+        while start > 0 && class(chars[start - 1]) == kind {
+            start -= 1;
+        }
+        let mut end = at + 1;
+        while end < chars.len() && class(chars[end]) == kind {
+            end += 1;
+        }
+        self.anchor = Some(start);
+        self.caret = end;
+    }
+
     /// Principio de la palabra que queda antes de `from`: salta los espacios y
     /// después los caracteres de la misma clase, como Ctrl+← en Windows.
     fn word_start(&self, from: usize) -> usize {
@@ -210,6 +231,23 @@ mod tests {
         let mut field = TextField::default();
         field.insert(text);
         field
+    }
+
+    #[test]
+    fn select_word_takes_the_word_or_the_spaces_under_the_click() {
+        let mut text = field("abrir  spotify.exe");
+        text.select_word(3);
+        assert_eq!(text.selected_text().as_deref(), Some("abrir"));
+        text.select_word(5);
+        assert_eq!(text.selected_text().as_deref(), Some("  "));
+        text.select_word(9);
+        assert_eq!(text.selected_text().as_deref(), Some("spotify"));
+        // Al final del texto, la última palabra.
+        text.select_word(100);
+        assert_eq!(text.selected_text().as_deref(), Some("exe"));
+        let mut empty = TextField::default();
+        empty.select_word(0);
+        assert_eq!(empty.selection(), None);
     }
 
     #[test]
