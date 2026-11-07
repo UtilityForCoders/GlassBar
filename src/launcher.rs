@@ -261,6 +261,8 @@ pub struct LauncherState {
     /// Desplazamiento horizontal del texto de búsqueda cuando no cabe, para que el
     /// cursor siempre se vea.
     search_offset: f32,
+    /// El cursor del texto se ve en esta fase del parpadeo.
+    caret_on: bool,
     user: String,
     icons: HashMap<String, Option<Pixmap>>,
     /// Con ventana, los iconos que faltan se cargan en otro hilo (ver `IconLoader`);
@@ -294,6 +296,7 @@ impl LauncherState {
             context: None,
             selection: None,
             search_offset: 0.0,
+            caret_on: true,
             user: user_display_name(),
             icons: HashMap::new(),
             loader: None,
@@ -326,6 +329,7 @@ impl LauncherState {
         self.recent = recent;
         self.frequent = frequent;
         self.query.clear();
+        self.caret_on = true;
         self.power_menu = false;
         self.context = None;
         self.jumps.clear();
@@ -342,6 +346,16 @@ impl LauncherState {
         self.pinned
             .iter()
             .any(|p| p.command.eq_ignore_ascii_case(&entry.command))
+    }
+    /// Siguiente fase del parpadeo del cursor del texto. Devuelve si cambia algo
+    /// visible (con texto seleccionado o un menú abierto, el cursor no se ve).
+    pub fn blink(&mut self) -> bool {
+        self.caret_on = !self.caret_on;
+        self.query.selection().is_none() && !self.overlay_open()
+    }
+    /// El cursor del ratón está sobre el texto del buscador y escribir ahí es posible.
+    pub fn over_text(&self, x: f32, y: f32) -> bool {
+        !self.overlay_open() && self.in_search(x, y)
     }
     /// Hay un menú flotante abierto (energía o contextual): el resto no responde.
     pub fn overlay_open(&self) -> bool {
@@ -526,6 +540,8 @@ impl LauncherState {
         if self.overlay_open() {
             return None;
         }
+        // Al escribir o mover el cursor, se ve fijo hasta el siguiente parpadeo.
+        self.caret_on = true;
         let before = self.query.text().to_string();
         let result = change(&mut self.query);
         if self.query.text() != before {
@@ -1013,7 +1029,7 @@ impl LauncherState {
             }
             draw_text_on_baseline(&mut layer, text, -offset, baseline, size, 1.0);
         }
-        if self.query.selection().is_none() && !self.power_menu {
+        if self.query.selection().is_none() && !self.overlay_open() && self.caret_on {
             fill_rounded(
                 &mut layer,
                 [235, 240, 250, 220],
@@ -1926,6 +1942,7 @@ mod tests {
             context: None,
             selection: None,
             search_offset: 0.0,
+            caret_on: true,
             user: "Usuario de prueba".into(),
             icons: HashMap::new(),
             loader: None,
@@ -2083,6 +2100,27 @@ mod tests {
         menu.power_menu = true;
         assert!(menu.edit(|field| field.insert("x")).is_none());
         assert_eq!(menu.query.text(), "app ");
+    }
+
+    #[test]
+    fn caret_blinks_but_stays_on_while_typing_and_hides_with_a_menu() {
+        let mut menu = state();
+        assert!(menu.caret_on);
+        assert!(menu.blink());
+        assert!(!menu.caret_on);
+        // Escribir o mover el cursor lo vuelve a mostrar.
+        menu.insert_text("a");
+        assert!(menu.caret_on);
+        menu.blink();
+        menu.edit(|field| field.home(false));
+        assert!(menu.caret_on);
+        // Sobre el texto del buscador hay cursor de texto; con un menú abierto, no.
+        let y = SEARCH_Y + SEARCH_H / 2.0;
+        assert!(menu.over_text(SEARCH_TEXT_X + 10.0, y));
+        assert!(!menu.over_text(SEARCH_TEXT_X + 10.0, VIEW_TOP + 20.0));
+        menu.activate(Hit::Power);
+        assert!(!menu.over_text(SEARCH_TEXT_X + 10.0, y));
+        assert!(!menu.blink());
     }
 
     #[test]

@@ -106,6 +106,8 @@ const TIMER_ANNOUNCE: usize = 5;
 /// Buscar actualizaciones: una vez poco después de arrancar y luego cada 6 horas.
 const TIMER_UPDATE_FIRST: usize = 6;
 const TIMER_UPDATE: usize = 7;
+/// Parpadeo del cursor del texto en el buscador del lanzador.
+const TIMER_CARET: usize = 8;
 
 /// Refresco del reloj y verificación de apps activas.
 const TICK_MS: u32 = 1000;
@@ -434,11 +436,16 @@ impl LauncherWindow {
         self.transition.open(Instant::now());
         self.render();
         take_focus(self.hwnd);
+        restart_caret(self.hwnd);
     }
     /// Empieza el cierre; la ventana se oculta cuando termina de desvanecerse.
     fn hide(&mut self) {
         if !self.visible {
             return;
+        }
+        unsafe {
+            let _ =
+                windows::Win32::UI::WindowsAndMessaging::KillTimer(Some(self.hwnd), TIMER_CARET);
         }
         self.visible = false;
         self.transition.close(Instant::now());
@@ -1152,6 +1159,20 @@ fn run_power(option: launcher::Power) -> bool {
     }
 }
 
+/// (Re)empieza el parpadeo del cursor del buscador con el ritmo que tenga Windows,
+/// para que no se apague justo al escribir. Sin parpadeo en Windows, queda fijo.
+fn restart_caret(hwnd: HWND) {
+    use windows::Win32::UI::WindowsAndMessaging::{GetCaretBlinkTime, KillTimer, SetTimer};
+    unsafe {
+        let period = GetCaretBlinkTime();
+        if period == 0 || period == u32::MAX {
+            let _ = KillTimer(Some(hwnd), TIMER_CARET);
+        } else {
+            SetTimer(Some(hwnd), TIMER_CARET, period, None);
+        }
+    }
+}
+
 /// Lee el catálogo y los iconos de la vista inicial en otro hilo.
 fn prepare_launcher(
     pinned: &[apps::AppEntry],
@@ -1173,11 +1194,46 @@ unsafe extern "system" fn launcher_wndproc(
     lparam: LPARAM,
 ) -> LRESULT {
     use windows::Win32::UI::WindowsAndMessaging::{
-        WA_INACTIVE, WM_ACTIVATE, WM_CHAR, WM_CLOSE, WM_KEYDOWN, WM_MOUSEWHEEL, WM_RBUTTONUP,
-        WM_SYSKEYDOWN,
+        WA_INACTIVE, WM_ACTIVATE, WM_CHAR, WM_CLOSE, WM_KEYDOWN, WM_LBUTTONDOWN, WM_MOUSEWHEEL,
+        WM_RBUTTONUP, WM_SETCURSOR, WM_SYSKEYDOWN,
     };
     let mut action = None;
+    // Al escribir o pulsar, el cursor del texto se ve fijo y el parpadeo empieza de nuevo.
+    if matches!(msg, WM_CHAR | WM_KEYDOWN | WM_LBUTTONDOWN) {
+        restart_caret(hwnd);
+    }
     match msg {
+        WM_TIMER if wparam.0 == TIMER_CARET => {
+            with_app(|app| {
+                if let Some(menu) = app.launcher.as_mut().filter(|m| m.visible) {
+                    if menu.model.blink() {
+                        menu.render();
+                    }
+                }
+            });
+        }
+        // Sobre el buscador, el cursor de texto (I), como en cualquier cuadro de texto.
+        WM_SETCURSOR if (lparam.0 & 0xffff) as u32 == 1 => {
+            use windows::Win32::Graphics::Gdi::ScreenToClient;
+            use windows::Win32::UI::WindowsAndMessaging::{SetCursor, IDC_IBEAM};
+            let over = with_app(|app| {
+                let menu = app.launcher.as_ref().filter(|m| m.visible)?;
+                let mut point = POINT::default();
+                let _ = GetCursorPos(&mut point);
+                let _ = ScreenToClient(hwnd, &mut point);
+                Some(
+                    menu.model
+                        .over_text(point.x as f32 / menu.scale, point.y as f32 / menu.scale),
+                )
+            })
+            .flatten()
+            .unwrap_or(false);
+            let cursor = if over { IDC_IBEAM } else { IDC_ARROW };
+            if let Ok(cursor) = LoadCursorW(None, cursor) {
+                SetCursor(Some(cursor));
+            }
+            return LRESULT(1);
+        }
         WM_ACTIVATE if (wparam.0 & 0xffff) as u32 == WA_INACTIVE => {
             with_app(|app| {
                 if let Some(menu) = &mut app.launcher {
