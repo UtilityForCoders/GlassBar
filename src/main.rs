@@ -1173,7 +1173,8 @@ unsafe extern "system" fn launcher_wndproc(
     lparam: LPARAM,
 ) -> LRESULT {
     use windows::Win32::UI::WindowsAndMessaging::{
-        WA_INACTIVE, WM_ACTIVATE, WM_CHAR, WM_CLOSE, WM_KEYDOWN, WM_MOUSEWHEEL,
+        WA_INACTIVE, WM_ACTIVATE, WM_CHAR, WM_CLOSE, WM_KEYDOWN, WM_MOUSEWHEEL, WM_RBUTTONUP,
+        WM_SYSKEYDOWN,
     };
     let mut action = None;
     match msg {
@@ -1227,15 +1228,42 @@ unsafe extern "system" fn launcher_wndproc(
                             action = menu.model.activate(hit);
                         }
                     }
-                    menu.model.hovered = hit;
+                    menu.model.set_hovered(hit);
                     menu.render();
+                }
+            });
+        }
+        // Clic derecho en una app: su menú contextual, como en el Inicio de Windows.
+        // Con un menú ya abierto, lo cierra.
+        WM_RBUTTONUP => {
+            with_app(|app| {
+                if let Some(menu) = app.launcher.as_mut().filter(|menu| menu.visible) {
+                    let x = (lparam.0 & 0xffff) as i16 as f32 / menu.scale;
+                    let y = ((lparam.0 >> 16) & 0xffff) as i16 as f32 / menu.scale;
+                    if !menu.model.close_overlay() {
+                        if let Some(hit) = menu.model.hit_test(x, y) {
+                            menu.model.open_context(hit, x, y);
+                        }
+                    }
+                    menu.render();
+                }
+            });
+        }
+        // Mayús+F10 abre el menú contextual de la app elegida, como en Windows.
+        WM_SYSKEYDOWN if wparam.0 == 0x79 => {
+            with_app(|app| {
+                if let Some(menu) = app.launcher.as_mut().filter(|menu| menu.visible) {
+                    use windows::Win32::UI::Input::KeyboardAndMouse::GetKeyState;
+                    if GetKeyState(0x10) < 0 && menu.model.open_context_from_keyboard() {
+                        menu.render();
+                    }
                 }
             });
         }
         WM_MOUSEWHEEL => {
             with_app(|app| {
                 if let Some(menu) = app.launcher.as_mut().filter(|menu| menu.visible) {
-                    if !menu.model.power_menu {
+                    if !menu.model.overlay_open() {
                         // 120 unidades por muesca de la rueda: algo más de una fila.
                         let delta = ((wparam.0 >> 16) & 0xffff) as i16 as f32;
                         menu.model.scroll_by(-delta / 120.0 * 96.0);
@@ -1261,19 +1289,26 @@ unsafe extern "system" fn launcher_wndproc(
                     use windows::Win32::UI::Input::KeyboardAndMouse::GetKeyState;
                     let ctrl = GetKeyState(0x11) < 0;
                     let shift = GetKeyState(0x10) < 0;
-                    let menu_open = menu.model.power_menu;
+                    let menu_open = menu.model.overlay_open();
                     match wparam.0 {
                         0x1B => {
-                            if menu_open {
-                                menu.model.power_menu = false;
+                            if menu.model.close_overlay() {
                                 menu.render();
                             } else {
                                 menu.hide();
                             }
                         }
-                        0x0D if !menu_open => {
+                        // Enter abre lo elegido; con un menú abierto, su opción resaltada.
+                        0x0D => {
                             if let Some(hit) = menu.model.first_match() {
                                 action = menu.model.activate(hit);
+                                menu.render();
+                            }
+                        }
+                        // Tecla de menú: el menú contextual de la app elegida.
+                        0x5D => {
+                            if menu.model.open_context_from_keyboard() {
+                                menu.render();
                             }
                         }
                         // Ctrl+A, Ctrl+C, Ctrl+X y Ctrl+V, como en cualquier cuadro de texto.
@@ -1333,19 +1368,19 @@ unsafe extern "system" fn launcher_wndproc(
                             menu.model.edit(|field| field.end(shift));
                             menu.render();
                         }
-                        0x28 if !menu.model.power_menu => {
+                        0x28 => {
                             menu.model.move_selection(0, 1);
                             menu.render();
                         }
-                        0x26 if !menu.model.power_menu => {
+                        0x26 => {
                             menu.model.move_selection(0, -1);
                             menu.render();
                         }
-                        0x22 if !menu.model.power_menu => {
+                        0x22 if !menu_open => {
                             menu.model.scroll_page(true);
                             menu.render();
                         }
-                        0x21 if !menu.model.power_menu => {
+                        0x21 if !menu_open => {
                             menu.model.scroll_page(false);
                             menu.render();
                         }
@@ -1358,16 +1393,38 @@ unsafe extern "system" fn launcher_wndproc(
     }
     // Ejecutar después de liberar el préstamo de APP: Shell puede reenviar eventos.
     if let Some(action) = action {
-        with_app(|app| {
-            if let Some(menu) = &mut app.launcher {
-                menu.hide();
-            }
-        });
+        if action.closes_launcher() {
+            with_app(|app| {
+                if let Some(menu) = &mut app.launcher {
+                    menu.hide();
+                }
+            });
+        }
         match action {
             launcher::Action::Launch(entry) => {
                 if apps::launch_entry(&entry) {
                     let _ = catalog::record(&entry);
                 }
+            }
+            launcher::Action::RunAsAdmin(entry) => {
+                if apps::launch_entry_as_admin(&entry) {
+                    let _ = catalog::record(&entry);
+                }
+            }
+            launcher::Action::OpenLocation(entry) => {
+                apps::open_entry_location(&entry);
+            }
+            launcher::Action::Uninstall => {
+                apps::open_uninstall();
+            }
+            launcher::Action::Jump(entry, item) => {
+                jumplist::open(&item, &entry.command);
+            }
+            launcher::Action::Pin(entry) => {
+                with_app(|app| app.pin_from_launcher(entry, true));
+            }
+            launcher::Action::Unpin(entry) => {
+                with_app(|app| app.pin_from_launcher(entry, false));
             }
             launcher::Action::Power(option) => {
                 if !run_power(option) {
@@ -1949,6 +2006,33 @@ impl App {
             priority::raise(self.hwnd);
             // Su desenfoque, otra vez justo debajo.
             self.sync_backdrop();
+        }
+    }
+
+    /// Ancla o desancla en el dock una app desde el lanzador, que sigue abierto
+    /// con su sección "Anclado" al día.
+    fn pin_from_launcher(&mut self, entry: apps::AppEntry, pin: bool) {
+        let same = |a: &apps::AppItem| a.entry.command.eq_ignore_ascii_case(&entry.command);
+        let position = self.bar.primary_apps.iter().position(same);
+        match (pin, position) {
+            (true, None) => self.bar.primary_apps.push(apps::AppItem::new(entry)),
+            (false, Some(index)) => {
+                self.bar.primary_apps.remove(index);
+            }
+            _ => return,
+        }
+        // Sus ventanas pasan al anclado (o vuelven a los abiertos).
+        apps::update_running_apps(&mut self.bar.primary_apps, &mut self.bar.open_apps);
+        self.pins_changed();
+        let pinned: Vec<_> = self
+            .bar
+            .primary_apps
+            .iter()
+            .map(|a| a.entry.clone())
+            .collect();
+        if let Some(menu) = self.launcher.as_mut().filter(|m| m.visible) {
+            menu.model.set_pinned(&pinned);
+            menu.render();
         }
     }
 

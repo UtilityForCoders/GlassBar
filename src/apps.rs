@@ -229,6 +229,47 @@ pub fn launch_entry(entry: &AppEntry) -> bool {
     }
 }
 
+/// Pide a Windows `verb` sobre `file` con `args`. Devuelve si lo aceptó.
+fn shell_execute(verb: &str, file: &str, args: Option<&str>) -> bool {
+    let wide = |text: &str| -> Vec<u16> { OsStr::new(text).encode_wide().chain(Some(0)).collect() };
+    let (verb, file) = (wide(verb), wide(file));
+    let args = args.map(wide);
+    unsafe {
+        ShellExecuteW(
+            None,
+            PCWSTR(verb.as_ptr()),
+            PCWSTR(file.as_ptr()),
+            args.as_ref().map_or(PCWSTR::null(), |a| PCWSTR(a.as_ptr())),
+            None,
+            SW_SHOWNORMAL,
+        )
+        .0 as isize
+            > 32
+    }
+}
+
+/// Abre la app como administrador (Windows pide confirmación).
+pub fn launch_entry_as_admin(entry: &AppEntry) -> bool {
+    shell_execute("runas", &entry.command, None)
+}
+
+/// Abre la carpeta del programa o acceso directo con él seleccionado.
+pub fn open_entry_location(entry: &AppEntry) -> bool {
+    let explorer = std::env::var("WINDIR")
+        .map(|p| format!("{p}\\explorer.exe"))
+        .unwrap_or_else(|_| "explorer.exe".into());
+    shell_execute(
+        "open",
+        &explorer,
+        Some(&format!("/select,\"{}\"", entry.command)),
+    )
+}
+
+/// Abre "Aplicaciones instaladas" de Configuración, desde donde se desinstala.
+pub fn open_uninstall() -> bool {
+    shell_execute("open", "ms-settings:appsfeatures", None)
+}
+
 pub fn default_apps() -> Vec<AppItem> {
     vec![AppItem::new(AppEntry {
         name: "Explorador".into(),

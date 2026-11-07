@@ -52,6 +52,31 @@ const MENU_PAD: f32 = 6.0;
 /// Entrada del menú de energía: duración y desplazamiento inicial hacia abajo.
 const MENU_ANIM: Duration = Duration::from_millis(200);
 const MENU_RISE: f32 = 12.0;
+/// Al buscar, los resultados ocupan la columna izquierda y el detalle del elegido
+/// la derecha, como la búsqueda de Windows 11.
+const LIST_W: f32 = 260.0;
+const DETAIL_X: f32 = PAD + LIST_W + 12.0;
+const DETAIL_W: f32 = WIDTH - PAD - DETAIL_X;
+const DETAIL_ICON: f32 = 56.0;
+const DETAIL_BUTTON_Y: f32 = VIEW_TOP + 196.0;
+const DETAIL_BUTTON_H: f32 = 32.0;
+/// Comienzo de la lista de recientes de la app (su jump list) dentro del detalle.
+const DETAIL_JUMPS_Y: f32 = DETAIL_BUTTON_Y + DETAIL_BUTTON_H + 18.0;
+const JUMP_HEADER_H: f32 = 28.0;
+const JUMP_ROW_H: f32 = 30.0;
+/// Opciones del menú contextual de una app (clic derecho u "Opciones").
+const CMD_OPEN: u32 = 1;
+const CMD_ADMIN: u32 = 2;
+const CMD_LOCATION: u32 = 3;
+const CMD_PIN: u32 = 4;
+const CMD_UNPIN: u32 = 5;
+const CMD_UNINSTALL: u32 = 6;
+/// Glifos de Segoe Fluent Icons de esas opciones, los mismos que usa Windows.
+const GLYPH_OPEN: char = '\u{E8A7}';
+const GLYPH_ADMIN: char = '\u{E7EF}';
+const GLYPH_FOLDER: char = '\u{E838}';
+const GLYPH_UNINSTALL: char = '\u{E74D}';
+const GLYPH_CHEVRON_DOWN: char = '\u{E70D}';
 /// Apertura y cierre del panel: el cierre es algo más corto, como en Windows 11.
 const OPEN_ANIM: Duration = Duration::from_millis(240);
 const CLOSE_ANIM: Duration = Duration::from_millis(160);
@@ -66,13 +91,98 @@ pub enum Hit {
     App(usize),
     Power,
     PowerOption(Power),
-    /// Clic fuera del menú de energía abierto: solo lo cierra.
+    /// Clic fuera del menú abierto (energía o contextual): solo lo cierra.
     Outside,
     ClearSearch,
+    /// Opción `n` del menú contextual abierto.
+    Context(usize),
+    /// Botones del detalle del resultado elegido y elementos de su jump list.
+    DetailOpen,
+    DetailOptions,
+    DetailJump(usize),
 }
 pub enum Action {
     Launch(AppEntry),
     Power(Power),
+    RunAsAdmin(AppEntry),
+    OpenLocation(AppEntry),
+    Pin(AppEntry),
+    Unpin(AppEntry),
+    /// Abre "Aplicaciones instaladas" de Configuración.
+    Uninstall,
+    /// Un elemento de la jump list de la app.
+    Jump(AppEntry, crate::jumplist::JumpItem),
+}
+impl Action {
+    /// Anclar y desanclar dejan el lanzador abierto, como el Inicio de Windows.
+    pub fn closes_launcher(&self) -> bool {
+        !matches!(self, Action::Pin(_) | Action::Unpin(_))
+    }
+}
+
+/// Menú contextual de una app, dibujado dentro del panel. `x` e `y` son su esquina
+/// superior izquierda en coordenadas del panel.
+struct Context {
+    menu: crate::appmenu::AppMenu,
+    x: f32,
+    y: f32,
+    entry: AppEntry,
+}
+
+/// Opciones del menú de `entry`, como el clic derecho del Inicio de Windows 11.
+fn context_entries(entry: &AppEntry, pinned: bool) -> Vec<crate::appmenu::Entry> {
+    use crate::appmenu::{Entry, Icon, GLYPH_PIN, GLYPH_UNPIN};
+    let item = |glyph: char, label: &str, command: u32| Entry::Item {
+        icon: Icon::Glyph(glyph),
+        label: label.into(),
+        command,
+    };
+    let mut entries = vec![item(GLYPH_OPEN, "Abrir", CMD_OPEN)];
+    if !packaged(&entry.command) {
+        entries.push(item(GLYPH_ADMIN, "Ejecutar como administrador", CMD_ADMIN));
+    }
+    if file_path(&entry.command) {
+        entries.push(item(
+            GLYPH_FOLDER,
+            "Abrir ubicación del archivo",
+            CMD_LOCATION,
+        ));
+    }
+    entries.push(if pinned {
+        item(GLYPH_UNPIN, "Desanclar de la barra de tareas", CMD_UNPIN)
+    } else {
+        item(GLYPH_PIN, "Anclar a la barra de tareas", CMD_PIN)
+    });
+    entries.push(Entry::Separator);
+    entries.push(item(GLYPH_UNINSTALL, "Desinstalar", CMD_UNINSTALL));
+    entries
+}
+
+/// App empaquetada (Store): su ruta de AppsFolder lleva "familia!app". Windows no
+/// ofrece ejecutarlas como administrador.
+fn packaged(command: &str) -> bool {
+    command
+        .strip_prefix("shell:AppsFolder\\")
+        .is_some_and(|id| id.contains('!'))
+}
+
+/// Lo que hace la opción `command` del menú contextual de `entry`.
+fn context_action(command: u32, entry: AppEntry) -> Option<Action> {
+    Some(match command {
+        CMD_OPEN => Action::Launch(entry),
+        CMD_ADMIN => Action::RunAsAdmin(entry),
+        CMD_LOCATION => Action::OpenLocation(entry),
+        CMD_PIN => Action::Pin(entry),
+        CMD_UNPIN => Action::Unpin(entry),
+        CMD_UNINSTALL => Action::Uninstall,
+        _ => return None,
+    })
+}
+
+/// La orden es un archivo del disco (programa o acceso directo), con carpeta propia.
+fn file_path(command: &str) -> bool {
+    let bytes = command.as_bytes();
+    (bytes.len() > 2 && bytes[1] == b':' && bytes[2] == b'\\') || command.starts_with("\\\\")
 }
 
 /// Opciones del menú de energía, en el orden en que se muestran.
@@ -137,8 +247,10 @@ pub struct LauncherState {
     pub scroll: f32,
     pub hovered: Option<Hit>,
     pub power_menu: bool,
-    /// Cuándo se abrió el menú de energía, para su animación de entrada.
-    power_opened: Option<Instant>,
+    /// Cuándo se abrió el menú de energía o el contextual, para su animación de entrada.
+    menu_opened: Option<Instant>,
+    /// Menú contextual de una app abierto (clic derecho u "Opciones").
+    context: Option<Context>,
     pub selection: Option<Hit>,
     /// Desplazamiento horizontal del texto de búsqueda cuando no cabe, para que el
     /// cursor siempre se vea.
@@ -154,6 +266,10 @@ pub struct LauncherState {
     loaded: Instant,
     /// Última búsqueda y sus resultados: la vista se recalcula en cada movimiento del ratón.
     search_cache: RefCell<Option<(String, Vec<usize>)>>,
+    /// Iconos grandes del detalle, sin reducir, por orden de la app.
+    detail_icons: HashMap<String, Option<Pixmap>>,
+    /// Jump list de cada app mostrada en el detalle; se vuelve a leer en cada apertura.
+    jumps: HashMap<String, Vec<crate::jumplist::Section>>,
 }
 impl LauncherState {
     pub fn new(pinned: &[AppEntry]) -> Self {
@@ -166,7 +282,8 @@ impl LauncherState {
             scroll: 0.0,
             hovered: None,
             power_menu: false,
-            power_opened: None,
+            menu_opened: None,
+            context: None,
             selection: None,
             search_offset: 0.0,
             user: user_display_name(),
@@ -176,6 +293,8 @@ impl LauncherState {
             view_layer: None,
             loaded: Instant::now(),
             search_cache: RefCell::new(None),
+            detail_icons: HashMap::new(),
+            jumps: HashMap::new(),
         };
         state.refresh(pinned);
         state
@@ -199,7 +318,38 @@ impl LauncherState {
         self.frequent = frequent;
         self.query.clear();
         self.power_menu = false;
+        self.context = None;
+        self.jumps.clear();
         self.reset_results();
+    }
+    /// Pone al día los anclados (tras anclar o desanclar desde el propio lanzador).
+    pub fn set_pinned(&mut self, pinned: &[AppEntry]) {
+        self.pinned = pinned.to_vec();
+        self.hovered = None;
+        self.selection = self.selection.filter(|hit| !matches!(hit, Hit::Pinned(_)));
+        self.scroll = self.scroll.clamp(0.0, self.max_scroll());
+    }
+    fn is_pinned(&self, entry: &AppEntry) -> bool {
+        self.pinned
+            .iter()
+            .any(|p| p.command.eq_ignore_ascii_case(&entry.command))
+    }
+    /// Hay un menú flotante abierto (energía o contextual): el resto no responde.
+    pub fn overlay_open(&self) -> bool {
+        self.power_menu || self.context.is_some()
+    }
+    /// Cierra el menú flotante abierto, si lo hay.
+    pub fn close_overlay(&mut self) -> bool {
+        let open = self.overlay_open();
+        self.power_menu = false;
+        self.context = None;
+        if open {
+            self.selection = self
+                .selection
+                .filter(|hit| !matches!(hit, Hit::PowerOption(_) | Hit::Context(_)));
+            self.hovered = None;
+        }
+        open
     }
     /// Desde ahora los iconos que falten se cargan en segundo plano.
     pub fn load_icons_with(&mut self, loader: IconLoader) {
@@ -269,25 +419,36 @@ impl LauncherState {
             count.div_ceil(COLS) as f32 * TILE_H
         };
         if self.searching() {
+            // Como en Windows: la mejor coincidencia aparte y debajo las demás apps;
+            // el detalle del elegido ocupa la columna derecha.
             let hits = self.filtered();
-            let title = match hits.len() {
-                0 => "Sin resultados".to_string(),
-                1 => "1 resultado".to_string(),
-                n => format!("{n} resultados"),
-            };
-            headers.push((title, y));
-            y += HEADER_H;
+            if hits.is_empty() {
+                headers.push(("Sin resultados".to_string(), y));
+                y += HEADER_H;
+            }
             for (n, index) in hits.into_iter().enumerate() {
+                if n < 2 {
+                    let title = if n == 0 {
+                        "Mejor coincidencia"
+                    } else {
+                        "Aplicaciones"
+                    };
+                    if n == 1 {
+                        y += SECTION_GAP;
+                    }
+                    headers.push((title.to_string(), y));
+                    y += HEADER_H;
+                }
                 slots.push(Slot {
                     hit: Hit::App(index),
                     x: 0.0,
-                    y: y + n as f32 * ROW_H,
-                    w: CONTENT_W,
+                    y,
+                    w: LIST_W,
                     h: ROW_H - 4.0,
                     row: true,
                 });
+                y += ROW_H;
             }
-            y += slots.len() as f32 * ROW_H;
             return Layout {
                 headers,
                 slots,
@@ -351,9 +512,9 @@ impl LauncherState {
     }
 
     /// Aplica una edición al campo de búsqueda; si cambia el texto, la vista vuelve
-    /// al principio de los resultados. Con el menú de energía abierto no se edita.
+    /// al principio de los resultados. Con un menú flotante abierto no se edita.
     pub fn edit<R>(&mut self, change: impl FnOnce(&mut TextField) -> R) -> Option<R> {
-        if self.power_menu {
+        if self.overlay_open() {
             return None;
         }
         let before = self.query.text().to_string();
@@ -390,6 +551,12 @@ impl LauncherState {
     /// Mueve la selección con las flechas: izquierda/derecha siguen el orden de lectura;
     /// arriba/abajo saltan al elemento más cercano en esa dirección, entre secciones.
     pub fn move_selection(&mut self, dx: i32, dy: i32) {
+        if let Some(context) = &mut self.context {
+            // En el menú contextual las flechas recorren sus opciones.
+            context.menu.move_hover(dy > 0 || (dy == 0 && dx > 0));
+            self.hovered = None;
+            return;
+        }
         if self.power_menu {
             // En el menú de energía las flechas recorren sus opciones.
             let current = match self.selection {
@@ -454,6 +621,14 @@ impl LauncherState {
         }
     }
     pub fn activate(&mut self, hit: Hit) -> Option<Action> {
+        if let Some(context) = self.context.take() {
+            // Igual que el de energía: cualquier clic lo cierra; solo sus opciones actúan.
+            self.hovered = None;
+            let Hit::Context(index) = hit else {
+                return None;
+            };
+            return context_action(context.menu.command(index)?, context.entry);
+        }
         if self.power_menu {
             // Con el menú abierto, cualquier clic lo cierra; solo sus opciones actúan.
             self.power_menu = false;
@@ -474,16 +649,149 @@ impl LauncherState {
             }
             Hit::Power => {
                 self.power_menu = true;
-                self.power_opened = animations_enabled().then(Instant::now);
+                self.menu_opened = animations_enabled().then(Instant::now);
                 self.selection = None;
                 self.hovered = None;
+            }
+            Hit::DetailOpen => return self.detail_entry().cloned().map(Action::Launch),
+            Hit::DetailOptions => {
+                let (x, y, _, h) = Self::detail_options_rect();
+                self.open_context(Hit::DetailOptions, x, y + h + 4.0);
+            }
+            Hit::DetailJump(index) => {
+                let entry = self.detail_entry()?.clone();
+                let item = self.jump_item(&entry, index)?.clone();
+                return Some(Action::Jump(entry, item));
             }
             _ => {}
         }
         None
     }
+    /// Lo que hay bajo el cursor pasa a resaltarse; en el menú contextual, su opción.
+    pub fn set_hovered(&mut self, hit: Option<Hit>) {
+        self.hovered = hit;
+        if let Some(context) = &mut self.context {
+            context.menu.hovered = match hit {
+                Some(Hit::Context(index)) => Some(index),
+                _ => None,
+            };
+        }
+    }
+    /// Abre el menú contextual de la app de `hit` con su esquina en (`x`, `y`), sin
+    /// salirse del panel. Devuelve si había una app ahí.
+    pub fn open_context(&mut self, hit: Hit, x: f32, y: f32) -> bool {
+        let entry = match hit {
+            Hit::DetailOpen | Hit::DetailOptions => self.detail_entry(),
+            _ => self.entry(hit),
+        };
+        let Some(entry) = entry.cloned() else {
+            return false;
+        };
+        let menu = crate::appmenu::AppMenu::new(context_entries(&entry, self.is_pinned(&entry)));
+        let (w, h) = menu.size();
+        let x = x.min(WIDTH - 8.0 - w).max(8.0);
+        // Debajo del cursor si cabe; si no, encima, como los menús de Windows.
+        let y = if y + h > HEIGHT - 8.0 {
+            (y - h).max(8.0)
+        } else {
+            y
+        };
+        self.power_menu = false;
+        self.context = Some(Context { menu, x, y, entry });
+        self.menu_opened = animations_enabled().then(Instant::now);
+        self.hovered = None;
+        true
+    }
+    /// Tecla de menú (o Mayús+F10): el menú de la app elegida, con su primera
+    /// opción resaltada. Al buscar, el del resultado del detalle bajo "Opciones".
+    pub fn open_context_from_keyboard(&mut self) -> bool {
+        if self.overlay_open() {
+            return false;
+        }
+        let opened = if self.searching() {
+            let (x, y, _, h) = Self::detail_options_rect();
+            self.open_context(Hit::DetailOptions, x, y + h + 4.0)
+        } else {
+            let slot = self
+                .selection
+                .and_then(|hit| self.layout().slots.into_iter().find(|s| s.hit == hit));
+            match slot {
+                Some(slot) => {
+                    let (cx, cy) = slot.center();
+                    self.open_context(slot.hit, PAD + cx, VIEW_TOP + cy - self.scroll)
+                }
+                None => false,
+            }
+        };
+        if let Some(context) = &mut self.context {
+            context.menu.move_hover(true);
+        }
+        opened
+    }
+    /// Resultado cuyo detalle se muestra al buscar: el elegido con las flechas o,
+    /// si no hay, la mejor coincidencia.
+    fn detail_hit(&self) -> Option<Hit> {
+        if !self.searching() {
+            return None;
+        }
+        let slots = self.layout().slots;
+        self.selection
+            .filter(|hit| slots.iter().any(|s| s.hit == *hit))
+            .or_else(|| slots.first().map(|s| s.hit))
+    }
+    fn detail_entry(&self) -> Option<&AppEntry> {
+        self.entry(self.detail_hit()?)
+    }
+    /// Elemento `index` de la jump list de `entry`, contando sección tras sección.
+    fn jump_item(&self, entry: &AppEntry, index: usize) -> Option<&crate::jumplist::JumpItem> {
+        self.jumps
+            .get(&entry.command)?
+            .iter()
+            .flat_map(|s| &s.items)
+            .nth(index)
+    }
+    /// Filas de la jump list del detalle que caben: (arriba, elemento, texto). Los
+    /// títulos de sección no llevan elemento.
+    fn jump_rows(&self) -> Vec<(f32, Option<usize>, String)> {
+        let Some(sections) = self
+            .detail_entry()
+            .and_then(|entry| self.jumps.get(&entry.command))
+        else {
+            return Vec::new();
+        };
+        let bottom = VIEW_TOP + VIEW_H - 8.0;
+        let mut rows = Vec::new();
+        let (mut y, mut index) = (DETAIL_JUMPS_Y, 0);
+        for section in sections {
+            if !section.items.is_empty() && y + JUMP_HEADER_H + JUMP_ROW_H <= bottom {
+                rows.push((y, None, section.title.clone()));
+                y += JUMP_HEADER_H;
+                for item in &section.items {
+                    if y + JUMP_ROW_H <= bottom {
+                        rows.push((y, Some(index), item.name.clone()));
+                        y += JUMP_ROW_H;
+                    }
+                    index += 1;
+                }
+            } else {
+                index += section.items.len();
+            }
+        }
+        rows
+    }
+    fn detail_open_rect() -> (f32, f32, f32, f32) {
+        let w = (DETAIL_W - 48.0) / 2.0;
+        (DETAIL_X + 20.0, DETAIL_BUTTON_Y, w, DETAIL_BUTTON_H)
+    }
+    fn detail_options_rect() -> (f32, f32, f32, f32) {
+        let (x, y, w, h) = Self::detail_open_rect();
+        (x + w + 8.0, y, w, h)
+    }
     /// Elemento que abre Enter: el seleccionado o, al buscar, el primer resultado.
     pub fn first_match(&self) -> Option<Hit> {
+        if let Some(context) = &self.context {
+            return context.menu.hovered.map(Hit::Context);
+        }
         if self.power_menu {
             return self
                 .selection
@@ -524,6 +832,17 @@ impl LauncherState {
         let within = |left: f32, top: f32, width: f32, height: f32| {
             x >= left && x < left + width && y >= top && y < top + height
         };
+        if let Some(context) = &self.context {
+            let (w, h) = context.menu.size();
+            if !within(context.x, context.y, w, h) {
+                return Some(Hit::Outside);
+            }
+            // Títulos y separadores no responden, pero tampoco cierran el menú.
+            return context
+                .menu
+                .hit_test(x - context.x, y - context.y)
+                .map(Hit::Context);
+        }
         if self.power_menu {
             let (px, py, ps) = Self::power_button();
             if within(px, py, ps, ps) {
@@ -547,6 +866,26 @@ impl LauncherState {
         }
         if !(VIEW_TOP..VIEW_TOP + VIEW_H).contains(&y) {
             return None;
+        }
+        if self.searching() && x >= DETAIL_X - 6.0 {
+            if self.detail_entry().is_none() {
+                return None;
+            }
+            let (ox, oy, ow, oh) = Self::detail_open_rect();
+            if within(ox, oy, ow, oh) {
+                return Some(Hit::DetailOpen);
+            }
+            let (ox, oy, ow, oh) = Self::detail_options_rect();
+            if within(ox, oy, ow, oh) {
+                return Some(Hit::DetailOptions);
+            }
+            return self
+                .jump_rows()
+                .into_iter()
+                .find(|(top, item, _)| {
+                    item.is_some() && within(DETAIL_X + 12.0, *top, DETAIL_W - 24.0, JUMP_ROW_H)
+                })
+                .and_then(|(_, item, _)| item.map(Hit::DetailJump));
         }
         let (cx, cy) = (x - PAD, y - VIEW_TOP + self.scroll);
         self.layout()
@@ -581,9 +920,13 @@ impl LauncherState {
         );
         self.draw_search(image, scale);
         self.draw_view(image, scale);
+        if self.searching() {
+            self.draw_detail(image, scale);
+        }
         if self.power_menu {
             self.draw_power_menu(image, scale, self.menu_progress());
         }
+        self.draw_context(image, scale, self.menu_progress());
     }
 
     fn draw_search(&mut self, image: &mut Pixmap, scale: f32) {
@@ -753,30 +1096,34 @@ impl LauncherState {
                 0.55,
             );
         }
+        // Al buscar, el resultado del detalle queda marcado, como en Windows.
+        let detail = self.detail_hit();
         for slot in layout.slots.iter().filter(|s| visible(s.y, s.h)) {
             let Some(entry) = self.entry(slot.hit).cloned() else {
                 continue;
             };
             let (x, y) = (PAD + slot.x, top(slot.y));
-            let marked = self.hovered == Some(slot.hit) || self.selection == Some(slot.hit);
-            if marked {
+            let chosen = self.selection == Some(slot.hit) || detail == Some(slot.hit);
+            if chosen || self.hovered == Some(slot.hit) {
                 fill_rounded(
                     &mut view,
-                    [
-                        255,
-                        255,
-                        255,
-                        if self.selection == Some(slot.hit) {
-                            26
-                        } else {
-                            18
-                        },
-                    ],
+                    [255, 255, 255, if chosen { 26 } else { 18 }],
                     (x + 2.0) * scale,
                     y * scale,
                     (slot.w - 4.0) * scale,
                     slot.h * scale,
                     6.0 * scale,
+                );
+            }
+            if detail == Some(slot.hit) {
+                fill_rounded(
+                    &mut view,
+                    crate::accent::with_alpha(crate::accent::current().light, 255),
+                    (x + 2.0) * scale,
+                    (y + slot.h / 2.0 - 8.0) * scale,
+                    3.0 * scale,
+                    16.0 * scale,
+                    1.5 * scale,
                 );
             }
             if slot.row {
@@ -813,10 +1160,16 @@ impl LauncherState {
             let track = VIEW_H - 8.0;
             let thumb = (track * VIEW_H / layout.height).max(32.0);
             let thumb_y = 4.0 + (track - thumb) * self.scroll / max;
+            // Al buscar, junto a la lista de resultados, a la izquierda del detalle.
+            let bar_x = if self.searching() {
+                PAD + LIST_W + 3.0
+            } else {
+                WIDTH - 12.0
+            };
             fill_rounded(
                 &mut view,
                 [255, 255, 255, 70],
-                (WIDTH - 12.0) * scale,
+                bar_x * scale,
                 thumb_y * scale,
                 3.0 * scale,
                 thumb * scale,
@@ -920,14 +1273,14 @@ impl LauncherState {
     /// (curva cúbica), como los menús flotantes de Windows 11.
     fn menu_progress(&self) -> f32 {
         ease_out(
-            self.power_opened
+            self.menu_opened
                 .map(|t| t.elapsed().as_secs_f32() / MENU_ANIM.as_secs_f32())
                 .unwrap_or(1.0),
         )
     }
     /// El menú sigue entrando y hace falta redibujar el siguiente fotograma.
     pub fn animating(&self) -> bool {
-        self.power_menu && self.menu_progress() < 1.0
+        self.overlay_open() && self.menu_progress() < 1.0
     }
 
     /// Menú flotante de energía, como el del Inicio de Windows 11. Se dibuja en una
@@ -1008,6 +1361,192 @@ impl LauncherState {
         image.draw_pixmap(
             (gx * scale).round() as i32,
             ((gy + (1.0 - progress) * MENU_RISE) * scale).round() as i32,
+            layer.as_ref(),
+            &PixmapPaint {
+                opacity: progress,
+                ..Default::default()
+            },
+            Transform::identity(),
+            None,
+        );
+    }
+
+    /// Detalle del resultado elegido, como la búsqueda de Windows 11: nombre, icono
+    /// grande, "Abrir" y "Opciones", y debajo la jump list de la app.
+    fn draw_detail(&mut self, image: &mut Pixmap, scale: f32) {
+        let Some(entry) = self.detail_entry().cloned() else {
+            return;
+        };
+        let command = entry.command.clone();
+        let big = (DETAIL_ICON * scale).round().max(1.0) as u32;
+        let icon = self
+            .detail_icons
+            .entry(command.clone())
+            .or_insert_with(|| {
+                crate::icons::load(&command).map(|icon| {
+                    if icon.width() > big {
+                        crate::apps::downscale(&icon, big)
+                    } else {
+                        icon
+                    }
+                })
+            })
+            .clone();
+        self.jumps.entry(command.clone()).or_insert_with(|| {
+            crate::jumplist::app_id(&command, &[])
+                .map(|id| crate::jumplist::sections(&id))
+                .unwrap_or_default()
+        });
+
+        let s = |v: f32| v * scale;
+        let (x, y, w, h) = (DETAIL_X, VIEW_TOP, DETAIL_W, VIEW_H);
+        fill_rounded(image, [255, 255, 255, 10], s(x), s(y), s(w), s(h), s(8.0));
+        stroke_rounded(
+            image,
+            [255, 255, 255, 18],
+            s(x),
+            s(y),
+            s(w),
+            s(h),
+            s(8.0),
+            scale * 0.75,
+        );
+        let name = fit_text(&entry.name, s(16.0), s(w - 40.0));
+        draw_text_semibold(image, &name, s(x + 20.0), s(y + 18.0), s(16.0), 0.95);
+        self.text(image, "Aplicación", x + 20.0, y + 42.0, 12.0, scale, 0.55);
+
+        // Tarjeta con el icono grande.
+        let (cx, cy, cw, ch) = (x + 20.0, y + 70.0, w - 40.0, 112.0);
+        fill_rounded(
+            image,
+            [255, 255, 255, 8],
+            s(cx),
+            s(cy),
+            s(cw),
+            s(ch),
+            s(6.0),
+        );
+        stroke_rounded(
+            image,
+            [255, 255, 255, 20],
+            s(cx),
+            s(cy),
+            s(cw),
+            s(ch),
+            s(6.0),
+            scale * 0.75,
+        );
+        if let Some(icon) = &icon {
+            blit(
+                image,
+                icon,
+                s(cx + (cw - DETAIL_ICON) / 2.0),
+                s(cy + (ch - DETAIL_ICON) / 2.0),
+                s(DETAIL_ICON),
+            );
+        }
+
+        // "Abrir" y "Opciones", con el resaltado al pasar el cursor.
+        for (hit, (bx, by, bw, bh)) in [
+            (Hit::DetailOpen, Self::detail_open_rect()),
+            (Hit::DetailOptions, Self::detail_options_rect()),
+        ] {
+            let active =
+                self.hovered == Some(hit) || (hit == Hit::DetailOptions && self.context.is_some());
+            fill_rounded(
+                image,
+                [255, 255, 255, if active { 30 } else { 16 }],
+                s(bx),
+                s(by),
+                s(bw),
+                s(bh),
+                s(4.0),
+            );
+            let label = if hit == Hit::DetailOpen {
+                "Abrir"
+            } else {
+                "Opciones"
+            };
+            let size = 13.0;
+            let label_w = text_width(label, s(size)) / scale;
+            let extra = if hit == Hit::DetailOptions { 18.0 } else { 0.0 };
+            let lx = bx + (bw - label_w - extra) / 2.0;
+            self.text(image, label, lx, by + 8.0, size, scale, 0.95);
+            if hit == Hit::DetailOptions {
+                draw_icon(
+                    image,
+                    GLYPH_CHEVRON_DOWN,
+                    s(lx + label_w + 12.0),
+                    s(by + bh / 2.0),
+                    s(10.0),
+                    0.8,
+                );
+            }
+        }
+
+        // Jump list: recientes, frecuentes y tareas de la app, hasta donde quepan.
+        for (top, item, label) in self.jump_rows() {
+            match item {
+                None => draw_text_semibold(image, &label, s(x + 20.0), s(top + 7.0), s(13.0), 0.9),
+                Some(index) => {
+                    if self.hovered == Some(Hit::DetailJump(index)) {
+                        fill_rounded(
+                            image,
+                            [255, 255, 255, 18],
+                            s(x + 12.0),
+                            s(top),
+                            s(w - 24.0),
+                            s(JUMP_ROW_H - 2.0),
+                            s(4.0),
+                        );
+                    }
+                    if let Some(icon) = &icon {
+                        blit(image, icon, s(x + 20.0), s(top + 6.0), s(16.0));
+                    }
+                    let label = fit_text(&label, s(13.0), s(w - 72.0));
+                    self.text(image, &label, x + 46.0, top + 6.0, 13.0, scale, 0.9);
+                }
+            }
+        }
+    }
+
+    /// Menú contextual de una app, dentro del panel. Entra como el de energía.
+    fn draw_context(&self, image: &mut Pixmap, scale: f32, progress: f32) {
+        let Some(context) = &self.context else {
+            return;
+        };
+        let (w, h) = context.menu.size();
+        let margin = 4.0;
+        let Some(mut layer) = Pixmap::new(
+            ((w + margin * 2.0) * scale).ceil() as u32,
+            ((h + margin * 2.0) * scale).ceil() as u32,
+        ) else {
+            return;
+        };
+        // Sombra y una base opaca: el fondo del menú es translúcido y aquí no hay
+        // desenfoque debajo, solo el contenido del panel.
+        fill_rounded(
+            &mut layer,
+            [0, 0, 0, 60],
+            (margin - 1.0) * scale,
+            (margin + 2.0) * scale,
+            (w + 2.0) * scale,
+            (h + 2.0) * scale,
+            9.0 * scale,
+        );
+        fill_rounded(
+            &mut layer,
+            [36, 36, 38, 255],
+            (margin + 0.5) * scale,
+            (margin + 0.5) * scale,
+            (w - 1.0) * scale,
+            (h - 1.0) * scale,
+            8.0 * scale,
+        );
+        context.menu.draw_at(&mut layer, scale, margin, margin);
+        image.draw_pixmap(
+            ((context.x - margin) * scale).round() as i32,
+            ((context.y - margin + (1.0 - progress) * MENU_RISE * 0.5) * scale).round() as i32,
             layer.as_ref(),
             &PixmapPaint {
                 opacity: progress,
@@ -1181,6 +1720,23 @@ fn rank(
     (recent, frequent)
 }
 
+/// Dibuja `icon` con su esquina en (`x`, `y`) y `side` píxeles de lado.
+fn blit(image: &mut Pixmap, icon: &Pixmap, x: f32, y: f32, side: f32) {
+    let transform = Transform::from_scale(side / icon.width() as f32, side / icon.height() as f32)
+        .post_translate(x.round(), y.round());
+    image.draw_pixmap(
+        0,
+        0,
+        icon.as_ref(),
+        &PixmapPaint {
+            quality: FilterQuality::Bicubic,
+            ..Default::default()
+        },
+        transform,
+        None,
+    );
+}
+
 fn stroke(image: &mut Pixmap, path: tiny_skia::Path, scale: f32) {
     let mut paint = tiny_skia::Paint {
         anti_alias: true,
@@ -1351,7 +1907,8 @@ mod tests {
             scroll: 0.0,
             hovered: None,
             power_menu: false,
-            power_opened: None,
+            menu_opened: None,
+            context: None,
             selection: None,
             search_offset: 0.0,
             user: "Usuario de prueba".into(),
@@ -1361,6 +1918,8 @@ mod tests {
             view_layer: None,
             loaded: Instant::now(),
             search_cache: RefCell::new(None),
+            detail_icons: HashMap::new(),
+            jumps: HashMap::new(),
         }
     }
     fn many(prefix: &str, count: usize) -> Vec<AppEntry> {
@@ -1635,11 +2194,11 @@ mod tests {
         assert!(ease_out(0.5) > 0.5);
         assert_eq!(ease_out(2.0), 1.0);
         menu.power_menu = true;
-        menu.power_opened = None;
+        menu.menu_opened = None;
         assert!(!menu.animating());
-        menu.power_opened = Some(Instant::now());
+        menu.menu_opened = Some(Instant::now());
         assert!(menu.animating());
-        menu.power_opened = Instant::now().checked_sub(MENU_ANIM * 2);
+        menu.menu_opened = Instant::now().checked_sub(MENU_ANIM * 2);
         assert!(!menu.animating());
     }
 
@@ -1703,5 +2262,126 @@ mod tests {
         assert_eq!(menu.first_match(), Some(Hit::PowerOption(Power::Restart)));
         menu.move_selection(0, -1);
         assert_eq!(menu.first_match(), Some(Hit::PowerOption(Power::Shutdown)));
+    }
+
+    /// Opciones del menú contextual abierto, en orden.
+    fn context_labels(menu: &LauncherState) -> Vec<String> {
+        menu.context
+            .as_ref()
+            .unwrap()
+            .menu
+            .entries
+            .iter()
+            .filter_map(|e| match e {
+                crate::appmenu::Entry::Item { label, .. } => Some(label.clone()),
+                _ => None,
+            })
+            .collect()
+    }
+
+    /// Centro de la opción con ese texto en el menú contextual, en el panel.
+    fn context_point(menu: &LauncherState, label: &str) -> (f32, f32) {
+        let context = menu.context.as_ref().unwrap();
+        let (w, h) = context.menu.size();
+        (0..h as i32)
+            .map(|y| (context.x + w / 2.0, context.y + y as f32))
+            .find(|&(x, y)| {
+                matches!(menu.hit_test(x, y), Some(Hit::Context(i))
+                    if matches!(&context.menu.entries[i],
+                        crate::appmenu::Entry::Item { label: l, .. } if l == label))
+            })
+            .unwrap()
+    }
+
+    #[test]
+    fn right_click_opens_the_app_menu_and_its_options_act() {
+        let mut menu = state();
+        menu.pinned = vec![entry("Explorador", "C:\\Windows\\explorer.exe")];
+        let (x, y) = point_of(&menu, Hit::Pinned(0));
+        assert!(menu.open_context(Hit::Pinned(0), x, y));
+        assert!(menu.overlay_open());
+        assert_eq!(
+            context_labels(&menu),
+            [
+                "Abrir",
+                "Ejecutar como administrador",
+                "Abrir ubicación del archivo",
+                "Desanclar de la barra de tareas",
+                "Desinstalar",
+            ]
+        );
+        // El menú queda dentro del panel; con él abierto no se escribe.
+        let context = menu.context.as_ref().unwrap();
+        let (w, h) = context.menu.size();
+        assert!(context.x >= 0.0 && context.x + w <= WIDTH);
+        assert!(context.y >= 0.0 && context.y + h <= HEIGHT);
+        assert!(menu.edit(|field| field.insert("x")).is_none());
+
+        let (ux, uy) = context_point(&menu, "Desanclar de la barra de tareas");
+        let hit = menu.hit_test(ux, uy).unwrap();
+        assert!(matches!(menu.activate(hit), Some(Action::Unpin(e)) if e.name == "Explorador"));
+        assert!(!menu.overlay_open());
+
+        // Una app de la Store: sin administrador ni ubicación; sin anclar, "Anclar".
+        menu.apps
+            .push(entry("Spotify", "shell:AppsFolder\\SpotifyAB.Test!Spotify"));
+        menu.insert_text("spotify");
+        let hit = menu.first_match().unwrap();
+        let (x, y) = point_of(&menu, hit);
+        assert!(menu.open_context(hit, x, y));
+        assert_eq!(
+            context_labels(&menu),
+            ["Abrir", "Anclar a la barra de tareas", "Desinstalar"]
+        );
+        // Clic fuera: se cierra sin hacer nada.
+        assert_eq!(
+            menu.hit_test(WIDTH - 10.0, HEIGHT - 10.0),
+            Some(Hit::Outside)
+        );
+        assert!(menu.activate(Hit::Outside).is_none());
+        assert!(menu.context.is_none());
+    }
+
+    #[test]
+    fn search_shows_the_best_match_in_the_detail_with_its_actions() {
+        let mut menu = state();
+        menu.insert_text("editor");
+        let layout = menu.layout();
+        let titles: Vec<_> = layout.headers.iter().map(|(t, _)| t.as_str()).collect();
+        assert_eq!(titles, ["Mejor coincidencia", "Aplicaciones"]);
+        // Los resultados dejan sitio al detalle, a su derecha.
+        assert!(layout.slots.iter().all(|s| PAD + s.x + s.w < DETAIL_X));
+        let best = menu.first_match().unwrap();
+        assert_eq!(menu.detail_hit(), Some(best));
+
+        let (x, y, w, h) = LauncherState::detail_open_rect();
+        let open = (x + w / 2.0, y + h / 2.0);
+        assert_eq!(menu.hit_test(open.0, open.1), Some(Hit::DetailOpen));
+        let launched = |menu: &mut LauncherState| match menu.activate(Hit::DetailOpen) {
+            Some(Action::Launch(e)) => e.name,
+            _ => panic!("debía abrir la app del detalle"),
+        };
+        let first = launched(&mut menu);
+        // Con las flechas el detalle pasa al resultado elegido.
+        menu.move_selection(0, 1);
+        menu.move_selection(0, 1);
+        assert_ne!(menu.detail_hit(), Some(best));
+        assert_ne!(launched(&mut menu), first);
+
+        // "Opciones" abre el menú de esa app debajo del botón; Esc (cerrar) lo quita.
+        let (x, y, w, h) = LauncherState::detail_options_rect();
+        assert_eq!(
+            menu.hit_test(x + w / 2.0, y + h / 2.0),
+            Some(Hit::DetailOptions)
+        );
+        assert!(menu.activate(Hit::DetailOptions).is_none());
+        assert!(menu.context.as_ref().unwrap().y >= y + h);
+        assert!(menu.close_overlay());
+        // La tecla de menú lo abre con la primera opción resaltada; Enter la elige.
+        assert!(menu.open_context_from_keyboard());
+        assert!(matches!(
+            menu.first_match().and_then(|hit| menu.activate(hit)),
+            Some(Action::Launch(_))
+        ));
     }
 }

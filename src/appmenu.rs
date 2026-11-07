@@ -242,7 +242,7 @@ impl AppMenu {
 
     /// Dibuja el menú con su esquina superior izquierda en (`ox`, `oy`), en
     /// unidades lógicas, sin borrar lo que ya hay.
-    fn draw_at(&self, image: &mut Pixmap, scale: f32, ox: f32, oy: f32) {
+    pub fn draw_at(&self, image: &mut Pixmap, scale: f32, ox: f32, oy: f32) {
         let (w, h) = self.size();
         let s = |v: f32| v * scale;
         // Panel oscuro como los menús de Windows 11.
