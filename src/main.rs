@@ -2137,7 +2137,7 @@ impl App {
     fn pins_changed(&mut self) {
         self.save_pins();
         self.relayout();
-        self.visibility.reveal();
+        self.reveal();
         self.visibility
             .defer_hide(Instant::now(), Duration::from_millis(1200));
         self.start_animating();
@@ -2313,13 +2313,18 @@ impl App {
     }
 
     fn expand(&mut self) {
+        self.reveal();
+        self.start_animating();
+    }
+
+    /// Hace que el dock se muestre. Escondido no se mira la pantalla (ver
+    /// `TIMER_TICK`): se mira al salir, para que aparezca ya con su apariencia.
+    fn reveal(&mut self) {
         let hidden = !self.visibility.expanded;
         self.visibility.reveal();
-        // Escondido no se mira la pantalla (ver `TIMER_TICK`): se mira al salir.
         if hidden {
             self.update_style();
         }
-        self.start_animating();
     }
 
     /// Actualiza únicamente la posición física de la ventana en pantalla sin redibujar
