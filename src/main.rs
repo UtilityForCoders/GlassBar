@@ -106,6 +106,8 @@ const TIMER_ANNOUNCE: usize = 5;
 /// Buscar actualizaciones: una vez poco después de arrancar y luego cada 6 horas.
 const TIMER_UPDATE_FIRST: usize = 6;
 const TIMER_UPDATE: usize = 7;
+/// Parpadeo del cursor del texto en el buscador del lanzador.
+const TIMER_CARET: usize = 8;
 
 /// Refresco del reloj y verificación de apps activas.
 const TICK_MS: u32 = 1000;
@@ -203,6 +205,8 @@ impl Drop for Surface {
 /// Globo con el nombre del programa bajo el cursor; no recibe clics ni foco.
 struct Tooltip {
     hwnd: HWND,
+    /// Desenfoque de debajo, como el del dock.
+    backdrop: Option<style::Backdrop>,
     surface: Option<Surface>,
     visible: bool,
 }
@@ -230,6 +234,7 @@ impl Tooltip {
         };
         Ok(Self {
             hwnd,
+            backdrop: style::Backdrop::new(),
             surface: None,
             visible: false,
         })
@@ -247,7 +252,7 @@ impl Tooltip {
         surface.pixmap.fill(tiny_skia::Color::TRANSPARENT);
         apps::fill_rounded(
             &mut surface.pixmap,
-            [32, 32, 32, 235],
+            glass::panel(),
             0.5,
             0.5,
             w - 1.0,
@@ -314,6 +319,10 @@ impl Tooltip {
                 SWP_NOMOVE | SWP_NOSIZE | SWP_NOACTIVATE,
             );
         }
+        if let Some(backdrop) = &self.backdrop {
+            let shape = style::Shape::inset(width, height, 0.5, 7.0 * scale);
+            backdrop.under(self.hwnd, surface_rect(pos, &surface), &[shape], 1.0);
+        }
         self.surface = Some(surface);
         self.visible = true;
     }
@@ -322,6 +331,9 @@ impl Tooltip {
             unsafe {
                 let _ = ShowWindow(self.hwnd, SW_HIDE);
             }
+            if let Some(backdrop) = &self.backdrop {
+                backdrop.hide();
+            }
             self.visible = false;
         }
     }
@@ -329,6 +341,8 @@ impl Tooltip {
 
 struct LauncherWindow {
     hwnd: HWND,
+    /// Desenfoque de debajo, como el del dock.
+    backdrop: Option<style::Backdrop>,
     surface: Surface,
     pos: POINT,
     scale: f32,
@@ -380,6 +394,7 @@ impl LauncherWindow {
         ));
         Ok(Self {
             hwnd,
+            backdrop: style::Backdrop::new(),
             surface,
             pos,
             scale,
@@ -412,6 +427,8 @@ impl LauncherWindow {
             &self.transition,
             self.visible,
             animating,
+            self.backdrop.as_ref(),
+            &[panel_shape(&self.surface, self.scale, 12.0)],
         );
     }
     fn show(&mut self) {
@@ -419,11 +436,16 @@ impl LauncherWindow {
         self.transition.open(Instant::now());
         self.render();
         take_focus(self.hwnd);
+        restart_caret(self.hwnd);
     }
     /// Empieza el cierre; la ventana se oculta cuando termina de desvanecerse.
     fn hide(&mut self) {
         if !self.visible {
             return;
+        }
+        unsafe {
+            let _ =
+                windows::Win32::UI::WindowsAndMessaging::KillTimer(Some(self.hwnd), TIMER_CARET);
         }
         self.visible = false;
         self.transition.close(Instant::now());
@@ -441,6 +463,7 @@ impl Drop for LauncherWindow {
 /// Pone en pantalla un panel emergente (lanzador o panel rápido) ya dibujado, con la
 /// opacidad y la posición de su transición. Mientras algo se mueve, un temporizador
 /// pide el siguiente fotograma; al terminar de cerrarse, oculta la ventana.
+#[allow(clippy::too_many_arguments)]
 fn present_popup(
     hwnd: HWND,
     surface: &Surface,
@@ -449,6 +472,8 @@ fn present_popup(
     transition: &launcher::Transition,
     visible: bool,
     animating: bool,
+    backdrop: Option<&style::Backdrop>,
+    shapes: &[style::Shape],
 ) {
     let now = Instant::now();
     let shown = transition.shown(now);
@@ -461,6 +486,9 @@ fn present_popup(
         }
         if !visible && !running {
             let _ = ShowWindow(hwnd, SW_HIDE);
+            if let Some(backdrop) = backdrop {
+                backdrop.hide();
+            }
             return;
         }
     }
@@ -468,6 +496,9 @@ fn present_popup(
         x: pos.x,
         y: pos.y + (transition.offset(now) * scale).round() as i32,
     };
+    if let Some(backdrop) = backdrop {
+        backdrop.under(hwnd, surface_rect(pos, surface), shapes, shown);
+    }
     let blend = BLENDFUNCTION {
         BlendOp: AC_SRC_OVER as u8,
         SourceConstantAlpha: (shown * 255.0).round() as u8,
@@ -490,6 +521,22 @@ fn present_popup(
             ULW_ALPHA,
         );
     }
+}
+
+/// Rectángulo en pantalla de una superficie con su esquina en `pos`.
+fn surface_rect(pos: POINT, surface: &Surface) -> windows::Win32::Foundation::RECT {
+    windows::Win32::Foundation::RECT {
+        left: pos.x,
+        top: pos.y,
+        right: pos.x + surface.width as i32,
+        bottom: pos.y + surface.height as i32,
+    }
+}
+
+/// El panel de una superficie, dibujado a `scale` de cada borde y con esquinas de
+/// `radius` (las dos en unidades lógicas), para el desenfoque de debajo.
+fn panel_shape(surface: &Surface, scale: f32, radius: f32) -> style::Shape {
+    style::Shape::inset(surface.width, surface.height, scale, radius * scale)
 }
 
 /// Muestra un panel emergente y le da el foco, para que se cierre al hacer clic fuera.
@@ -530,6 +577,8 @@ fn take_focus(hwnd: HWND) {
 /// Panel rápido (Wi-Fi, Bluetooth, brillo y volumen) sobre los iconos de estado.
 struct QuickWindow {
     hwnd: HWND,
+    /// Desenfoque de debajo, como el del dock.
+    backdrop: Option<style::Backdrop>,
     surface: Surface,
     pos: POINT,
     scale: f32,
@@ -563,6 +612,7 @@ impl QuickWindow {
         };
         Ok(Self {
             hwnd,
+            backdrop: style::Backdrop::new(),
             surface,
             pos: POINT::default(),
             scale,
@@ -599,6 +649,8 @@ impl QuickWindow {
             &self.transition,
             self.visible,
             false,
+            self.backdrop.as_ref(),
+            &[panel_shape(&self.surface, self.scale, 12.0)],
         );
     }
     /// Cambia entre la vista principal y la de redes. La de redes es más alta: el
@@ -1119,6 +1171,20 @@ fn run_power(option: launcher::Power) -> bool {
     }
 }
 
+/// (Re)empieza el parpadeo del cursor del buscador con el ritmo que tenga Windows,
+/// para que no se apague justo al escribir. Sin parpadeo en Windows, queda fijo.
+fn restart_caret(hwnd: HWND) {
+    use windows::Win32::UI::WindowsAndMessaging::{GetCaretBlinkTime, KillTimer, SetTimer};
+    unsafe {
+        let period = GetCaretBlinkTime();
+        if period == 0 || period == u32::MAX {
+            let _ = KillTimer(Some(hwnd), TIMER_CARET);
+        } else {
+            SetTimer(Some(hwnd), TIMER_CARET, period, None);
+        }
+    }
+}
+
 /// Lee el catálogo y los iconos de la vista inicial en otro hilo.
 fn prepare_launcher(
     pinned: &[apps::AppEntry],
@@ -1140,10 +1206,46 @@ unsafe extern "system" fn launcher_wndproc(
     lparam: LPARAM,
 ) -> LRESULT {
     use windows::Win32::UI::WindowsAndMessaging::{
-        WA_INACTIVE, WM_ACTIVATE, WM_CHAR, WM_CLOSE, WM_KEYDOWN, WM_MOUSEWHEEL,
+        WA_INACTIVE, WM_ACTIVATE, WM_CHAR, WM_CLOSE, WM_KEYDOWN, WM_LBUTTONDOWN, WM_MOUSEWHEEL,
+        WM_RBUTTONUP, WM_SETCURSOR, WM_SYSKEYDOWN,
     };
     let mut action = None;
+    // Al escribir o pulsar, el cursor del texto se ve fijo y el parpadeo empieza de nuevo.
+    if matches!(msg, WM_CHAR | WM_KEYDOWN | WM_LBUTTONDOWN) {
+        restart_caret(hwnd);
+    }
     match msg {
+        WM_TIMER if wparam.0 == TIMER_CARET => {
+            with_app(|app| {
+                if let Some(menu) = app.launcher.as_mut().filter(|m| m.visible) {
+                    if menu.model.blink() {
+                        menu.render();
+                    }
+                }
+            });
+        }
+        // Sobre el buscador, el cursor de texto (I), como en cualquier cuadro de texto.
+        WM_SETCURSOR if (lparam.0 & 0xffff) as u32 == 1 => {
+            use windows::Win32::Graphics::Gdi::ScreenToClient;
+            use windows::Win32::UI::WindowsAndMessaging::{SetCursor, IDC_IBEAM};
+            let over = with_app(|app| {
+                let menu = app.launcher.as_ref().filter(|m| m.visible)?;
+                let mut point = POINT::default();
+                let _ = GetCursorPos(&mut point);
+                let _ = ScreenToClient(hwnd, &mut point);
+                Some(
+                    menu.model
+                        .over_text(point.x as f32 / menu.scale, point.y as f32 / menu.scale),
+                )
+            })
+            .flatten()
+            .unwrap_or(false);
+            let cursor = if over { IDC_IBEAM } else { IDC_ARROW };
+            if let Ok(cursor) = LoadCursorW(None, cursor) {
+                SetCursor(Some(cursor));
+            }
+            return LRESULT(1);
+        }
         WM_ACTIVATE if (wparam.0 & 0xffff) as u32 == WA_INACTIVE => {
             with_app(|app| {
                 if let Some(menu) = &mut app.launcher {
@@ -1187,22 +1289,53 @@ unsafe extern "system" fn launcher_wndproc(
                         if menu.model.in_search(x, y) {
                             let shift =
                                 windows::Win32::UI::Input::KeyboardAndMouse::GetKeyState(0x10) < 0;
-                            menu.model.click_search(x, shift);
+                            let double = Duration::from_millis(
+                                windows::Win32::UI::Input::KeyboardAndMouse::GetDoubleClickTime()
+                                    as u64,
+                            );
+                            menu.model.press_search(x, shift, Instant::now(), double);
                             menu.model.selection = None;
                         }
                         if let Some(hit) = hit {
                             action = menu.model.activate(hit);
                         }
                     }
-                    menu.model.hovered = hit;
+                    menu.model.set_hovered(hit);
                     menu.render();
+                }
+            });
+        }
+        // Clic derecho en una app: su menú contextual, como en el Inicio de Windows.
+        // Con un menú ya abierto, lo cierra.
+        WM_RBUTTONUP => {
+            with_app(|app| {
+                if let Some(menu) = app.launcher.as_mut().filter(|menu| menu.visible) {
+                    let x = (lparam.0 & 0xffff) as i16 as f32 / menu.scale;
+                    let y = ((lparam.0 >> 16) & 0xffff) as i16 as f32 / menu.scale;
+                    if !menu.model.close_overlay() {
+                        if let Some(hit) = menu.model.hit_test(x, y) {
+                            menu.model.open_context(hit, x, y);
+                        }
+                    }
+                    menu.render();
+                }
+            });
+        }
+        // Mayús+F10 abre el menú contextual de la app elegida, como en Windows.
+        WM_SYSKEYDOWN if wparam.0 == 0x79 => {
+            with_app(|app| {
+                if let Some(menu) = app.launcher.as_mut().filter(|menu| menu.visible) {
+                    use windows::Win32::UI::Input::KeyboardAndMouse::GetKeyState;
+                    if GetKeyState(0x10) < 0 && menu.model.open_context_from_keyboard() {
+                        menu.render();
+                    }
                 }
             });
         }
         WM_MOUSEWHEEL => {
             with_app(|app| {
                 if let Some(menu) = app.launcher.as_mut().filter(|menu| menu.visible) {
-                    if !menu.model.power_menu {
+                    if !menu.model.overlay_open() {
                         // 120 unidades por muesca de la rueda: algo más de una fila.
                         let delta = ((wparam.0 >> 16) & 0xffff) as i16 as f32;
                         menu.model.scroll_by(-delta / 120.0 * 96.0);
@@ -1228,19 +1361,26 @@ unsafe extern "system" fn launcher_wndproc(
                     use windows::Win32::UI::Input::KeyboardAndMouse::GetKeyState;
                     let ctrl = GetKeyState(0x11) < 0;
                     let shift = GetKeyState(0x10) < 0;
-                    let menu_open = menu.model.power_menu;
+                    let menu_open = menu.model.overlay_open();
                     match wparam.0 {
                         0x1B => {
-                            if menu_open {
-                                menu.model.power_menu = false;
+                            if menu.model.close_overlay() {
                                 menu.render();
                             } else {
                                 menu.hide();
                             }
                         }
-                        0x0D if !menu_open => {
+                        // Enter abre lo elegido; con un menú abierto, su opción resaltada.
+                        0x0D => {
                             if let Some(hit) = menu.model.first_match() {
                                 action = menu.model.activate(hit);
+                                menu.render();
+                            }
+                        }
+                        // Tecla de menú: el menú contextual de la app elegida.
+                        0x5D => {
+                            if menu.model.open_context_from_keyboard() {
+                                menu.render();
                             }
                         }
                         // Ctrl+A, Ctrl+C, Ctrl+X y Ctrl+V, como en cualquier cuadro de texto.
@@ -1300,19 +1440,19 @@ unsafe extern "system" fn launcher_wndproc(
                             menu.model.edit(|field| field.end(shift));
                             menu.render();
                         }
-                        0x28 if !menu.model.power_menu => {
+                        0x28 => {
                             menu.model.move_selection(0, 1);
                             menu.render();
                         }
-                        0x26 if !menu.model.power_menu => {
+                        0x26 => {
                             menu.model.move_selection(0, -1);
                             menu.render();
                         }
-                        0x22 if !menu.model.power_menu => {
+                        0x22 if !menu_open => {
                             menu.model.scroll_page(true);
                             menu.render();
                         }
-                        0x21 if !menu.model.power_menu => {
+                        0x21 if !menu_open => {
                             menu.model.scroll_page(false);
                             menu.render();
                         }
@@ -1325,16 +1465,38 @@ unsafe extern "system" fn launcher_wndproc(
     }
     // Ejecutar después de liberar el préstamo de APP: Shell puede reenviar eventos.
     if let Some(action) = action {
-        with_app(|app| {
-            if let Some(menu) = &mut app.launcher {
-                menu.hide();
-            }
-        });
+        if action.closes_launcher() {
+            with_app(|app| {
+                if let Some(menu) = &mut app.launcher {
+                    menu.hide();
+                }
+            });
+        }
         match action {
             launcher::Action::Launch(entry) => {
                 if apps::launch_entry(&entry) {
                     let _ = catalog::record(&entry);
                 }
+            }
+            launcher::Action::RunAsAdmin(entry) => {
+                if apps::launch_entry_as_admin(&entry) {
+                    let _ = catalog::record(&entry);
+                }
+            }
+            launcher::Action::OpenLocation(entry) => {
+                apps::open_entry_location(&entry);
+            }
+            launcher::Action::Uninstall => {
+                apps::open_uninstall();
+            }
+            launcher::Action::Jump(entry, item) => {
+                jumplist::open(&item, &entry.command);
+            }
+            launcher::Action::Pin(entry) => {
+                with_app(|app| app.pin_from_launcher(entry, true));
+            }
+            launcher::Action::Unpin(entry) => {
+                with_app(|app| app.pin_from_launcher(entry, false));
             }
             launcher::Action::Power(option) => {
                 if !run_power(option) {
@@ -1410,13 +1572,14 @@ struct App {
     backdrop: Option<style::Backdrop>,
     /// Dónde y con qué apariencia se puso el desenfoque la última vez.
     backdrop_at: std::cell::Cell<Option<(windows::Win32::Foundation::RECT, style::Appearance)>>,
-    /// Actualizaciones (ver `update`): ajustes, versión nueva encontrada y los
-    /// hilos que buscan o descargan, que responden por `update_events`.
-    update_settings: update::Settings,
+    /// Actualizaciones (ver `update`): versión nueva encontrada y los hilos que
+    /// buscan o descargan, que responden por `update_events`.
     new_release: Option<update::Release>,
     /// Versión de la que ya se avisó, para no repetirlo cada 6 horas.
     notified: Option<update::Version>,
     checking: bool,
+    /// La búsqueda en curso la pidió el usuario desde el menú: se le dice qué salió.
+    manual_check: bool,
     updating: bool,
     update_sender: std::sync::mpsc::Sender<UpdateEvent>,
     update_events: std::sync::mpsc::Receiver<UpdateEvent>,
@@ -1452,6 +1615,7 @@ impl App {
         bar.keyboard = keyboard::current();
         let styles = style::Styles::load();
         bar.appearance = styles.look(style::State::Desktop).appearance;
+        glass::set_menu_opacity(styles.menu_opacity());
         let (update_sender, update_events) = std::sync::mpsc::channel();
         let scale = scale.min((rc.right - rc.left) as f32 / (bar.dock_width() + 40.0));
         let (width, height) = bar.window_size(scale);
@@ -1517,10 +1681,10 @@ impl App {
             tray_checked: Instant::now(),
             backdrop: style::Backdrop::new(),
             backdrop_at: std::cell::Cell::new(None),
-            update_settings: update::Settings::load(),
             new_release: None,
             notified: None,
             checking: false,
+            manual_check: false,
             updating: false,
             update_sender,
             update_events,
@@ -1610,7 +1774,7 @@ impl App {
         }
         let bounds = (self.screen_left, self.screen_right);
         let updates = appmenu::Updates {
-            check: self.update_settings.check,
+            checking: self.checking,
             available: self.new_release.as_ref().map(|r| r.version.to_string()),
             busy: self.updating,
         };
@@ -1645,8 +1809,13 @@ impl App {
     }
 
     /// Busca en un hilo aparte si hay una versión nueva; responde con `WM_UPDATE`.
-    fn check_updates(&mut self) {
-        if !self.update_settings.check || self.checking || self.updating {
+    /// `manual` si lo pidió el usuario: entonces se avisa también si no hay nada.
+    fn check_updates(&mut self, manual: bool) {
+        if self.updating {
+            return;
+        }
+        self.manual_check |= manual;
+        if self.checking {
             return;
         }
         self.checking = true;
@@ -1680,13 +1849,29 @@ impl App {
             match event {
                 UpdateEvent::Checked(result) => {
                     self.checking = false;
+                    let manual = std::mem::take(&mut self.manual_check);
                     // Sin conexión o sin respuesta, se vuelve a mirar en 6 horas.
-                    let Ok(release) = result else {
-                        continue;
+                    let release = match result {
+                        Ok(release) => release,
+                        Err(error) => {
+                            if manual {
+                                self.tray.notify(
+                                    "No se pudo buscar actualizaciones",
+                                    &format!("Motivo: {error}."),
+                                );
+                            }
+                            continue;
+                        }
                     };
-                    // Se avisa una vez por versión, no cada 6 horas.
+                    if release.is_none() && manual {
+                        self.tray.notify(
+                            "GlassBar está al día",
+                            &format!("La v{} es la última versión.", update::Version::current()),
+                        );
+                    }
+                    // Sola, se avisa una vez por versión, no cada 6 horas.
                     if let Some(release) = &release {
-                        if self.notified != Some(release.version) {
+                        if manual || self.notified != Some(release.version) {
                             self.notified = Some(release.version);
                             self.tray.notify(
                                 "Hay una versión nueva de GlassBar",
@@ -1919,6 +2104,33 @@ impl App {
             priority::raise(self.hwnd);
             // Su desenfoque, otra vez justo debajo.
             self.sync_backdrop();
+        }
+    }
+
+    /// Ancla o desancla en el dock una app desde el lanzador, que sigue abierto
+    /// con su sección "Anclado" al día.
+    fn pin_from_launcher(&mut self, entry: apps::AppEntry, pin: bool) {
+        let same = |a: &apps::AppItem| a.entry.command.eq_ignore_ascii_case(&entry.command);
+        let position = self.bar.primary_apps.iter().position(same);
+        match (pin, position) {
+            (true, None) => self.bar.primary_apps.push(apps::AppItem::new(entry)),
+            (false, Some(index)) => {
+                self.bar.primary_apps.remove(index);
+            }
+            _ => return,
+        }
+        // Sus ventanas pasan al anclado (o vuelven a los abiertos).
+        apps::update_running_apps(&mut self.bar.primary_apps, &mut self.bar.open_apps);
+        self.pins_changed();
+        let pinned: Vec<_> = self
+            .bar
+            .primary_apps
+            .iter()
+            .map(|a| a.entry.clone())
+            .collect();
+        if let Some(menu) = self.launcher.as_mut().filter(|m| m.visible) {
+            menu.model.set_pinned(&pinned);
+            menu.render();
         }
     }
 
@@ -2642,7 +2854,7 @@ unsafe extern "system" fn wndproc(hwnd: HWND, msg: u32, wparam: WPARAM, lparam: 
                     if id == TIMER_UPDATE_FIRST {
                         let _ = KillTimer(Some(app.hwnd), TIMER_UPDATE_FIRST);
                     }
-                    app.check_updates();
+                    app.check_updates(false);
                 });
             } else if id == TIMER_ANNOUNCE {
                 with_app(|app| {
@@ -2767,6 +2979,8 @@ unsafe extern "system" fn wndproc(hwnd: HWND, msg: u32, wparam: WPARAM, lparam: 
 /// Panel de idioma del teclado sobre el indicador del dock.
 struct LanguageWindow {
     hwnd: HWND,
+    /// Desenfoque de debajo, como el del dock.
+    backdrop: Option<style::Backdrop>,
     surface: Option<Surface>,
     pos: POINT,
     scale: f32,
@@ -2796,6 +3010,7 @@ impl LanguageWindow {
         };
         Ok(Self {
             hwnd,
+            backdrop: style::Backdrop::new(),
             surface: None,
             pos: POINT::default(),
             scale: 1.0,
@@ -2861,6 +3076,8 @@ impl LanguageWindow {
                 &self.transition,
                 self.visible,
                 false,
+                self.backdrop.as_ref(),
+                &[panel_shape(surface, self.scale, 12.0)],
             );
         }
     }
@@ -3034,6 +3251,8 @@ struct TrayMenu {
 /// Panel de las apps en segundo plano (ver `traypanel` y `systray`).
 struct TrayWindow {
     hwnd: HWND,
+    /// Desenfoque de debajo, como el del dock.
+    backdrop: Option<style::Backdrop>,
     surface: Option<Surface>,
     pos: POINT,
     scale: f32,
@@ -3070,6 +3289,7 @@ impl TrayWindow {
         };
         Ok(Self {
             hwnd,
+            backdrop: style::Backdrop::new(),
             surface: None,
             pos: POINT::default(),
             scale: 1.0,
@@ -3158,6 +3378,8 @@ impl TrayWindow {
                 &self.transition,
                 self.visible,
                 false,
+                self.backdrop.as_ref(),
+                &[panel_shape(surface, self.scale, 10.0)],
             );
         }
     }
@@ -3249,6 +3471,8 @@ enum MenuPurpose {
 /// dock y el de GlassBar.
 struct AppMenuWindow {
     hwnd: HWND,
+    /// Desenfoque de debajo, como el del dock.
+    backdrop: Option<style::Backdrop>,
     surface: Option<Surface>,
     pos: POINT,
     scale: f32,
@@ -3256,6 +3480,8 @@ struct AppMenuWindow {
     visible: bool,
     transition: launcher::Transition,
     purpose: Option<MenuPurpose>,
+    /// Barra que se está arrastrando; el ratón queda capturado hasta soltarla.
+    sliding: Option<appmenu::Hit>,
     /// Iconos ya reducidos al tamaño del menú, por archivo o tipo de archivo: así
     /// las siguientes aperturas no los vuelven a leer.
     icons: std::collections::HashMap<String, Option<Pixmap>>,
@@ -3281,6 +3507,7 @@ impl AppMenuWindow {
         };
         Ok(Self {
             hwnd,
+            backdrop: style::Backdrop::new(),
             surface: None,
             pos: POINT::default(),
             scale: 1.0,
@@ -3288,6 +3515,7 @@ impl AppMenuWindow {
             visible: false,
             transition: launcher::Transition::hidden(),
             purpose: None,
+            sliding: None,
             icons: std::collections::HashMap::new(),
             icons_scale: 0.0,
         })
@@ -3498,6 +3726,8 @@ impl AppMenuWindow {
                 &self.transition,
                 self.visible,
                 false,
+                self.backdrop.as_ref(),
+                &self.model.shapes(self.scale),
             );
         }
     }
@@ -3564,7 +3794,9 @@ unsafe extern "system" fn app_menu_wndproc(
     wparam: WPARAM,
     lparam: LPARAM,
 ) -> LRESULT {
-    use windows::Win32::UI::WindowsAndMessaging::{WA_INACTIVE, WM_ACTIVATE, WM_KEYDOWN};
+    use windows::Win32::UI::WindowsAndMessaging::{
+        WA_INACTIVE, WM_ACTIVATE, WM_CAPTURECHANGED, WM_KEYDOWN, WM_LBUTTONDOWN,
+    };
     let point = |scale: f32| {
         (
             (lparam.0 & 0xffff) as i16 as f32 / scale,
@@ -3623,6 +3855,13 @@ unsafe extern "system" fn app_menu_wndproc(
                 };
                 let _ = TrackMouseEvent(&mut track);
                 let (x, y) = point(menu.scale);
+                // Arrastrando una barra, la sigue aunque el cursor salga de su fila.
+                if let Some(hit) = menu.sliding {
+                    if let Some((command, value)) = menu.model.slide(hit, x) {
+                        apply_menu_slider(&mut app.styles, menu, hit, command, value);
+                    }
+                    return;
+                }
                 if menu.model.point(x, y) {
                     menu.render();
                 }
@@ -3631,11 +3870,42 @@ unsafe extern "system" fn app_menu_wndproc(
         WM_MOUSELEAVE => {
             with_app(|app| {
                 if let Some(menu) = app.app_menu.as_mut().filter(|m| m.visible) {
-                    if menu.model.leave() {
+                    if menu.sliding.is_none() && menu.model.leave() {
                         menu.render();
                     }
                 }
             });
+        }
+        WM_LBUTTONDOWN => {
+            let grabbed = with_app(|app| {
+                let menu = app.app_menu.as_mut().filter(|m| m.visible)?;
+                let (x, y) = point(menu.scale);
+                let (hit, _) = menu.model.slider_at(x, y)?;
+                menu.sliding = Some(hit);
+                let (command, value) = menu.model.slide(hit, x)?;
+                apply_menu_slider(&mut app.styles, menu, hit, command, value);
+                Some(())
+            })
+            .flatten();
+            // Fuera de `with_app`: capturar avisa a esta misma ventana.
+            if grabbed.is_some() {
+                let _ = windows::Win32::UI::Input::KeyboardAndMouse::SetCapture(hwnd);
+            }
+        }
+        // Al soltar la barra, o si Windows le quita el ratón, se guarda el valor.
+        WM_CAPTURECHANGED => {
+            with_app(|app| {
+                let menu = app.app_menu.as_mut()?;
+                menu.sliding.take()?;
+                let _ = app.styles.save();
+                Some(())
+            });
+        }
+        WM_LBUTTONUP
+            if with_app(|app| app.app_menu.as_ref().is_some_and(|m| m.sliding.is_some()))
+                == Some(true) =>
+        {
+            let _ = windows::Win32::UI::Input::KeyboardAndMouse::ReleaseCapture();
         }
         WM_LBUTTONUP => {
             let command = with_app(|app| {
@@ -3657,6 +3927,17 @@ unsafe extern "system" fn app_menu_wndproc(
                     appmenu::Key::Close => menu.hide(),
                     appmenu::Key::Moved => menu.render(),
                     appmenu::Key::Choose(_) => {}
+                    appmenu::Key::Slide(command, value) => {
+                        let hit = if menu.model.in_sub {
+                            menu.model.sub_hovered().map(appmenu::Hit::Sub)
+                        } else {
+                            menu.model.root.hovered.map(appmenu::Hit::Root)
+                        };
+                        if let Some(hit) = hit {
+                            apply_menu_slider(&mut app.styles, menu, hit, command, value);
+                            let _ = app.styles.save();
+                        }
+                    }
                 }
                 Some(key)
             })
@@ -3668,6 +3949,25 @@ unsafe extern "system" fn app_menu_wndproc(
         _ => return DefWindowProcW(hwnd, msg, wparam, lparam),
     }
     LRESULT(0)
+}
+
+/// Aplica una barra del menú de GlassBar mientras se mueve. La opacidad de los
+/// menús cambia ya, también la del propio menú; se guarda al soltar la barra.
+fn apply_menu_slider(
+    styles: &mut style::Styles,
+    menu: &mut AppMenuWindow,
+    hit: appmenu::Hit,
+    command: u32,
+    value: f32,
+) {
+    if command == appmenu::CMD_MENU_OPACITY {
+        styles.set_menu_opacity((value * 100.0).round() as u8);
+        let percent = styles.menu_opacity();
+        glass::set_menu_opacity(percent);
+        // Sin bajar del mínimo, aunque el cursor vaya más allá.
+        menu.model.set_slider(hit, percent as f32 / 100.0);
+    }
+    menu.render();
 }
 
 impl Drop for TrayWindow {
@@ -3906,6 +4206,8 @@ unsafe extern "system" fn tray_wndproc(
 /// vivo las pone Windows (DWM) encima, en el hueco de cada tarjeta.
 struct PreviewWindow {
     hwnd: HWND,
+    /// Desenfoque de debajo, como el del dock.
+    backdrop: Option<style::Backdrop>,
     surface: Option<Surface>,
     pos: POINT,
     scale: f32,
@@ -3940,6 +4242,7 @@ impl PreviewWindow {
         };
         Ok(Self {
             hwnd,
+            backdrop: style::Backdrop::new(),
             surface: None,
             pos: POINT::default(),
             scale: 1.0,
@@ -4097,6 +4400,23 @@ impl PreviewWindow {
                 ULW_ALPHA,
             );
         }
+        if let Some(backdrop) = &self.backdrop {
+            // Las tarjetas, como las pinta `preview::draw`.
+            let s = self.scale;
+            let shapes: Vec<style::Shape> = self
+                .layout
+                .cards
+                .iter()
+                .map(|card| style::Shape {
+                    x: (card.x + 1.0) * s,
+                    y: (card.y + 1.0) * s,
+                    width: (card.width - 2.0) * s,
+                    height: (card.height - 2.0) * s,
+                    radius: 8.0 * s,
+                })
+                .collect();
+            backdrop.under(self.hwnd, surface_rect(self.pos, surface), &shapes, 1.0);
+        }
     }
 
     fn hide(&mut self) {
@@ -4106,6 +4426,9 @@ impl PreviewWindow {
         self.unregister();
         unsafe {
             let _ = ShowWindow(self.hwnd, SW_HIDE);
+        }
+        if let Some(backdrop) = &self.backdrop {
+            backdrop.hide();
         }
         self.visible = false;
         self.target = None;
@@ -4283,12 +4606,7 @@ fn handle_menu_command(app: &mut App, cmd: u32) {
             }
         }
         CMD_UPDATE => app.start_update(),
-        CMD_UPDATE_CHECK => {
-            app.update_settings.check = !app.update_settings.check;
-            let _ = app.update_settings.save();
-            // Al activarlo, se mira ya.
-            app.check_updates();
-        }
+        CMD_UPDATE_CHECK => app.check_updates(true),
         _ => {
             if let Some(choice) = style::Choice::from_command(cmd) {
                 choice.apply(&mut app.styles);

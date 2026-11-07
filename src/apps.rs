@@ -229,6 +229,125 @@ pub fn launch_entry(entry: &AppEntry) -> bool {
     }
 }
 
+/// Pide a Windows `verb` sobre `file` con `args`. Devuelve si lo aceptó.
+fn shell_execute(verb: &str, file: &str, args: Option<&str>) -> bool {
+    let wide = |text: &str| -> Vec<u16> { OsStr::new(text).encode_wide().chain(Some(0)).collect() };
+    let (verb, file) = (wide(verb), wide(file));
+    let args = args.map(wide);
+    unsafe {
+        ShellExecuteW(
+            None,
+            PCWSTR(verb.as_ptr()),
+            PCWSTR(file.as_ptr()),
+            args.as_ref().map_or(PCWSTR::null(), |a| PCWSTR(a.as_ptr())),
+            None,
+            SW_SHOWNORMAL,
+        )
+        .0 as isize
+            > 32
+    }
+}
+
+/// Abre la app como administrador (Windows pide confirmación), con la acción
+/// "runas" de su menú de Shell: así funciona también con las entradas de
+/// AppsFolder, que no son archivos. Si no la tiene, se pide a `ShellExecute`.
+pub fn launch_entry_as_admin(entry: &AppEntry) -> bool {
+    with_shell_menu(&entry.command, |menu, _| unsafe {
+        let id = runas_id(menu)?;
+        let info = windows::Win32::UI::Shell::CMINVOKECOMMANDINFO {
+            cbSize: std::mem::size_of::<windows::Win32::UI::Shell::CMINVOKECOMMANDINFO>() as u32,
+            lpVerb: windows::core::PCSTR(id as usize as *const u8),
+            nShow: SW_SHOWNORMAL.0,
+            ..Default::default()
+        };
+        menu.InvokeCommand(&info).ok()
+    })
+    .flatten()
+    .is_some()
+        || shell_execute("runas", &entry.command, None)
+}
+
+/// Windows ofrece "Ejecutar como administrador" para la app: su menú de Shell
+/// tiene la acción "runas", como mira el Inicio.
+pub fn can_run_as_admin(command: &str) -> bool {
+    with_shell_menu(command, |menu, _| unsafe { runas_id(menu) })
+        .flatten()
+        .is_some()
+}
+
+/// Primer número de orden que se pide al menú de Shell.
+const SHELL_MENU_FIRST: u32 = 1;
+
+/// Construye el menú de Shell del elemento `command` (ruta o `shell:AppsFolder\…`)
+/// y llama a `f` con él y con su primer número de orden.
+fn with_shell_menu<T>(
+    command: &str,
+    f: impl FnOnce(&windows::Win32::UI::Shell::IContextMenu, u32) -> T,
+) -> Option<T> {
+    use windows::core::HSTRING;
+    use windows::Win32::System::Com::{CoInitializeEx, CoUninitialize, COINIT_APARTMENTTHREADED};
+    use windows::Win32::UI::Shell::{
+        BHID_SFUIObject, IContextMenu, IShellItem, SHCreateItemFromParsingName, CMF_NORMAL,
+    };
+    use windows::Win32::UI::WindowsAndMessaging::{CreatePopupMenu, DestroyMenu};
+    unsafe {
+        let initialized = CoInitializeEx(None, COINIT_APARTMENTTHREADED).is_ok();
+        let result = (|| {
+            let path = HSTRING::from(command);
+            let item: IShellItem = SHCreateItemFromParsingName(&path, None).ok()?;
+            let menu: IContextMenu = item.BindToHandler(None, &BHID_SFUIObject).ok()?;
+            let popup = CreatePopupMenu().ok()?;
+            let built = menu
+                .QueryContextMenu(popup, 0, SHELL_MENU_FIRST, 0x7FFF, CMF_NORMAL)
+                .is_ok();
+            let result = built.then(|| f(&menu, SHELL_MENU_FIRST));
+            let _ = DestroyMenu(popup);
+            result
+        })();
+        if initialized {
+            CoUninitialize();
+        }
+        result
+    }
+}
+
+/// Número de orden (relativo) de la acción "runas" del menú de Shell, si la tiene.
+unsafe fn runas_id(menu: &windows::Win32::UI::Shell::IContextMenu) -> Option<u32> {
+    use windows::core::PSTR;
+    use windows::Win32::UI::Shell::GCS_VERBW;
+    // Se pregunta el nombre de cada orden; sus números son relativos al primero.
+    (0..0x400u32).find(|&offset| {
+        let mut verb = [0u16; 64];
+        menu.GetCommandString(
+            offset as usize,
+            GCS_VERBW,
+            None,
+            PSTR(verb.as_mut_ptr().cast()),
+            verb.len() as u32,
+        )
+        .is_ok()
+            && String::from_utf16_lossy(&verb[..verb.iter().position(|&c| c == 0).unwrap_or(0)])
+                .eq_ignore_ascii_case("runas")
+    })
+}
+
+/// Abre la carpeta del programa o acceso directo con él seleccionado.
+pub fn open_entry_location(entry: &AppEntry) -> bool {
+    let explorer = std::env::var("WINDIR")
+        .map(|p| format!("{p}\\explorer.exe"))
+        .unwrap_or_else(|_| "explorer.exe".into());
+    shell_execute(
+        "open",
+        &explorer,
+        Some(&format!("/select,\"{}\"", entry.command)),
+    )
+}
+
+/// Abre "Aplicaciones instaladas" de Configuración, desde donde se desinstala.
+pub fn open_uninstall() -> bool {
+    shell_execute("open", "ms-settings:appsfeatures", None)
+}
+
 pub fn default_apps() -> Vec<AppItem> {
     vec![AppItem::new(AppEntry {
         name: "Explorador".into(),
@@ -539,11 +658,13 @@ pub fn draw_windows_start_icon(pixmap: &mut Pixmap, cx: f32, cy: f32, size: f32,
     let x1 = x0 + tile_w + gap;
     let y1 = y0 + tile_w + gap;
 
-    let white = [255, 255, 255, 235];
-    fill_rounded(pixmap, white, x0, y0, tile_w, tile_w, r);
-    fill_rounded(pixmap, white, x1, y0, tile_w, tile_w, r);
-    fill_rounded(pixmap, white, x0, y1, tile_w, tile_w, r);
-    fill_rounded(pixmap, white, x1, y1, tile_w, tile_w, r);
+    // El logo de Windows 11 en azul: un solo degradado de cian claro (arriba a la
+    // izquierda) a azul (abajo a la derecha) que atraviesa los cuatro cuadros.
+    let stops = [(0.0, [112, 224, 255, 255]), (1.0, [0, 120, 240, 255])];
+    let (from, to) = ((x0, y0), (x0 + s, y0 + s));
+    for (tx, ty) in [(x0, y0), (x1, y0), (x0, y1), (x1, y1)] {
+        fill_rounded_gradient(pixmap, &stops, from, to, tx, ty, tile_w, tile_w, r);
+    }
 }
 
 /// `base` es el tamaño en reposo; `size` incluye la animación de hover o pulsación.
@@ -666,6 +787,51 @@ pub fn fill_rounded(
         ..Default::default()
     };
     paint.set_color_rgba8(r, g, b, a);
+    if let Some(path) = rounded_rect(x, y, w, h, rad) {
+        pixmap.fill_path(
+            &path,
+            &paint,
+            FillRule::Winding,
+            Transform::identity(),
+            None,
+        );
+    }
+}
+
+/// Como `fill_rounded`, con un degradado lineal de `from` (en `start`) a `to` (en
+/// `end`), con paradas intermedias opcionales en `stops`: `(posición 0..1, color)`.
+#[allow(clippy::too_many_arguments)]
+pub fn fill_rounded_gradient(
+    pixmap: &mut Pixmap,
+    stops: &[(f32, [u8; 4])],
+    start: (f32, f32),
+    end: (f32, f32),
+    x: f32,
+    y: f32,
+    w: f32,
+    h: f32,
+    rad: f32,
+) {
+    let stops = stops
+        .iter()
+        .map(|&(at, [r, g, b, a])| {
+            tiny_skia::GradientStop::new(at, tiny_skia::Color::from_rgba8(r, g, b, a))
+        })
+        .collect();
+    let Some(shader) = tiny_skia::LinearGradient::new(
+        tiny_skia::Point::from_xy(start.0, start.1),
+        tiny_skia::Point::from_xy(end.0, end.1),
+        stops,
+        tiny_skia::SpreadMode::Pad,
+        Transform::identity(),
+    ) else {
+        return;
+    };
+    let paint = Paint {
+        anti_alias: true,
+        shader,
+        ..Default::default()
+    };
     if let Some(path) = rounded_rect(x, y, w, h, rad) {
         pixmap.fill_path(
             &path,

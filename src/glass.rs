@@ -1,7 +1,39 @@
-//! Cristal plano de opacidad media: sin sombras ni reflejo superior.
-use crate::apps::{fill_rounded, stroke_rounded};
+//! Cristal gris de opacidad media: sin sombras ni reflejo superior.
+use crate::apps::{fill_rounded, fill_rounded_gradient, stroke_rounded};
 use crate::style::Appearance;
+use std::sync::atomic::AtomicU8;
 use tiny_skia::Pixmap;
+
+/// Opacidad de los paneles y menús propios, en tanto por ciento: la elige el
+/// usuario en el menú de GlassBar (ver `style::Styles::menu_opacity`).
+static MENU_OPACITY: AtomicU8 = AtomicU8::new(DEFAULT_MENU_OPACITY);
+pub const DEFAULT_MENU_OPACITY: u8 = 43;
+/// Por debajo, el texto no se lee y los clics atravesarían el fondo.
+pub const MIN_MENU_OPACITY: u8 = 10;
+
+pub fn set_menu_opacity(percent: u8) {
+    MENU_OPACITY.store(
+        percent.clamp(MIN_MENU_OPACITY, 100),
+        std::sync::atomic::Ordering::Relaxed,
+    );
+}
+pub fn menu_opacity() -> u8 {
+    MENU_OPACITY.load(std::sync::atomic::Ordering::Relaxed)
+}
+
+fn menu_alpha() -> u8 {
+    (menu_opacity() as f32 * 2.55).round() as u8
+}
+
+/// Fondo de los paneles y menús propios: el gris del cristal, translúcido para que
+/// se vea el desenfoque de debajo, con la opacidad elegida.
+pub fn panel() -> [u8; 4] {
+    [32, 32, 34, menu_alpha()]
+}
+/// El mismo fondo, algo más claro: los menús de opciones y lo que está bajo el cursor.
+pub fn panel_light() -> [u8; 4] {
+    [48, 48, 50, menu_alpha().saturating_add(15)]
+}
 
 /// Radio de las esquinas del dock, en unidades lógicas.
 pub const DOCK_RADIUS: f32 = 16.0;
@@ -17,19 +49,20 @@ pub fn draw_dock(
     h: f32,
     scale: f32,
 ) {
-    let (fill, stroke) = appearance.colors();
-    fill_rounded(pixmap, fill, x, y, w, h, DOCK_RADIUS * scale);
+    let ([left, middle, right], stroke) = appearance.colors();
+    fill_rounded_gradient(
+        pixmap,
+        &[(0.0, left), (0.5, middle), (1.0, right)],
+        (x, y),
+        (x + w, y),
+        x,
+        y,
+        w,
+        h,
+        DOCK_RADIUS * scale,
+    );
     if stroke[3] > 0 {
-        stroke_rounded(
-            pixmap,
-            stroke,
-            x,
-            y,
-            w,
-            h,
-            DOCK_RADIUS * scale,
-            0.75 * scale,
-        );
+        stroke_rounded(pixmap, stroke, x, y, w, h, DOCK_RADIUS * scale, scale);
     }
 }
 pub fn draw_hover(pixmap: &mut Pixmap, cx: f32, cy: f32, scale: f32) {

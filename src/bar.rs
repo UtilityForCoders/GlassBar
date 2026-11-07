@@ -15,6 +15,10 @@ const APP_STEP: f32 = 46.0;
 const CLOCK_W: f32 = 78.0;
 const ICON_SIZE: f32 = 28.0;
 const OVERFLOW_W: f32 = 30.0;
+/// Hueco entre el último programa y la flecha, con una línea fina en medio.
+const TRAY_GAP: f32 = 14.0;
+/// Alto de la línea que separa los programas de la bandeja.
+const TRAY_DIVIDER_H: f32 = 22.0;
 /// Indicador de idioma del teclado ("ESP" / "INTL"), entre la flecha y el estado.
 const LANGUAGE_W: f32 = 44.0;
 /// Grupo de red, volumen y batería: margen a cada lado y ancho de cada icono.
@@ -111,7 +115,15 @@ impl BarState {
     }
     /// Borde izquierdo del indicador de idioma, en unidades del dock.
     fn language_left(&self) -> f32 {
-        APP_START + self.item_count() as f32 * APP_STEP + OVERFLOW_W
+        self.overflow_left() + OVERFLOW_W
+    }
+    /// Fin del último programa, en unidades del dock: ahí empieza el hueco.
+    fn apps_right(&self) -> f32 {
+        APP_START + self.item_count() as f32 * APP_STEP
+    }
+    /// Borde izquierdo de la flecha, en unidades del dock.
+    fn overflow_left(&self) -> f32 {
+        self.apps_right() + TRAY_GAP
     }
     /// Centro horizontal del indicador de idioma, en píxeles de la ventana.
     pub fn language_center(&self, scale: f32) -> f32 {
@@ -140,7 +152,7 @@ impl BarState {
     }
     /// Centro horizontal de la flecha, en píxeles de la ventana.
     pub fn overflow_center(&self, scale: f32) -> f32 {
-        (SHADOW_PAD_X + APP_START + self.item_count() as f32 * APP_STEP + OVERFLOW_W / 2.0) * scale
+        (SHADOW_PAD_X + self.overflow_left() + OVERFLOW_W / 2.0) * scale
     }
     fn item_count(&self) -> usize {
         self.primary_apps.len() + self.open_apps.len()
@@ -314,6 +326,9 @@ impl BarState {
             Some(HoverTarget::PrimaryApp(index))
         } else if index < self.item_count() {
             Some(HoverTarget::OpenApp(index - self.primary_apps.len()))
+        } else if x < self.overflow_left() {
+            // El hueco entre los programas y la flecha no es de nadie.
+            None
         } else if x < self.language_left() {
             Some(HoverTarget::Overflow)
         } else if x < self.status_left() {
@@ -421,6 +436,17 @@ impl BarState {
             self.dock_width() * scale,
             DOCK_H * scale,
             scale,
+        );
+        // La línea entre los programas y la flecha solo se mueve con el número de apps.
+        let divider_x = x + (self.apps_right() + TRAY_GAP / 2.0) * scale;
+        crate::apps::fill_rounded(
+            pixmap,
+            [255, 255, 255, 38],
+            divider_x - 0.5 * scale,
+            cy - TRAY_DIVIDER_H * scale / 2.0,
+            scale,
+            TRAY_DIVIDER_H * scale,
+            0.5 * scale,
         );
         let arrow_x = self.overflow_center(scale);
         if self.hovered == Some(HoverTarget::Overflow) {

@@ -78,6 +78,14 @@ pub fn minute() -> u64 {
         + now.wMinute as u64
 }
 
+/// Opacidad de la fecha: queda por detrás de la hora.
+const DATE_OPACITY: f32 = 0.75;
+
+/// Tamaño de la fecha para una hora de `pixels`: unos dos puntos menos.
+fn date_size(pixels: u32) -> f32 {
+    (pixels as f32 * 11.0 / 13.0).round()
+}
+
 /// Hora y, debajo, la fecha corta, como la barra de Windows. Las dos líneas se
 /// rasterizan solo cuando cambian (una vez por minuto).
 pub struct ClockRenderer {
@@ -106,16 +114,16 @@ impl ClockRenderer {
         let now = unsafe { GetLocalTime() };
         let time = format!("{:02}:{:02}", now.wHour, now.wMinute);
         let date = format_date(&now, false);
-        let pixels = (12.0 * scale).round().max(8.0) as u32;
+        // La hora, más grande; la fecha, más pequeña y atenuada debajo.
+        let pixels = (13.0 * scale).round().max(8.0) as u32;
         let mut cached = self.cached.borrow_mut();
         if !cached
             .as_ref()
             .is_some_and(|c| c.time == time && c.date == date && c.pixels == pixels)
         {
-            let size = pixels as f32;
             let lines = [
-                rasterize_line(system_font(), &time, size),
-                rasterize_line(system_font(), &date, size),
+                rasterize_line(system_font(), &time, pixels as f32),
+                rasterize_line(system_font(), &date, date_size(pixels)),
             ];
             *cached = Some(Clock {
                 time,
@@ -128,19 +136,28 @@ impl ClockRenderer {
             return;
         };
         // Dos líneas seguidas centradas en `cy`, cada una sobre su línea base.
-        let (ascent, descent) = line_metrics(clock.pixels as f32);
-        let line = ascent + descent;
-        let top = cy - line;
-        for (index, (image, rise)) in clock.lines.iter().enumerate() {
-            let baseline = top + line * index as f32 + ascent;
+        let metrics = [
+            line_metrics(clock.pixels as f32),
+            line_metrics(date_size(clock.pixels)),
+        ];
+        let height: f32 = metrics.iter().map(|(a, d)| a + d).sum();
+        let mut top = cy - height / 2.0;
+        for (((image, rise), (ascent, descent)), opacity) in
+            clock.lines.iter().zip(metrics).zip([1.0, DATE_OPACITY])
+        {
+            let baseline = top + ascent;
             target.draw_pixmap(
                 (cx - image.width() as f32 / 2.0).round() as i32,
                 (baseline - *rise as f32).round() as i32,
                 image.as_ref(),
-                &PixmapPaint::default(),
+                &PixmapPaint {
+                    opacity,
+                    ..Default::default()
+                },
                 Transform::identity(),
                 None,
             );
+            top += ascent + descent;
         }
     }
 }

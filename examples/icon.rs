@@ -1,8 +1,8 @@
-//! Genera `assets/icon.ico`, el ícono de GlassBar:
+//! Genera el ícono original de GlassBar en `assets/icon.ico`:
 //! Una barra de cristal líquido (Liquid Glass) con reflejos especulares y 4 apps brillantes.
 //! Se dibuja con tiny-skia.
 //!
-//! Para regenerarlo:
+//! Ya no es el ícono en uso: `assets/icon.ico` se diseñó aparte. Ejecutarlo lo sobrescribe:
 //! ```powershell
 //! cargo run --example icon
 //! ```

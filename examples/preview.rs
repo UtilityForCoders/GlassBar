@@ -170,7 +170,7 @@ fn main() {
         }
         // Con una versión nueva, para ver su opción.
         let updates = appmenu::Updates {
-            check: true,
+            checking: false,
             available: Some("9.9.9".into()),
             busy: false,
         };
