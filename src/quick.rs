@@ -1,5 +1,6 @@
 //! Panel rápido propio, que se abre sobre los iconos de red, volumen y batería:
-//! Wi-Fi y Bluetooth, brillo y volumen, con el estilo del lanzador. La flecha de los
+//! Wi-Fi y Bluetooth; luz nocturna, modo avión y ahorro de batería; brillo y
+//! volumen, con el estilo del lanzador. La flecha de los
 //! botones de Wi-Fi y Bluetooth abre la lista de redes o de dispositivos, y la del
 //! volumen, la de salidas de audio y aplicaciones. "Más opciones" abre el panel de
 //! Windows para lo que este aún no tiene.
@@ -13,27 +14,35 @@ use crate::clock::{
 use crate::status::{draw_battery, volume_glyph, Battery, Volume};
 use crate::system::{Radio, Snapshot};
 use crate::textfield::TextField;
+use crate::toggles::Toggle;
 use crate::wifi::{Network, Security};
 use std::time::{Duration, Instant};
 use tiny_skia::Pixmap;
 
 pub const WIDTH: f32 = 340.0;
-pub const HEIGHT: f32 = 244.0;
+pub const HEIGHT: f32 = 316.0;
 const PAD: f32 = 16.0;
 const TILE_Y: f32 = 16.0;
 const TILE_H: f32 = 60.0;
 const TILE_GAP: f32 = 12.0;
 const TILE_W: f32 = (WIDTH - PAD * 2.0 - TILE_GAP) / 2.0;
+/// Fila de luz nocturna, modo avión y ahorro de batería: botones con su nombre
+/// debajo, como en Windows 11.
+const TOGGLE_Y: f32 = 88.0;
+const TOGGLE_H: f32 = 48.0;
+const TOGGLE_W: f32 = (WIDTH - PAD * 2.0 - TILE_GAP * 2.0) / 3.0;
+/// Línea base del nombre bajo cada botón.
+const TOGGLE_LABEL_Y: f32 = TOGGLE_Y + TOGGLE_H + 18.0;
 /// Centro vertical de las filas de brillo y volumen.
-const BRIGHTNESS_Y: f32 = 112.0;
-const VOLUME_Y: f32 = 160.0;
+const BRIGHTNESS_Y: f32 = 184.0;
+const VOLUME_Y: f32 = 232.0;
 const ROW_H: f32 = 40.0;
 const SLIDER_X: f32 = PAD + 40.0;
 /// Las barras dejan sitio a la derecha para el porcentaje y, en la del volumen, la
 /// flecha que abre las salidas de audio.
 const SLIDER_W: f32 = WIDTH - PAD - 76.0 - SLIDER_X;
 const AUDIO_BUTTON: f32 = 28.0;
-const FOOTER_Y: f32 = 196.0;
+const FOOTER_Y: f32 = 268.0;
 const MORE_W: f32 = 112.0;
 fn background() -> [u8; 4] {
     crate::glass::panel()
@@ -120,6 +129,8 @@ pub enum Slider {
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum Hit {
     Tile(Radio),
+    /// Luz nocturna, modo avión o ahorro de batería.
+    Toggle(Toggle),
     /// Icono del altavoz: silencia o quita el silencio.
     Mute,
     Slider(Slider),
@@ -170,6 +181,28 @@ fn tile_x(radio: Radio) -> f32 {
     match radio {
         Radio::Wifi => PAD,
         Radio::Bluetooth => PAD + TILE_W + TILE_GAP,
+    }
+}
+fn toggle_x(toggle: Toggle) -> f32 {
+    let column = match toggle {
+        Toggle::NightLight => 0.0,
+        Toggle::Airplane => 1.0,
+        Toggle::Saver => 2.0,
+    };
+    PAD + column * (TOGGLE_W + TILE_GAP)
+}
+fn toggle_label(toggle: Toggle) -> &'static str {
+    match toggle {
+        Toggle::NightLight => "Luz nocturna",
+        Toggle::Airplane => "Modo avión",
+        Toggle::Saver => "Ahorro de batería",
+    }
+}
+fn toggle_glyph(toggle: Toggle) -> char {
+    match toggle {
+        Toggle::NightLight => '\u{F08C}',
+        Toggle::Airplane => '\u{E709}',
+        Toggle::Saver => '\u{E8BE}',
     }
 }
 fn back_rect() -> (f32, f32, f32, f32) {
@@ -568,6 +601,15 @@ impl QuickState {
                 return Some(Hit::Tile(radio));
             }
         }
+        for toggle in Toggle::ALL {
+            // Con su nombre: pulsarlo también vale, como en Windows.
+            let height = TOGGLE_LABEL_Y + 6.0 - TOGGLE_Y;
+            if self.system.toggle(toggle).is_some()
+                && within(toggle_x(toggle), TOGGLE_Y, TOGGLE_W, height)
+            {
+                return Some(Hit::Toggle(toggle));
+            }
+        }
         let (ax, ay, aw, ah) = audio_button_rect();
         if within(ax, ay, aw, ah) {
             return Some(Hit::AudioList);
@@ -606,6 +648,9 @@ impl QuickState {
         }
         self.draw_tile(image, Radio::Wifi, scale);
         self.draw_tile(image, Radio::Bluetooth, scale);
+        for toggle in Toggle::ALL {
+            self.draw_toggle(image, toggle, scale);
+        }
         self.draw_slider(image, Slider::Brightness, scale);
         self.draw_slider(image, Slider::Volume, scale);
         self.draw_footer(image, scale);
@@ -756,6 +801,65 @@ impl QuickState {
             (y + 33.0) * scale,
             12.0 * scale,
             0.75 * faded,
+        );
+    }
+
+    /// Botón cuadrado de luz nocturna, modo avión o ahorro de batería, con su nombre
+    /// debajo. Encendido lleva el color de énfasis; no disponible, atenuado.
+    fn draw_toggle(&self, image: &mut Pixmap, toggle: Toggle, scale: f32) {
+        let (x, y) = (toggle_x(toggle), TOGGLE_Y);
+        let state = self.system.toggle(toggle);
+        let on = state == Some(true);
+        let hovered = self.hovered == Some(Hit::Toggle(toggle));
+        let fill = match (on, hovered) {
+            (true, false) => crate::accent::current().dark,
+            (true, true) => crate::accent::current().base,
+            (false, false) => [255, 255, 255, 14],
+            (false, true) => [255, 255, 255, 24],
+        };
+        fill_rounded(
+            image,
+            fill,
+            x * scale,
+            y * scale,
+            TOGGLE_W * scale,
+            TOGGLE_H * scale,
+            6.0 * scale,
+        );
+        if !on {
+            stroke_rounded(
+                image,
+                [255, 255, 255, 24],
+                x * scale,
+                y * scale,
+                TOGGLE_W * scale,
+                TOGGLE_H * scale,
+                6.0 * scale,
+                scale * 0.75,
+            );
+        }
+        let faded = if state.is_none() { 0.45 } else { 1.0 };
+        draw_icon_aligned(
+            image,
+            toggle_glyph(toggle),
+            (x + TOGGLE_W / 2.0) * scale,
+            (y + TOGGLE_H / 2.0) * scale,
+            16.0 * scale,
+            faded,
+        );
+        let size = 12.0 * scale;
+        let label = fit_text(
+            toggle_label(toggle),
+            size,
+            (TOGGLE_W + TILE_GAP - 4.0) * scale,
+        );
+        draw_text_on_baseline(
+            image,
+            &label,
+            (x + TOGGLE_W / 2.0) * scale - text_width(&label, size) / 2.0,
+            TOGGLE_LABEL_Y * scale,
+            size,
+            0.85 * faded,
         );
     }
 
@@ -1758,6 +1862,48 @@ mod tests {
             quick.hit_test(arrow, TILE_Y + 10.0),
             Some(Hit::Tile(Radio::Wifi))
         );
+    }
+
+    #[test]
+    fn toggles_are_clicked_on_the_button_or_its_name() {
+        let mut quick = state();
+        quick.system.night_light = Some(false);
+        quick.system.airplane = Some(false);
+        quick.system.saver = Some(true);
+        for toggle in Toggle::ALL {
+            let cx = toggle_x(toggle) + TOGGLE_W / 2.0;
+            let hit = Some(Hit::Toggle(toggle));
+            assert_eq!(quick.hit_test(cx, TOGGLE_Y + TOGGLE_H / 2.0), hit);
+            assert_eq!(quick.hit_test(cx, TOGGLE_LABEL_Y - 4.0), hit);
+        }
+        // Entre dos botones no hay ninguno.
+        let gap = toggle_x(Toggle::Airplane) - TILE_GAP / 2.0;
+        assert_eq!(quick.hit_test(gap, TOGGLE_Y + TOGGLE_H / 2.0), None);
+        // La fila no tapa ni los botones de arriba ni el brillo de abajo.
+        assert_eq!(
+            quick.hit_test(tile_x(Radio::Wifi) + 10.0, TILE_Y + TILE_H - 2.0),
+            Some(Hit::Tile(Radio::Wifi))
+        );
+        assert_eq!(
+            quick.hit_test(SLIDER_X + SLIDER_W / 2.0, BRIGHTNESS_Y),
+            Some(Hit::Slider(Slider::Brightness))
+        );
+        assert!(TOGGLE_LABEL_Y + 6.0 < BRIGHTNESS_Y - ROW_H / 2.0);
+    }
+
+    #[test]
+    fn unavailable_toggles_are_drawn_but_cannot_be_used() {
+        let mut quick = state();
+        // Sin batería (o con el cargador) el ahorro no se puede encender.
+        quick.system.saver = None;
+        let cx = toggle_x(Toggle::Saver) + TOGGLE_W / 2.0;
+        assert_eq!(quick.hit_test(cx, TOGGLE_Y + TOGGLE_H / 2.0), None);
+        let mut image = Pixmap::new(WIDTH as u32, HEIGHT as u32).unwrap();
+        let mut on = Pixmap::new(WIDTH as u32, HEIGHT as u32).unwrap();
+        quick.draw(&mut image, 1.0);
+        quick.system.saver = Some(true);
+        quick.draw(&mut on, 1.0);
+        assert_ne!(image.data(), on.data());
     }
 
     #[test]

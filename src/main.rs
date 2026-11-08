@@ -36,6 +36,7 @@ mod style;
 mod system;
 mod systray;
 mod textfield;
+mod toggles;
 mod tray;
 mod traypanel;
 mod update;
@@ -848,6 +849,15 @@ unsafe extern "system" fn quick_wndproc(
                         if let Some(on) = state {
                             *on = !*on;
                             panel.backend.set_radio(radio, *on);
+                        }
+                        panel.render();
+                    }
+                    Some(quick::Hit::Toggle(toggle)) => {
+                        // Como los de Wi-Fi y Bluetooth: se ve al instante y el hilo
+                        // de sistema lo confirma al releerlo.
+                        if let Some(on) = panel.model.system.toggle_mut(toggle) {
+                            *on = !*on;
+                            panel.backend.set_toggle(toggle, *on);
                         }
                         panel.render();
                     }
