@@ -12,6 +12,7 @@ mod autohide;
 mod autostart;
 mod bar;
 mod bluetooth;
+mod calendar;
 mod catalog;
 mod clock;
 mod font;
@@ -1545,6 +1546,8 @@ struct App {
     quick: Option<QuickWindow>,
     /// Panel de idioma del teclado; también se crea al abrirlo.
     language: Option<LanguageWindow>,
+    /// Calendario que abre la hora; también se crea al abrirlo.
+    calendar: Option<CalendarWindow>,
     /// Lanzador preparado en segundo plano al iniciar (catálogo e iconos), para que
     /// la primera apertura no tenga que esperar a leerlos.
     prepared: Option<std::sync::mpsc::Receiver<launcher::LauncherState>>,
@@ -1667,6 +1670,7 @@ impl App {
             launcher: None,
             quick: None,
             language: None,
+            calendar: None,
             prepared: Some(prepare_launcher(&pinned)),
             tooltip: Tooltip::new(hwnd).ok(),
             preview: PreviewWindow::new(hwnd).ok(),
@@ -1704,6 +1708,9 @@ impl App {
         if let Some(panel) = &mut self.language {
             panel.hide();
         }
+        if let Some(panel) = &mut self.calendar {
+            panel.hide();
+        }
         if let Some(panel) = &mut self.tray_panel {
             panel.hide();
         }
@@ -1732,6 +1739,7 @@ impl App {
             self.launcher.as_ref().filter(|p| p.visible).map(|p| p.hwnd),
             self.quick.as_ref().filter(|p| p.visible).map(|p| p.hwnd),
             self.language.as_ref().filter(|p| p.visible).map(|p| p.hwnd),
+            self.calendar.as_ref().filter(|p| p.visible).map(|p| p.hwnd),
             self.tray_panel
                 .as_ref()
                 .filter(|p| p.visible)
@@ -2092,6 +2100,27 @@ impl App {
         self.expand();
     }
 
+    /// Abre o cierra el calendario sobre la hora.
+    fn toggle_calendar(&mut self) {
+        if let Some(panel) = self.calendar.as_mut().filter(|p| p.visible) {
+            panel.hide();
+            return;
+        }
+        self.close_popups();
+        if self.calendar.is_none() {
+            match CalendarWindow::new(self.hwnd) {
+                Ok(panel) => self.calendar = Some(panel),
+                Err(_) => return,
+            }
+        }
+        let anchor = self.pos.x + self.bar.clock_center(self.scale).round() as i32;
+        let (top, bounds) = (self.y_shown, (self.screen_left, self.screen_right));
+        if let Some(panel) = &mut self.calendar {
+            panel.show(anchor, top, bounds);
+        }
+        self.expand();
+    }
+
     fn check_priority(&mut self, raise: bool) {
         let monitor = windows::Win32::Foundation::RECT {
             left: self.screen_left,
@@ -2229,6 +2258,9 @@ impl App {
             return;
         }
         if target == HoverTarget::Language && self.language.as_ref().is_some_and(|l| l.visible) {
+            return;
+        }
+        if target == HoverTarget::Clock && self.calendar.as_ref().is_some_and(|c| c.visible) {
             return;
         }
         // Programa con ventana abierta: vista previa en lugar del nombre.
@@ -2672,9 +2704,10 @@ unsafe extern "system" fn wndproc(hwnd: HWND, msg: u32, wparam: WPARAM, lparam: 
                             app.toggle_quick();
                         }
                         HoverTarget::Clock => {
-                            let _ = std::process::Command::new("explorer.exe")
-                                .arg("ms-settings:dateandtime")
-                                .spawn();
+                            if let Some(tip) = &mut app.tooltip {
+                                tip.hide();
+                            }
+                            app.toggle_calendar();
                         }
                     }
                     app.start_animating();
@@ -2923,6 +2956,7 @@ unsafe extern "system" fn wndproc(hwnd: HWND, msg: u32, wparam: WPARAM, lparam: 
                             || app.launcher.as_ref().is_some_and(|l| l.visible)
                             || app.quick.as_ref().is_some_and(|q| q.visible)
                             || app.language.as_ref().is_some_and(|l| l.visible)
+                            || app.calendar.as_ref().is_some_and(|c| c.visible)
                             || app.tray_panel.as_ref().is_some_and(|p| p.visible)
                             || app.app_menu.as_ref().is_some_and(|m| m.visible)
                             || app.preview.as_ref().is_some_and(|p| p.visible)
@@ -3208,6 +3242,229 @@ unsafe extern "system" fn language_wndproc(
                     0x0D => {
                         if let Some(language::Hit::Layout(index)) = panel.model.hovered {
                             choose_language(app, index);
+                        }
+                    }
+                    _ => {}
+                }
+            });
+        }
+        _ => return DefWindowProcW(hwnd, msg, wparam, lparam),
+    }
+    LRESULT(0)
+}
+
+/// Calendario que se abre sobre la hora del dock.
+struct CalendarWindow {
+    hwnd: HWND,
+    backdrop: Option<style::Backdrop>,
+    surface: Option<Surface>,
+    pos: POINT,
+    scale: f32,
+    model: calendar::CalendarState,
+    visible: bool,
+    transition: launcher::Transition,
+}
+impl CalendarWindow {
+    fn new(owner: HWND) -> Result<Self> {
+        let hwnd = unsafe {
+            CreateWindowExW(
+                WS_EX_LAYERED | WS_EX_TOPMOST | WS_EX_TOOLWINDOW,
+                w!("GlassBarCalendar"),
+                w!("GlassBar — Calendario"),
+                WS_POPUP,
+                0,
+                0,
+                1,
+                1,
+                Some(owner),
+                None,
+                Some(GetModuleHandleW(None)?.into()),
+                None,
+            )?
+        };
+        Ok(Self {
+            hwnd,
+            backdrop: style::Backdrop::new(),
+            surface: None,
+            pos: POINT::default(),
+            scale: 1.0,
+            model: calendar::CalendarState::new(calendar::today(), calendar::Names::default()),
+            visible: false,
+            transition: launcher::Transition::hidden(),
+        })
+    }
+    /// Lo abre sobre `anchor_x`, encima del dock, en el mes de hoy.
+    fn show(&mut self, anchor_x: i32, dock_top: i32, (left, right): (i32, i32)) {
+        let today = calendar::today();
+        self.model = calendar::CalendarState::new(today, calendar::names(today));
+        let (_, dpi) = monitors::get_info(monitors::primary());
+        self.scale = dpi.max(0.3);
+        let width = (calendar::WIDTH * self.scale).ceil() as u32;
+        let height = (calendar::HEIGHT * self.scale).ceil() as u32;
+        let Ok(surface) = Surface::new(width, height) else {
+            return;
+        };
+        self.surface = Some(surface);
+        let margin = (12.0 * self.scale).round() as i32;
+        self.pos = POINT {
+            x: (anchor_x - width as i32 / 2).clamp(
+                left + margin,
+                (right - width as i32 - margin).max(left + margin),
+            ),
+            y: dock_top - height as i32 - margin,
+        };
+        self.visible = true;
+        self.transition.open(Instant::now());
+        self.render();
+        take_focus(self.hwnd);
+    }
+    fn render(&mut self) {
+        if let Some(surface) = &mut self.surface {
+            self.model.draw(&mut surface.pixmap, self.scale);
+            surface.copy_to_dib();
+        }
+        self.present();
+    }
+    fn present(&mut self) {
+        if let Some(surface) = &self.surface {
+            present_popup(
+                self.hwnd,
+                surface,
+                self.pos,
+                self.scale,
+                &self.transition,
+                self.visible,
+                false,
+                self.backdrop.as_ref(),
+                &[panel_shape(surface, self.scale, 12.0)],
+            );
+        }
+    }
+    fn hide(&mut self) {
+        if !self.visible {
+            return;
+        }
+        self.visible = false;
+        self.model.hovered = None;
+        self.transition.close(Instant::now());
+        self.present();
+    }
+    /// Muestra otro mes.
+    fn shift(&mut self, delta: i32) {
+        self.model.shift(delta);
+        self.render();
+    }
+}
+impl Drop for CalendarWindow {
+    fn drop(&mut self) {
+        unsafe {
+            let _ = windows::Win32::UI::WindowsAndMessaging::DestroyWindow(self.hwnd);
+        }
+    }
+}
+
+unsafe extern "system" fn calendar_wndproc(
+    hwnd: HWND,
+    msg: u32,
+    wparam: WPARAM,
+    lparam: LPARAM,
+) -> LRESULT {
+    use windows::Win32::UI::WindowsAndMessaging::{
+        WA_INACTIVE, WM_ACTIVATE, WM_KEYDOWN, WM_MOUSEWHEEL,
+    };
+    let point = |scale: f32| {
+        (
+            (lparam.0 & 0xffff) as i16 as f32 / scale,
+            ((lparam.0 >> 16) & 0xffff) as i16 as f32 / scale,
+        )
+    };
+    match msg {
+        WM_ACTIVATE if (wparam.0 & 0xffff) as u32 == WA_INACTIVE => {
+            with_app(|app| app.calendar.as_mut().map(CalendarWindow::hide));
+        }
+        WM_TIMER if wparam.0 == TIMER_ANIM => {
+            with_app(|app| app.calendar.as_mut().map(CalendarWindow::present));
+        }
+        WM_MOUSEMOVE => {
+            with_app(|app| {
+                let Some(panel) = app.calendar.as_mut().filter(|p| p.visible) else {
+                    return;
+                };
+                let mut track = TRACKMOUSEEVENT {
+                    cbSize: std::mem::size_of::<TRACKMOUSEEVENT>() as u32,
+                    dwFlags: TME_LEAVE,
+                    hwndTrack: hwnd,
+                    dwHoverTime: 0,
+                };
+                let _ = TrackMouseEvent(&mut track);
+                let (x, y) = point(panel.scale);
+                let hit = panel.model.hit_test(x, y);
+                if hit != panel.model.hovered {
+                    panel.model.hovered = hit;
+                    panel.render();
+                }
+            });
+        }
+        WM_MOUSELEAVE => {
+            with_app(|app| {
+                if let Some(panel) = app.calendar.as_mut().filter(|p| p.visible) {
+                    if panel.model.hovered.take().is_some() {
+                        panel.render();
+                    }
+                }
+            });
+        }
+        // La rueda recorre los meses, como en el calendario de Windows.
+        WM_MOUSEWHEEL => {
+            with_app(|app| {
+                if let Some(panel) = app.calendar.as_mut().filter(|p| p.visible) {
+                    let delta = ((wparam.0 >> 16) & 0xffff) as i16;
+                    panel.shift(if delta > 0 { -1 } else { 1 });
+                }
+            });
+        }
+        WM_LBUTTONUP => {
+            with_app(|app| {
+                let Some(panel) = app.calendar.as_mut().filter(|p| p.visible) else {
+                    return;
+                };
+                let (x, y) = point(panel.scale);
+                match panel.model.hit_test(x, y) {
+                    Some(calendar::Hit::Previous) => panel.shift(-1),
+                    Some(calendar::Hit::Next) => panel.shift(1),
+                    Some(calendar::Hit::Today) => {
+                        if panel.model.go_today() {
+                            panel.render();
+                        }
+                    }
+                    Some(calendar::Hit::Day(index)) => {
+                        if panel.model.choose_day(index) {
+                            panel.render();
+                        }
+                    }
+                    Some(calendar::Hit::Settings) => {
+                        panel.hide();
+                        let _ = std::process::Command::new("explorer.exe")
+                            .arg("ms-settings:dateandtime")
+                            .spawn();
+                    }
+                    None => {}
+                }
+            });
+        }
+        // Escape cierra; flechas y RePág/AvPág cambian de mes; Inicio vuelve a hoy.
+        WM_KEYDOWN => {
+            with_app(|app| {
+                let Some(panel) = app.calendar.as_mut().filter(|p| p.visible) else {
+                    return;
+                };
+                match wparam.0 {
+                    0x1B => panel.hide(),
+                    0x21 | 0x25 | 0x26 => panel.shift(-1),
+                    0x22 | 0x27 | 0x28 => panel.shift(1),
+                    0x24 => {
+                        if panel.model.go_today() {
+                            panel.render();
                         }
                     }
                     _ => {}
@@ -4825,6 +5082,18 @@ fn main() -> Result<()> {
             ..Default::default()
         };
         if RegisterClassExW(&language_class) == 0 {
+            return Err(windows::core::Error::from_thread());
+        }
+
+        let calendar_class = WNDCLASSEXW {
+            cbSize: std::mem::size_of::<WNDCLASSEXW>() as u32,
+            lpfnWndProc: Some(calendar_wndproc),
+            hInstance: instance.into(),
+            hCursor: LoadCursorW(None, IDC_ARROW)?,
+            lpszClassName: w!("GlassBarCalendar"),
+            ..Default::default()
+        };
+        if RegisterClassExW(&calendar_class) == 0 {
             return Err(windows::core::Error::from_thread());
         }
 
