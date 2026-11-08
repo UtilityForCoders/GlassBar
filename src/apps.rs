@@ -39,6 +39,8 @@ pub struct AppItem {
     pub window: Option<isize>,
     /// Todas sus ventanas abiertas, de la más reciente a la más antigua.
     pub windows: Vec<isize>,
+    /// Alguna de sus ventanas pide atención (ver `attention`).
+    pub attention: bool,
     /// Para las apps de Store abiertas sin anclar: su ruta de AppsFolder, con la que
     /// se abren (su .exe no se puede abrir directamente).
     shell_path: Option<String>,
@@ -65,6 +67,7 @@ impl AppItem {
             is_running: false,
             window: None,
             windows: Vec::new(),
+            attention: false,
             shell_path: None,
             hover_spring: Spring::new(1.0, 260.0, 18.0),
             press_spring: Spring::new(1.0, 340.0, 20.0),
@@ -103,6 +106,7 @@ impl AppItem {
             is_running: true,
             window: Some(window.hwnd),
             windows: vec![window.hwnd],
+            attention: false,
             shell_path,
             hover_spring: Spring::new(1.0, 260.0, 18.0),
             press_spring: Spring::new(1.0, 340.0, 20.0),

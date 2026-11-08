@@ -403,8 +403,8 @@ unsafe fn network_name() -> Option<String> {
     (!name.trim().is_empty()).then_some(name)
 }
 
-/// Pantalla cuyo brillo controla el panel: la del monitor principal, donde está el
-/// dock. La integrada del portátil se controla con WMI; un monitor externo, por
+/// Pantalla cuyo brillo controla el panel: la del monitor donde está el dock (ver
+/// `monitors::dock`), que se vuelve a mirar cada vez que se abre. La integrada del portátil se controla con WMI; un monitor externo, por
 /// DDC/CI (el canal que usa su propio menú), si lo admite y lo tiene activado.
 enum Display {
     Internal,
@@ -413,9 +413,7 @@ enum Display {
 }
 impl Display {
     fn find(wmi: Option<&Brightness>) -> Self {
-        use windows::Win32::Foundation::POINT;
-        use windows::Win32::Graphics::Gdi::{MonitorFromPoint, MONITOR_DEFAULTTOPRIMARY};
-        let monitor = unsafe { MonitorFromPoint(POINT { x: 0, y: 0 }, MONITOR_DEFAULTTOPRIMARY) };
+        let monitor = crate::monitors::dock();
         let internal = unsafe { is_internal(monitor) };
         if internal == Some(true) {
             return if wmi.is_some() {

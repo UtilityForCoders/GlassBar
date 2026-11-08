@@ -7,6 +7,7 @@
 mod accent;
 mod appmenu;
 mod apps;
+mod attention;
 mod audio;
 mod autohide;
 mod autostart;
@@ -357,19 +358,8 @@ impl LauncherWindow {
         dock_left: i32,
         dock_top: i32,
     ) -> Result<Self> {
-        let (screen, dpi) = monitors::get_info(monitors::primary());
-        let scale = dpi
-            .min((screen.right - screen.left - 24) as f32 / launcher::WIDTH)
-            .min((dock_top - screen.top - 24) as f32 / launcher::HEIGHT)
-            .max(0.3);
-        let width = (launcher::WIDTH * scale).ceil() as u32;
-        let height = (launcher::HEIGHT * scale).ceil() as u32;
-        // Centrado sobre el dock, como el Inicio de Windows 11.
         let _ = dock_left;
-        let pos = POINT {
-            x: screen.left + (screen.right - screen.left - width as i32) / 2,
-            y: dock_top - height as i32 - 12,
-        };
+        let (scale, width, height, pos) = Self::geometry(dock_top);
         let surface = Surface::new(width, height)?;
         let hwnd = unsafe {
             CreateWindowExW(
@@ -402,6 +392,41 @@ impl LauncherWindow {
             visible: false,
             transition: launcher::Transition::hidden(),
         })
+    }
+    /// Escala, tamaño y posición: centrado en el monitor del dock y encima de él,
+    /// como el Inicio de Windows 11.
+    fn geometry(dock_top: i32) -> (f32, u32, u32, POINT) {
+        let (screen, dpi) = monitors::get_info(monitors::dock());
+        let scale = dpi
+            .min((screen.right - screen.left - 24) as f32 / launcher::WIDTH)
+            .min((dock_top - screen.top - 24) as f32 / launcher::HEIGHT)
+            .max(0.3);
+        let width = (launcher::WIDTH * scale).ceil() as u32;
+        let height = (launcher::HEIGHT * scale).ceil() as u32;
+        let pos = POINT {
+            x: screen.left + (screen.right - screen.left - width as i32) / 2,
+            y: dock_top - height as i32 - 12,
+        };
+        (scale, width, height, pos)
+    }
+    /// Lo lleva al monitor del dock, que pudo cambiar desde la última apertura.
+    fn relocate(&mut self, dock_top: i32) {
+        let (scale, width, height, pos) = Self::geometry(dock_top);
+        if (width, height) != (self.surface.width, self.surface.height) {
+            let Ok(surface) = Surface::new(width, height) else {
+                return;
+            };
+            self.surface = surface;
+        }
+        if scale != self.scale {
+            self.scale = scale;
+            self.model.reload_icons_with(launcher::IconLoader::start(
+                scale,
+                self.hwnd.0 as isize,
+                WM_LAUNCHER_ICONS,
+            ));
+        }
+        self.pos = pos;
     }
     fn render(&mut self) {
         self.model.draw(&mut self.surface.pixmap, self.scale);
@@ -589,7 +614,7 @@ struct QuickWindow {
 }
 impl QuickWindow {
     fn new(owner: HWND) -> Result<Self> {
-        let (_, dpi) = monitors::get_info(monitors::primary());
+        let (_, dpi) = monitors::get_info(monitors::dock());
         let scale = dpi.max(0.3);
         let width = (quick::WIDTH * scale).ceil() as u32;
         let height = (quick::HEIGHT * scale).ceil() as u32;
@@ -624,7 +649,17 @@ impl QuickWindow {
     }
     /// Encima de los iconos de estado (`anchor_x`), sin salirse de la pantalla.
     fn place(&mut self, anchor_x: i32, dock_top: i32) {
-        let (screen, _) = monitors::get_info(monitors::primary());
+        let (screen, dpi) = monitors::get_info(monitors::dock());
+        // El dock pudo pasar a un monitor con otra escala desde la última apertura.
+        let scale = dpi.max(0.3);
+        if scale != self.scale {
+            let width = (quick::WIDTH * scale).ceil() as u32;
+            let height = (self.model.height() * scale).ceil() as u32;
+            if let Ok(surface) = Surface::new(width, height) {
+                self.surface = surface;
+                self.scale = scale;
+            }
+        }
         let width = self.surface.width as i32;
         let margin = (12.0 * self.scale).round() as i32;
         self.pos = POINT {
@@ -1583,6 +1618,8 @@ struct App {
     updating: bool,
     update_sender: std::sync::mpsc::Sender<UpdateEvent>,
     update_events: std::sync::mpsc::Receiver<UpdateEvent>,
+    /// Ventanas que piden atención (ver `attention`).
+    attention: attention::Attention,
 }
 
 /// Respuesta de los hilos de las actualizaciones.
@@ -1606,6 +1643,7 @@ fn notify_update(hwnd: isize) {
 impl App {
     fn new(hwnd: HWND) -> Result<Self> {
         let monitor = monitors::primary();
+        monitors::set_dock(monitor);
         let (rc, scale) = monitors::get_info(monitor);
 
         let mut bar = BarState::new();
@@ -1688,6 +1726,7 @@ impl App {
             updating: false,
             update_sender,
             update_events,
+            attention: attention::Attention::install(hwnd),
         })
     }
 
@@ -2022,6 +2061,7 @@ impl App {
         } else if let Some(menu) = &mut self.launcher {
             // Conserva el catálogo y los iconos ya cargados; solo pone al día el uso.
             menu.model.refresh(&pinned);
+            menu.relocate(self.y_shown);
         }
         if let Some(menu) = &mut self.launcher {
             menu.show();
@@ -2092,6 +2132,102 @@ impl App {
         self.expand();
     }
 
+    /// Hay algo abierto desde el dock (un panel, un menú, un arrastre) que se
+    /// quedaría en el otro monitor si el dock cambiara de monitor.
+    fn busy(&self) -> bool {
+        self.bar.drag.is_some()
+            || self.launcher.as_ref().is_some_and(|p| p.visible)
+            || self.quick.as_ref().is_some_and(|p| p.visible)
+            || self.language.as_ref().is_some_and(|p| p.visible)
+            || self
+                .tray_panel
+                .as_ref()
+                .is_some_and(|p| p.visible || p.menu.is_some())
+            || self.app_menu.as_ref().is_some_and(|p| p.visible)
+            || self
+                .tray_clicked
+                .is_some_and(|at| at.elapsed() < Duration::from_millis(1500))
+            || menu_open()
+    }
+
+    /// Lleva el dock a `monitor`: sube desde su borde inferior, con su escala.
+    fn move_to_monitor(&mut self, monitor: windows::Win32::Graphics::Gdi::HMONITOR) {
+        monitors::set_dock(monitor);
+        self.close_popups();
+        if let Some(preview) = &mut self.preview {
+            preview.hide();
+        }
+        if let Some(tip) = &mut self.tooltip {
+            tip.hide();
+        }
+        // Sale del borde del monitor nuevo en vez de cruzar la pantalla.
+        self.visibility.motion.value = 0.0;
+        self.visibility.motion.velocity = 0.0;
+        self.fit_monitor();
+    }
+
+    /// Vuelve a leer el monitor del dock (tamaño, posición y escala) y lo recoloca;
+    /// si se desconectó, pasa al principal.
+    fn fit_monitor(&mut self) {
+        let monitor = monitors::dock();
+        monitors::set_dock(monitor);
+        let (rc, _) = monitors::get_info(monitor);
+        self.screen_top = rc.top;
+        self.screen_bottom = rc.bottom;
+        self.screen_left = rc.left;
+        self.screen_right = rc.right;
+        self.y_hidden = rc.bottom;
+        self.relayout();
+        self.check_priority(false);
+        self.update_style();
+    }
+
+    /// Marca las apps con alguna ventana que pide atención; `true` si cambió alguna.
+    fn mark_attention(&mut self) -> bool {
+        let mut changed = false;
+        for app in self
+            .bar
+            .primary_apps
+            .iter_mut()
+            .chain(&mut self.bar.open_apps)
+        {
+            let attention = self.attention.first_of(&app.windows).is_some();
+            changed |= attention != app.attention;
+            app.attention = attention;
+        }
+        changed
+    }
+
+    /// Atiende un aviso del Shell sobre una ventana (ver `attention`).
+    fn shell_event(&mut self, code: usize, window: isize) {
+        let change = self.attention.handle(code, window);
+        if change == attention::Change::None {
+            return;
+        }
+        // La ventana puede ser tan nueva que aún no esté en el dock.
+        if change == attention::Change::Started
+            && apps::update_running_apps(&mut self.bar.primary_apps, &mut self.bar.open_apps)
+        {
+            self.mark_attention();
+            self.relayout();
+        } else if self.mark_attention() {
+            self.render();
+        }
+        let shown = self
+            .bar
+            .primary_apps
+            .iter()
+            .chain(&self.bar.open_apps)
+            .any(|app| app.windows.contains(&window));
+        // Como la barra de Windows escondida, el dock se asoma un momento para avisar.
+        if change == attention::Change::Started && shown && !self.fullscreen {
+            self.reveal();
+            self.visibility
+                .defer_hide(Instant::now(), Duration::from_millis(3000));
+            self.start_animating();
+        }
+    }
+
     fn check_priority(&mut self, raise: bool) {
         let monitor = windows::Win32::Foundation::RECT {
             left: self.screen_left,
@@ -2155,7 +2291,7 @@ impl App {
 
     /// Ajusta tamaño y posición del dock al número de iconos.
     fn relayout(&mut self) {
-        let (rc, dpi) = monitors::get_info(monitors::primary());
+        let (rc, dpi) = monitors::get_info(monitors::dock());
         self.scale = dpi.min((rc.right - rc.left) as f32 / (self.bar.dock_width() + 40.0));
         let (width, height) = self.bar.window_size(self.scale);
         if let Ok(surface) = Surface::new(width, height) {
@@ -2415,6 +2551,11 @@ unsafe extern "system" fn wndproc(hwnd: HWND, msg: u32, wparam: WPARAM, lparam: 
         with_app(|app| app.tray.register());
         return LRESULT(0);
     }
+    // Una ventana pide atención, o se activó o cerró una que la pedía.
+    if msg != 0 && msg == attention::hook_message() {
+        with_app(|app| app.shell_event(wparam.0, lparam.0));
+        return LRESULT(0);
+    }
     match msg {
         // Cambió el color de énfasis (Windows avisa con estos dos mensajes, también
         // por otros ajustes): se vuelve a leer y, si es otro, se redibuja lo abierto.
@@ -2435,6 +2576,11 @@ unsafe extern "system" fn wndproc(hwnd: HWND, msg: u32, wparam: WPARAM, lparam: 
         }
         WM_UPDATE => {
             with_app(|app| app.handle_update_events());
+            LRESULT(0)
+        }
+        // Se conectó o desconectó un monitor, o cambió su resolución.
+        windows::Win32::UI::WindowsAndMessaging::WM_DISPLAYCHANGE => {
+            with_app(|app| app.fit_monitor());
             LRESULT(0)
         }
         WM_TRAY_ICONS => {
@@ -2468,7 +2614,18 @@ unsafe extern "system" fn wndproc(hwnd: HWND, msg: u32, wparam: WPARAM, lparam: 
             LRESULT(0)
         }
         WM_SHOW_LAUNCHER => {
-            with_app(|app| app.toggle_launcher());
+            with_app(|app| {
+                // Con la tecla Windows, en el monitor del cursor: donde se está trabajando.
+                if !app.launcher.as_ref().is_some_and(|menu| menu.visible) {
+                    let mut cursor = POINT::default();
+                    let _ = GetCursorPos(&mut cursor);
+                    let monitor = monitors::at(cursor);
+                    if monitor != monitors::dock() {
+                        app.move_to_monitor(monitor);
+                    }
+                }
+                app.toggle_launcher();
+            });
             LRESULT(0)
         }
         WM_DROPFILES => {
@@ -2629,9 +2786,13 @@ unsafe extern "system" fn wndproc(hwnd: HWND, msg: u32, wparam: WPARAM, lparam: 
                             if let Some(menu) = &mut app.launcher {
                                 menu.hide();
                             }
+                            // La ventana que pide atención, si la hay, como en Windows.
+                            let attention = &app.attention;
                             if let Some(a) = app.bar.item_mut(target) {
                                 a.press_spring.set_target(1.0);
-                                if a.activate() {
+                                if let Some(window) = attention.first_of(&a.windows) {
+                                    apps::focus_window(window);
+                                } else if a.activate() {
                                     let _ = catalog::record(&a.entry);
                                 }
                             }
@@ -2640,9 +2801,10 @@ unsafe extern "system" fn wndproc(hwnd: HWND, msg: u32, wparam: WPARAM, lparam: 
                             if let Some(menu) = &mut app.launcher {
                                 menu.hide();
                             }
+                            let attention = &app.attention;
                             if let Some(a) = app.bar.item_mut(target) {
                                 a.press_spring.set_target(1.0);
-                                if let Some(hwnd) = a.window {
+                                if let Some(hwnd) = attention.first_of(&a.windows).or(a.window) {
                                     apps::focus_window(hwnd);
                                 }
                             }
@@ -2843,9 +3005,13 @@ unsafe extern "system" fn wndproc(hwnd: HWND, msg: u32, wparam: WPARAM, lparam: 
                         &mut app.bar.primary_apps,
                         &mut app.bar.open_apps,
                     );
+                    // Por si se perdió el aviso de que una ventana dejó de pedir atención.
+                    app.attention.prune();
+                    let attention_changed = app.mark_attention();
                     if opened_or_closed || resized {
                         app.relayout();
                     } else if status_changed
+                        || attention_changed
                         || running(app) != was_running
                         || app.bar.clock_outdated()
                     {
@@ -2881,6 +3047,15 @@ unsafe extern "system" fn wndproc(hwnd: HWND, msg: u32, wparam: WPARAM, lparam: 
                     let mut pt = POINT::default();
                     unsafe {
                         let _ = GetCursorPos(&mut pt);
+                    }
+                    // El dock pasa al monitor de cuyo borde inferior se acerca el cursor,
+                    // como si cada pantalla tuviera el suyo.
+                    let monitor = monitors::at(pt);
+                    if monitor != monitors::dock() && !app.busy() {
+                        let (rc, dpi) = monitors::get_info(monitor);
+                        if cursor_at_edge(pt, rc.left, rc.right, rc.bottom, dpi) {
+                            app.move_to_monitor(monitor);
+                        }
                     }
                     let at_edge = cursor_at_edge(
                         pt,
@@ -3043,7 +3218,7 @@ impl LanguageWindow {
             current,
             hovered: None,
         };
-        let (_, dpi) = monitors::get_info(monitors::primary());
+        let (_, dpi) = monitors::get_info(monitors::dock());
         self.scale = dpi.max(0.3);
         let width = (language::WIDTH * self.scale).ceil() as u32;
         let height = (self.model.height() * self.scale).ceil() as u32;
@@ -3308,7 +3483,7 @@ impl TrayWindow {
     }
     fn show(&mut self, anchor_x: i32, dock_top: i32, bounds: (i32, i32)) {
         self.anchor = (anchor_x, dock_top, bounds);
-        let (_, dpi) = monitors::get_info(monitors::primary());
+        let (_, dpi) = monitors::get_info(monitors::dock());
         self.scale = dpi.max(0.3);
         self.visible = true;
         self.transition.open(Instant::now());
@@ -3572,7 +3747,7 @@ impl AppMenuWindow {
         (left, right): (i32, i32),
     ) {
         use appmenu::{Entry, Icon};
-        let (_, dpi) = monitors::get_info(monitors::primary());
+        let (_, dpi) = monitors::get_info(monitors::dock());
         self.scale = dpi.max(0.3);
         if self.icons_scale != self.scale {
             self.icons.clear();
@@ -3667,7 +3842,7 @@ impl AppMenuWindow {
         cursor: POINT,
         (left, right): (i32, i32),
     ) {
-        let (_, dpi) = monitors::get_info(monitors::primary());
+        let (_, dpi) = monitors::get_info(monitors::dock());
         self.scale = dpi.max(0.3);
         // Los submenús, a la derecha si caben; si no, a la izquierda.
         let wide = appmenu::Cascade::new(root, false);
