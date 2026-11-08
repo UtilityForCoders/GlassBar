@@ -892,7 +892,21 @@ unsafe extern "system" fn quick_wndproc(
                         // de sistema lo confirma al releerlo.
                         if let Some(on) = panel.model.system.toggle_mut(toggle) {
                             *on = !*on;
-                            panel.backend.set_toggle(toggle, *on);
+                            let on = *on;
+                            panel.backend.set_toggle(toggle, on);
+                            // El modo avión apaga el Wi-Fi y el Bluetooth: se ve ya, sin
+                            // esperar a que el hilo de sistema relea las radios. Al
+                            // quitarlo, Windows decide cuáles vuelven.
+                            if toggle == toggles::Toggle::Airplane && on {
+                                for radio in [
+                                    &mut panel.model.system.wifi,
+                                    &mut panel.model.system.bluetooth,
+                                ] {
+                                    if radio.is_some() {
+                                        *radio = Some(false);
+                                    }
+                                }
+                            }
                         }
                         panel.render();
                     }
@@ -3021,6 +3035,12 @@ unsafe extern "system" fn wndproc(hwnd: HWND, msg: u32, wparam: WPARAM, lparam: 
                     app.check_priority(false);
                     // Red, volumen y batería; si aparece o desaparece la batería cambia el ancho.
                     let status = app.status.read();
+                    // Ahorro de batería encendido desde el panel: al conectar el
+                    // cargador el umbral vuelve a ser el del usuario, para que no se
+                    // encienda solo al desconectarlo (como con el botón de Windows).
+                    if status.battery.is_some_and(|b| b.plugged) && toggles::saver_changed() {
+                        toggles::restore_saver();
+                    }
                     // El idioma también cambia con atajos (Win+Espacio, Alt+Mayús).
                     app.update_keyboard();
                     // Maximizar o restaurar no cambia la ventana activa. Con el dock
@@ -3186,6 +3206,7 @@ unsafe extern "system" fn wndproc(hwnd: HWND, msg: u32, wparam: WPARAM, lparam: 
         windows::Win32::UI::WindowsAndMessaging::WM_ENDSESSION => {
             if wparam.0 != 0 {
                 with_app(|app| app.shell.restore());
+                toggles::restore_saver();
             }
             DefWindowProcW(hwnd, msg, wparam, lparam)
         }
@@ -5360,6 +5381,8 @@ fn main() -> Result<()> {
         }
 
         APP.with(|cell| cell.borrow_mut().take());
+        // Sin GlassBar no hay quien devuelva el umbral del ahorro de batería.
+        toggles::restore_saver();
     }
     Ok(())
 }

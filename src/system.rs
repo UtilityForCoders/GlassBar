@@ -1,7 +1,8 @@
 //! Ajustes del sistema para el panel rápido: Wi-Fi y Bluetooth (encender/apagar),
-//! luz nocturna, modo avión y ahorro de batería (ver `toggles`), redes Wi-Fi, dispositivos Bluetooth, salidas de audio, brillo de la pantalla del dock y nombre de la red. Leerlos y
-//! cambiarlos puede tardar (WMI, radios, búsquedas), así que se hace en un hilo
-//! aparte que avisa al panel con un mensaje al terminar.
+//! luz nocturna, modo avión y ahorro de batería (ver `toggles`), redes Wi-Fi,
+//! dispositivos Bluetooth, salidas de audio, brillo de la pantalla del dock y nombre
+//! de la red. Leerlos y cambiarlos puede tardar (WMI, radios, búsquedas), así que se
+//! hace en un hilo aparte que avisa al panel con un mensaje al terminar.
 use crate::bluetooth::Device;
 use crate::toggles::Toggle;
 use crate::wifi::{Network, Security, Wlan};

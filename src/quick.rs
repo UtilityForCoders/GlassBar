@@ -20,7 +20,7 @@ use std::time::{Duration, Instant};
 use tiny_skia::Pixmap;
 
 pub const WIDTH: f32 = 340.0;
-pub const HEIGHT: f32 = 316.0;
+pub const HEIGHT: f32 = 328.0;
 const PAD: f32 = 16.0;
 const TILE_Y: f32 = 16.0;
 const TILE_H: f32 = 60.0;
@@ -33,16 +33,18 @@ const TOGGLE_H: f32 = 48.0;
 const TOGGLE_W: f32 = (WIDTH - PAD * 2.0 - TILE_GAP * 2.0) / 3.0;
 /// Línea base del nombre bajo cada botón.
 const TOGGLE_LABEL_Y: f32 = TOGGLE_Y + TOGGLE_H + 18.0;
+/// Línea base de la nota bajo el nombre (por qué no está disponible).
+const TOGGLE_NOTE_Y: f32 = TOGGLE_LABEL_Y + 15.0;
 /// Centro vertical de las filas de brillo y volumen.
-const BRIGHTNESS_Y: f32 = 184.0;
-const VOLUME_Y: f32 = 232.0;
+const BRIGHTNESS_Y: f32 = 196.0;
+const VOLUME_Y: f32 = 244.0;
 const ROW_H: f32 = 40.0;
 const SLIDER_X: f32 = PAD + 40.0;
 /// Las barras dejan sitio a la derecha para el porcentaje y, en la del volumen, la
 /// flecha que abre las salidas de audio.
 const SLIDER_W: f32 = WIDTH - PAD - 76.0 - SLIDER_X;
 const AUDIO_BUTTON: f32 = 28.0;
-const FOOTER_Y: f32 = 268.0;
+const FOOTER_Y: f32 = 280.0;
 const MORE_W: f32 = 112.0;
 fn background() -> [u8; 4] {
     crate::glass::panel()
@@ -804,8 +806,17 @@ impl QuickState {
         );
     }
 
+    /// Por qué un botón no está disponible, si hay algo que decir: el ahorro de
+    /// batería no se puede encender con el cargador conectado.
+    fn toggle_note(&self, toggle: Toggle) -> Option<&'static str> {
+        let plugged = self.battery.is_some_and(|b| b.plugged);
+        (toggle == Toggle::Saver && self.system.saver.is_none() && plugged)
+            .then_some("Con el cargador")
+    }
+
     /// Botón cuadrado de luz nocturna, modo avión o ahorro de batería, con su nombre
-    /// debajo. Encendido lleva el color de énfasis; no disponible, atenuado.
+    /// debajo. Encendido lleva el color de énfasis; no disponible, atenuado y, si se
+    /// sabe, con el motivo bajo el nombre.
     fn draw_toggle(&self, image: &mut Pixmap, toggle: Toggle, scale: f32) {
         let (x, y) = (toggle_x(toggle), TOGGLE_Y);
         let state = self.system.toggle(toggle);
@@ -861,6 +872,18 @@ impl QuickState {
             size,
             0.85 * faded,
         );
+        if let Some(note) = self.toggle_note(toggle) {
+            let size = 10.5 * scale;
+            let note = fit_text(note, size, (TOGGLE_W + TILE_GAP - 4.0) * scale);
+            draw_text_on_baseline(
+                image,
+                &note,
+                (x + TOGGLE_W / 2.0) * scale - text_width(&note, size) / 2.0,
+                TOGGLE_NOTE_Y * scale,
+                size,
+                0.6,
+            );
+        }
     }
 
     /// Vista de lista: cabecera con "volver", lista desplazable y pie.
@@ -1888,7 +1911,8 @@ mod tests {
             quick.hit_test(SLIDER_X + SLIDER_W / 2.0, BRIGHTNESS_Y),
             Some(Hit::Slider(Slider::Brightness))
         );
-        assert!(TOGGLE_LABEL_Y + 6.0 < BRIGHTNESS_Y - ROW_H / 2.0);
+        // Ni la nota bajo el nombre.
+        assert!(TOGGLE_NOTE_Y + 4.0 < BRIGHTNESS_Y - ROW_H / 2.0);
     }
 
     #[test]
@@ -1904,6 +1928,22 @@ mod tests {
         quick.system.saver = Some(true);
         quick.draw(&mut on, 1.0);
         assert_ne!(image.data(), on.data());
+        // Con el cargador se dice por qué; sin batería no hay nada que decir.
+        quick.system.saver = None;
+        assert_eq!(quick.toggle_note(Toggle::Saver), None);
+        quick.battery = Some(Battery {
+            percent: 80,
+            plugged: true,
+            charging: true,
+            remaining: None,
+        });
+        assert_eq!(quick.toggle_note(Toggle::Saver), Some("Con el cargador"));
+        assert_eq!(quick.toggle_note(Toggle::Airplane), None);
+        quick.battery = Some(Battery {
+            plugged: false,
+            ..quick.battery.unwrap()
+        });
+        assert_eq!(quick.toggle_note(Toggle::Saver), None);
     }
 
     #[test]
