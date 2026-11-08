@@ -125,6 +125,11 @@ impl BarState {
     fn overflow_left(&self) -> f32 {
         self.apps_right() + TRAY_GAP
     }
+    /// Centro horizontal del reloj, en píxeles de la ventana: el calendario se abre
+    /// sobre él.
+    pub fn clock_center(&self, scale: f32) -> f32 {
+        (SHADOW_PAD_X + self.dock_width() - CLOCK_W / 2.0) * scale
+    }
     /// Centro horizontal del indicador de idioma, en píxeles de la ventana.
     pub fn language_center(&self, scale: f32) -> f32 {
         (SHADOW_PAD_X + self.language_left() + LANGUAGE_W / 2.0) * scale
@@ -176,8 +181,7 @@ impl BarState {
         }
         if target == HoverTarget::Clock {
             // Como en Windows: la fecha completa al pasar el cursor por el reloj.
-            let cx = (SHADOW_PAD_X + self.dock_width() - CLOCK_W / 2.0) * scale;
-            return Some((crate::clock::today(true), cx));
+            return Some((crate::clock::today(true), self.clock_center(scale)));
         }
         if let HoverTarget::Status(index) = target {
             let item = self.status_item(index)?;
