@@ -1,7 +1,7 @@
 //! Dock compacto: Inicio, programas anclados, estado del sistema y hora.
 use crate::apps::{default_apps, draw_app_icon, draw_windows_start_icon, AppItem};
 use crate::clock::{draw_icon_aligned, ClockRenderer};
-use crate::glass::{draw_dock, draw_hover, draw_running_dot};
+use crate::glass::{draw_attention, draw_attention_dot, draw_dock, draw_hover, draw_running_dot};
 use crate::spring::Spring;
 use crate::status::{Item, Status};
 use tiny_skia::Pixmap;
@@ -374,6 +374,9 @@ impl BarState {
                 lifted = Some((app, cx));
                 continue;
             }
+            if app.attention {
+                draw_attention(pixmap, cx, cy, scale);
+            }
             if self.hovered == Some(target) && dragged.is_none() {
                 draw_hover(pixmap, cx, cy, scale);
             }
@@ -386,7 +389,9 @@ impl BarState {
                 ICON_SIZE * app.hover_spring.value * app.press_spring.value,
                 scale,
             );
-            if app.is_running {
+            if app.attention {
+                draw_attention_dot(pixmap, cx, y + (DOCK_H - 5.0) * scale, scale);
+            } else if app.is_running {
                 draw_running_dot(pixmap, cx, y + (DOCK_H - 5.0) * scale, scale);
             }
         }
@@ -603,6 +608,21 @@ mod tests {
         assert_ne!(first.data(), hovered.data());
         bar.hovered = None;
         assert_eq!(first.data(), draw(&bar).data());
+    }
+
+    #[test]
+    fn an_app_asking_for_attention_is_drawn_differently() {
+        let mut bar = BarState::new();
+        bar.primary_apps = vec![item("a.exe")];
+        let (w, h) = bar.window_size(1.0);
+        let draw = |bar: &BarState| {
+            let mut image = Pixmap::new(w, h).unwrap();
+            bar.draw(&mut image, 1.0);
+            image
+        };
+        let calm = draw(&bar);
+        bar.primary_apps[0].attention = true;
+        assert_ne!(calm.data(), draw(&bar).data());
     }
 
     #[test]

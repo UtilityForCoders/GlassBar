@@ -76,6 +76,37 @@ pub fn draw_hover(pixmap: &mut Pixmap, cx: f32, cy: f32, scale: f32) {
         10.0 * scale,
     );
 }
+/// Naranja con el que Windows 11 marca las apps que piden atención.
+const ATTENTION: [u8; 3] = [247, 99, 12];
+
+/// Fondo naranja tenue detrás del icono de una app que pide atención.
+pub fn draw_attention(pixmap: &mut Pixmap, cx: f32, cy: f32, scale: f32) {
+    let [r, g, b] = ATTENTION;
+    fill_rounded(
+        pixmap,
+        [r, g, b, 64],
+        cx - 19.0 * scale,
+        cy - 19.0 * scale,
+        38.0 * scale,
+        38.0 * scale,
+        10.0 * scale,
+    );
+}
+
+/// Indicador de una app que pide atención: más ancho que el de abierta y naranja.
+pub fn draw_attention_dot(pixmap: &mut Pixmap, cx: f32, cy: f32, scale: f32) {
+    let [r, g, b] = ATTENTION;
+    fill_rounded(
+        pixmap,
+        [r, g, b, 255],
+        cx - 7.0 * scale,
+        cy,
+        14.0 * scale,
+        2.0 * scale,
+        scale,
+    );
+}
+
 pub fn draw_running_dot(pixmap: &mut Pixmap, cx: f32, cy: f32, scale: f32) {
     fill_rounded(
         pixmap,
