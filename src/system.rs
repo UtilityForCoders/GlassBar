@@ -1,8 +1,10 @@
 //! Ajustes del sistema para el panel rápido: Wi-Fi y Bluetooth (encender/apagar),
-//! redes Wi-Fi, dispositivos Bluetooth, salidas de audio, brillo de la pantalla del dock y nombre de la red. Leerlos y
-//! cambiarlos puede tardar (WMI, radios, búsquedas), así que se hace en un hilo
-//! aparte que avisa al panel con un mensaje al terminar.
+//! luz nocturna, modo avión y ahorro de batería (ver `toggles`), redes Wi-Fi,
+//! dispositivos Bluetooth, salidas de audio, brillo de la pantalla del dock y nombre
+//! de la red. Leerlos y cambiarlos puede tardar (WMI, radios, búsquedas), así que se
+//! hace en un hilo aparte que avisa al panel con un mensaje al terminar.
 use crate::bluetooth::Device;
+use crate::toggles::Toggle;
 use crate::wifi::{Network, Security, Wlan};
 use std::sync::mpsc::{channel, Receiver, RecvTimeoutError, Sender};
 use std::sync::{Arc, Mutex};
@@ -29,6 +31,27 @@ pub struct Snapshot {
     pub join_failed: Option<String>,
     /// Salidas de audio y aplicaciones que lo usan.
     pub audio: crate::audio::Mixer,
+    pub night_light: Option<bool>,
+    pub airplane: Option<bool>,
+    /// Ahorro de batería; `None` sin batería o con el cargador conectado.
+    pub saver: Option<bool>,
+}
+
+impl Snapshot {
+    pub fn toggle(&self, toggle: Toggle) -> Option<bool> {
+        match toggle {
+            Toggle::NightLight => self.night_light,
+            Toggle::Airplane => self.airplane,
+            Toggle::Saver => self.saver,
+        }
+    }
+    pub fn toggle_mut(&mut self, toggle: Toggle) -> &mut Option<bool> {
+        match toggle {
+            Toggle::NightLight => &mut self.night_light,
+            Toggle::Airplane => &mut self.airplane,
+            Toggle::Saver => &mut self.saver,
+        }
+    }
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -40,6 +63,7 @@ pub enum Radio {
 enum Command {
     Refresh,
     SetRadio(Radio, bool),
+    SetToggle(Toggle, bool),
     SetBrightness(u8),
     /// Buscar redes Wi-Fi (al abrir la lista).
     Scan,
@@ -93,6 +117,9 @@ impl Backend {
     }
     pub fn set_radio(&self, radio: Radio, on: bool) {
         let _ = self.sender.send(Command::SetRadio(radio, on));
+    }
+    pub fn set_toggle(&self, toggle: Toggle, on: bool) {
+        let _ = self.sender.send(Command::SetToggle(toggle, on));
     }
     pub fn set_brightness(&self, percent: u8) {
         let _ = self.sender.send(Command::SetBrightness(percent.min(100)));
@@ -209,6 +236,13 @@ fn run(
             match command {
                 Command::SetRadio(radio, on) => {
                     set_radio(*radio, *on);
+                    reread = true;
+                }
+                Command::SetToggle(toggle, on) => {
+                    crate::toggles::set(*toggle, *on);
+                    // El modo avión apaga y enciende las radios, y Windows tarda en
+                    // aplicar los demás: se relee en unos segundos.
+                    (rereads, reread_at) = (2, Instant::now() + SETTLE);
                     reread = true;
                 }
                 Command::Join {
@@ -336,6 +370,9 @@ fn run(
                 error: audio_error.clone(),
                 ..crate::audio::read(&mut icons)
             },
+            night_light: crate::toggles::read(Toggle::NightLight),
+            airplane: crate::toggles::read(Toggle::Airplane),
+            saver: crate::toggles::read(Toggle::Saver),
         };
         if let Ok(mut shared) = shared.lock() {
             *shared = snapshot;
@@ -403,8 +440,8 @@ unsafe fn network_name() -> Option<String> {
     (!name.trim().is_empty()).then_some(name)
 }
 
-/// Pantalla cuyo brillo controla el panel: la del monitor principal, donde está el
-/// dock. La integrada del portátil se controla con WMI; un monitor externo, por
+/// Pantalla cuyo brillo controla el panel: la del monitor donde está el dock (ver
+/// `monitors::dock`), que se vuelve a mirar cada vez que se abre. La integrada del portátil se controla con WMI; un monitor externo, por
 /// DDC/CI (el canal que usa su propio menú), si lo admite y lo tiene activado.
 enum Display {
     Internal,
@@ -413,9 +450,7 @@ enum Display {
 }
 impl Display {
     fn find(wmi: Option<&Brightness>) -> Self {
-        use windows::Win32::Foundation::POINT;
-        use windows::Win32::Graphics::Gdi::{MonitorFromPoint, MONITOR_DEFAULTTOPRIMARY};
-        let monitor = unsafe { MonitorFromPoint(POINT { x: 0, y: 0 }, MONITOR_DEFAULTTOPRIMARY) };
+        let monitor = crate::monitors::dock();
         let internal = unsafe { is_internal(monitor) };
         if internal == Some(true) {
             return if wmi.is_some() {

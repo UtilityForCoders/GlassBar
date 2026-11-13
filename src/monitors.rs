@@ -4,7 +4,7 @@ use windows::core::BOOL;
 use windows::Win32::Foundation::{LPARAM, POINT, RECT};
 use windows::Win32::Graphics::Gdi::{
     EnumDisplayMonitors, GetMonitorInfoW, MonitorFromPoint, HDC, HMONITOR, MONITORINFO,
-    MONITORINFOEXW, MONITOR_DEFAULTTOPRIMARY,
+    MONITORINFOEXW, MONITOR_DEFAULTTONEAREST, MONITOR_DEFAULTTOPRIMARY,
 };
 use windows::Win32::UI::HiDpi::{GetDpiForMonitor, MDT_EFFECTIVE_DPI};
 
@@ -77,4 +77,31 @@ pub fn get_info(monitor: HMONITOR) -> (RECT, f32) {
     }
     let scale = dpi_x as f32 / 96.0;
     (info.rcMonitor, scale)
+}
+
+/// Monitor en el que está el dock ahora (0 hasta que se elige uno).
+static DOCK: std::sync::atomic::AtomicIsize = std::sync::atomic::AtomicIsize::new(0);
+
+/// Monitor del dock: pasa al de cuyo borde inferior se acerca el cursor. Si ya no
+/// existe (se desconectó), el principal. Los paneles se abren en este.
+pub fn dock() -> HMONITOR {
+    let handle = HMONITOR(DOCK.load(std::sync::atomic::Ordering::Relaxed) as *mut _);
+    let mut info = MONITORINFO {
+        cbSize: std::mem::size_of::<MONITORINFO>() as u32,
+        ..Default::default()
+    };
+    if !handle.is_invalid() && unsafe { GetMonitorInfoW(handle, &mut info) }.as_bool() {
+        handle
+    } else {
+        primary()
+    }
+}
+
+pub fn set_dock(monitor: HMONITOR) {
+    DOCK.store(monitor.0 as isize, std::sync::atomic::Ordering::Relaxed);
+}
+
+/// Monitor bajo `point`, o el más cercano.
+pub fn at(point: POINT) -> HMONITOR {
+    unsafe { MonitorFromPoint(point, MONITOR_DEFAULTTONEAREST) }
 }

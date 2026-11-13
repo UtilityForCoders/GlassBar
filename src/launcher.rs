@@ -382,6 +382,15 @@ impl LauncherState {
     pub fn load_icons_with(&mut self, loader: IconLoader) {
         self.loader = Some(loader);
     }
+    /// El lanzador pasa a otra escala (el dock se fue a un monitor con otro DPI):
+    /// se olvidan los iconos, que estaban reducidos a la anterior, y se vuelven a
+    /// cargar con `loader` a medida que se dibujan.
+    pub fn reload_icons_with(&mut self, loader: IconLoader) {
+        self.icons.clear();
+        self.requested.clear();
+        self.detail_icons.clear();
+        self.loader = Some(loader);
+    }
     /// Guarda los iconos que ya llegaron del hilo de carga.
     fn take_loaded_icons(&mut self) {
         if let Some(loader) = &self.loader {

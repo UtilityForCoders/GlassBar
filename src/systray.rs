@@ -386,6 +386,9 @@ impl Host {
     /// colocar sus ventanas) y delante, para seguir recibiendo los iconos. Si
     /// Explorer pasó la suya por encima, los programas le mandaron a ella sus
     /// iconos: se les vuelven a pedir, como mucho una vez por minuto.
+    ///
+    /// La bandeja propia es de otro hilo, que puede estar hasta 2 s esperando a
+    /// Explorer: se mueve sin esperar a que lo atienda (`SWP_ASYNCWINDOWPOS`).
     pub fn keep_in_front(&self) {
         unsafe {
             if let Some(explorer) = crate::shell::explorer_tray() {
@@ -401,7 +404,7 @@ impl Host {
                         theirs.top,
                         theirs.right - theirs.left,
                         theirs.bottom - theirs.top,
-                        SWP_NOACTIVATE | SWP_NOZORDER,
+                        SWP_NOACTIVATE | SWP_NOZORDER | SWP_ASYNCWINDOWPOS,
                     );
                 }
             }
@@ -415,7 +418,7 @@ impl Host {
                 0,
                 0,
                 0,
-                SWP_NOACTIVATE | SWP_NOMOVE | SWP_NOSIZE,
+                SWP_NOACTIVATE | SWP_NOMOVE | SWP_NOSIZE | SWP_ASYNCWINDOWPOS,
             );
         }
         if self.announced.get().elapsed() >= ANNOUNCE_EVERY {
