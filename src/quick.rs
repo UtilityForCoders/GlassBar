@@ -137,6 +137,8 @@ pub enum Hit {
     Mute,
     Slider(Slider),
     More,
+    /// Idioma del teclado, en el pie: abre el panel de idioma.
+    Language,
     /// Flecha de un botón: abre su lista.
     List(Radio),
     /// Flecha junto al volumen: abre las salidas de audio.
@@ -177,6 +179,8 @@ pub struct QuickState {
     pub joining: Option<JoinEditor>,
     /// Aplicación con su lista de salidas desplegada (por la ruta de su ejecutable).
     pub audio_app: Option<String>,
+    /// Idioma del teclado actual ("ESP"); con él, el pie lleva su botón.
+    pub language: Option<String>,
 }
 
 fn tile_x(radio: Radio) -> f32 {
@@ -223,6 +227,12 @@ fn audio_button_rect() -> (f32, f32, f32, f32) {
 }
 fn more_rect() -> (f32, f32, f32, f32) {
     (WIDTH - PAD - MORE_W, FOOTER_Y + 8.0, MORE_W, 32.0)
+}
+/// Botón del idioma, a la izquierda de "Más opciones": icono del teclado y el idioma.
+fn language_rect(language: &str) -> (f32, f32, f32, f32) {
+    let width = text_width(language, 13.0) + 40.0;
+    let (x, y, _, h) = more_rect();
+    (x - 6.0 - width, y, width, h)
 }
 fn row_y(slider: Slider) -> f32 {
     match slider {
@@ -414,6 +424,81 @@ impl QuickState {
     pub fn scroll_list(&mut self, delta: f32) {
         self.list_scroll = (self.list_scroll + delta).clamp(0.0, self.max_list_scroll());
     }
+    /// Lo que se puede elegir con el teclado en la vista actual, en orden.
+    pub fn focus_order(&self) -> Vec<Hit> {
+        if self.view != View::Main {
+            let mut order = vec![Hit::Back];
+            let enabled = match self.view {
+                View::List(radio) => self.radio(radio) == Some(true),
+                _ => true,
+            };
+            if enabled {
+                let audio = self.audio_rows();
+                for index in 0..self.rows() {
+                    let clickable = self.view != View::Audio
+                        || !matches!(
+                            audio.get(index),
+                            Some(AudioRow::Header(_) | AudioRow::Note(_) | AudioRow::Error)
+                        );
+                    if clickable {
+                        order.push(Hit::Row(index));
+                    }
+                }
+            }
+            order.push(Hit::Settings);
+            return order;
+        }
+        let mut order = Vec::new();
+        for radio in [Radio::Wifi, Radio::Bluetooth] {
+            if self.radio(radio).is_some() {
+                order.push(Hit::Tile(radio));
+            }
+            if self.has_list(radio) {
+                order.push(Hit::List(radio));
+            }
+        }
+        for toggle in Toggle::ALL {
+            if self.system.toggle(toggle).is_some() {
+                order.push(Hit::Toggle(toggle));
+            }
+        }
+        if self.value(Slider::Brightness).is_some() {
+            order.push(Hit::Slider(Slider::Brightness));
+        }
+        if self.value(Slider::Volume).is_some() {
+            order.push(Hit::Mute);
+            order.push(Hit::Slider(Slider::Volume));
+        }
+        order.push(Hit::AudioList);
+        if self.language.is_some() {
+            order.push(Hit::Language);
+        }
+        order.push(Hit::More);
+        order
+    }
+
+    /// Flechas arriba y abajo: pasa a lo siguiente (o a lo anterior) que se puede
+    /// elegir, y desplaza la lista para que se vea.
+    pub fn move_focus(&mut self, delta: isize) {
+        let order = self.focus_order();
+        let count = order.len() as isize;
+        if count == 0 {
+            return;
+        }
+        let next = match self
+            .hovered
+            .and_then(|hovered| order.iter().position(|&hit| hit == hovered))
+        {
+            Some(index) => (index as isize + delta).rem_euclid(count),
+            None if delta > 0 => 0,
+            None => count - 1,
+        };
+        self.hovered = Some(order[next as usize]);
+        if let Some(Hit::Row(index)) = self.hovered {
+            self.reveal(index);
+        }
+    }
+
     /// Desplaza lo justo para que se vea la fila entera (con su formulario).
     fn reveal(&mut self, index: usize) {
         let bottom = self.row_top(index) + self.row_height(index);
@@ -630,7 +715,11 @@ impl QuickState {
             }
         }
         let (mx, my, mw, mh) = more_rect();
-        within(mx, my, mw, mh).then_some(Hit::More)
+        if within(mx, my, mw, mh) {
+            return Some(Hit::More);
+        }
+        let (lx, ly, lw, lh) = language_rect(self.language.as_deref()?);
+        within(lx, ly, lw, lh).then_some(Hit::Language)
     }
 
     /// Valor de una barra para la posición `x` del cursor.
@@ -1691,6 +1780,32 @@ impl QuickState {
         let (ascent, descent) = line_metrics(size);
         let baseline = cy * scale + (ascent - descent) / 2.0;
         let (x, y, w, h) = more_rect();
+        // Lo que va a la izquierda del pie no pasa de aquí.
+        let mut limit = x;
+        if let Some(language) = &self.language {
+            let (lx, ly, lw, lh) = language_rect(language);
+            limit = lx;
+            if self.hovered == Some(Hit::Language) {
+                fill_rounded(
+                    image,
+                    [255, 255, 255, 20],
+                    lx * scale,
+                    ly * scale,
+                    lw * scale,
+                    lh * scale,
+                    5.0 * scale,
+                );
+            }
+            draw_icon_aligned(
+                image,
+                '\u{E765}',
+                (lx + 17.0) * scale,
+                cy * scale,
+                14.0 * scale,
+                0.85,
+            );
+            draw_text_on_baseline(image, language, (lx + 30.0) * scale, baseline, size, 0.9);
+        }
         if let Some(battery) = self.battery {
             draw_battery(
                 image,
@@ -1705,7 +1820,7 @@ impl QuickState {
             let text = format!("{} % · {}", battery.percent, battery.state());
             draw_text_on_baseline(
                 image,
-                &fit_text(&text, size, (x - 8.0 - left) * scale),
+                &fit_text(&text, size, (limit - 8.0 - left) * scale),
                 left * scale,
                 baseline,
                 size,
@@ -1794,6 +1909,24 @@ fn draw_signal(image: &mut Pixmap, cx: f32, cy: f32, size: f32, signal: u8) {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn the_arrows_walk_through_the_panel_and_wrap() {
+        let mut state = QuickState::default();
+        // Sin radios ni barras: solo las salidas de audio y "Más opciones".
+        assert_eq!(state.focus_order(), [Hit::AudioList, Hit::More]);
+        state.move_focus(1);
+        assert_eq!(state.hovered, Some(Hit::AudioList));
+        state.move_focus(1);
+        state.move_focus(1);
+        assert_eq!(state.hovered, Some(Hit::AudioList));
+        state.hovered = None;
+        state.move_focus(-1);
+        assert_eq!(state.hovered, Some(Hit::More));
+        state.view = View::Audio;
+        assert_eq!(state.focus_order().first(), Some(&Hit::Back));
+        assert_eq!(state.focus_order().last(), Some(&Hit::Settings));
+    }
 
     fn state() -> QuickState {
         QuickState {

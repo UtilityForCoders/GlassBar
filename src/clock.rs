@@ -115,7 +115,7 @@ impl ClockRenderer {
         let time = format!("{:02}:{:02}", now.wHour, now.wMinute);
         let date = format_date(&now, false);
         // La hora, más grande; la fecha, más pequeña y atenuada debajo.
-        let pixels = (13.0 * scale).round().max(8.0) as u32;
+        let pixels = (14.0 * scale).round().max(8.0) as u32;
         let mut cached = self.cached.borrow_mut();
         if !cached
             .as_ref()
@@ -166,6 +166,30 @@ impl ClockRenderer {
 /// ("jueves, 30 de octubre de 2026").
 pub fn today(long: bool) -> String {
     format_date(&unsafe { GetLocalTime() }, long)
+}
+
+/// Día y hora en una línea, como la barra de menús de macOS: "jue 13 nov 22:09".
+/// Los nombres salen de la configuración regional del usuario.
+pub fn day_and_time() -> String {
+    use windows::Win32::Globalization::GetDateFormatEx;
+    let now = unsafe { GetLocalTime() };
+    let mut buffer = [0u16; 64];
+    let len = unsafe {
+        GetDateFormatEx(
+            windows::core::PCWSTR::null(),
+            Default::default(),
+            Some(&now),
+            windows::core::w!("ddd d MMM"),
+            Some(&mut buffer),
+            windows::core::PCWSTR::null(),
+        )
+    };
+    let day = if len > 1 {
+        String::from_utf16_lossy(&buffer[..len as usize - 1]).replace('.', "")
+    } else {
+        format_date(&now, false)
+    };
+    format!("{day}  {:02}:{:02}", now.wHour, now.wMinute)
 }
 
 fn format_date(date: &windows::Win32::Foundation::SYSTEMTIME, long: bool) -> String {

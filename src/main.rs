@@ -5,6 +5,7 @@
 //! Comportamiento auto-hide nativo (sale suavemente desde abajo al acercar el mouse) y estética translúcida.
 
 mod accent;
+mod appbar;
 mod appmenu;
 mod apps;
 mod attention;
@@ -30,6 +31,7 @@ mod pins;
 mod preview;
 mod priority;
 mod quick;
+mod settings;
 mod shell;
 mod spring;
 mod status;
@@ -38,6 +40,7 @@ mod system;
 mod systray;
 mod textfield;
 mod toggles;
+mod topbar;
 mod tray;
 mod traypanel;
 mod update;
@@ -77,8 +80,8 @@ use windows::Win32::UI::WindowsAndMessaging::{
 };
 
 use crate::appmenu::{
-    CMD_APP_CLOSE, CMD_APP_END_TASK, CMD_APP_OPEN, CMD_APP_PIN, CMD_APP_UNPIN, CMD_AUTOSTART,
-    CMD_EXIT, CMD_JUMP, CMD_UPDATE, CMD_UPDATE_CHECK,
+    CMD_APP_CLOSE, CMD_APP_END_TASK, CMD_APP_OPEN, CMD_APP_PIN, CMD_APP_UNPIN, CMD_AUTOHIDE,
+    CMD_AUTOSTART, CMD_EXIT, CMD_JUMP, CMD_SETTINGS, CMD_TOP_BAR, CMD_UPDATE, CMD_UPDATE_CHECK,
 };
 use crate::autohide::AutoHide;
 use crate::bar::{BarState, HoverTarget, BOTTOM_MARGIN};
@@ -97,6 +100,17 @@ const WM_QUICK_UPDATE: u32 = windows::Win32::UI::WindowsAndMessaging::WM_APP + 4
 const WM_TRAY_ICONS: u32 = windows::Win32::UI::WindowsAndMessaging::WM_APP + 6;
 /// Un hilo de las actualizaciones terminó (ver `App::handle_update_events`).
 const WM_UPDATE: u32 = windows::Win32::UI::WindowsAndMessaging::WM_APP + 7;
+/// Cambió algún ajuste del sistema: se mira si la barra nativa sigue con el ocultar
+/// automático (fuera del aviso, que Explorer puede estar esperando).
+const WM_WORK_AREA: u32 = windows::Win32::UI::WindowsAndMessaging::WM_APP + 8;
+/// Atajo de la barra (Win+1…9, Win+T…), codificado en `wparam` (ver `winkey`).
+const WM_SHORTCUT: u32 = windows::Win32::UI::WindowsAndMessaging::WM_APP + 9;
+/// Aviso de Windows a la barra de aplicación del modo siempre visible.
+const WM_APPBAR: u32 = windows::Win32::UI::WindowsAndMessaging::WM_APP + 10;
+/// Abrir el menú del icono de GlassBar (ver `WM_TRAY`).
+const WM_TRAY_MENU: u32 = windows::Win32::UI::WindowsAndMessaging::WM_APP + 12;
+/// Aviso de Windows a la barra de aplicación de la barra superior.
+const WM_TOP_APPBAR: u32 = windows::Win32::UI::WindowsAndMessaging::WM_APP + 11;
 /// El hilo de iconos del lanzador cargó alguno nuevo.
 const WM_LAUNCHER_ICONS: u32 = windows::Win32::UI::WindowsAndMessaging::WM_APP + 5;
 
@@ -601,6 +615,25 @@ fn take_focus(hwnd: HWND) {
     }
 }
 
+/// Borde desde el que se abre un panel: encima del dock o, desde la barra
+/// superior, debajo de ella. `monitor` da la escala y los límites.
+#[derive(Clone, Copy, Default)]
+struct Edge {
+    y: i32,
+    below: bool,
+    monitor: windows::Win32::Graphics::Gdi::HMONITOR,
+}
+impl Edge {
+    /// Borde superior de un panel de `height` píxeles a `margin` del borde.
+    fn panel_top(self, height: i32, margin: i32) -> i32 {
+        if self.below {
+            self.y + margin
+        } else {
+            self.y - height - margin
+        }
+    }
+}
+
 /// Panel rápido (Wi-Fi, Bluetooth, brillo y volumen) sobre los iconos de estado.
 struct QuickWindow {
     hwnd: HWND,
@@ -613,6 +646,8 @@ struct QuickWindow {
     visible: bool,
     transition: launcher::Transition,
     backend: system::Backend,
+    /// Abierto bajo la barra superior: al cambiar de vista crece hacia abajo.
+    below: bool,
 }
 impl QuickWindow {
     fn new(owner: HWND) -> Result<Self> {
@@ -646,12 +681,14 @@ impl QuickWindow {
             model: quick::QuickState::default(),
             visible: false,
             transition: launcher::Transition::hidden(),
+            below: false,
             backend: system::Backend::start(hwnd, WM_QUICK_UPDATE),
         })
     }
     /// Encima de los iconos de estado (`anchor_x`), sin salirse de la pantalla.
-    fn place(&mut self, anchor_x: i32, dock_top: i32) {
-        let (screen, dpi) = monitors::get_info(monitors::dock());
+    fn place(&mut self, anchor_x: i32, edge: Edge) {
+        self.below = edge.below;
+        let (screen, dpi) = monitors::get_info(edge.monitor);
         // El dock pudo pasar a un monitor con otra escala desde la última apertura.
         let scale = dpi.max(0.3);
         if scale != self.scale {
@@ -669,7 +706,7 @@ impl QuickWindow {
                 screen.left + margin,
                 (screen.right - width - margin).max(screen.left + margin),
             ),
-            y: dock_top - self.surface.height as i32 - margin,
+            y: edge.panel_top(self.surface.height as i32, margin),
         };
     }
     fn render(&mut self) {
@@ -703,7 +740,9 @@ impl QuickWindow {
         if let Ok(surface) = Surface::new(self.surface.width, height) {
             let bottom = self.pos.y + self.surface.height as i32;
             self.surface = surface;
-            self.pos.y = bottom - height as i32;
+            if !self.below {
+                self.pos.y = bottom - height as i32;
+            }
         }
     }
     fn show(&mut self) {
@@ -755,6 +794,206 @@ impl Drop for QuickWindow {
         unsafe {
             let _ = windows::Win32::UI::WindowsAndMessaging::DestroyWindow(self.hwnd);
         }
+    }
+}
+
+/// Panel vecino de `open` entre los de la bandeja, el idioma (si se muestra), el
+/// estado y la hora, en el orden de la barra y dando la vuelta.
+fn neighbor_menu(open: HoverTarget, step: isize, language: bool) -> HoverTarget {
+    let order: Vec<_> = [
+        HoverTarget::Overflow,
+        HoverTarget::Language,
+        HoverTarget::Status(0),
+        HoverTarget::Clock,
+    ]
+    .into_iter()
+    .filter(|t| language || *t != HoverTarget::Language)
+    .collect();
+    let index = order.iter().position(|t| *t == open).unwrap_or(0) as isize;
+    order[(index + step).rem_euclid(order.len() as isize) as usize]
+}
+
+/// Un clic (o Enter) sobre `hit` en el panel rápido.
+fn press_quick(app: &mut App, hit: Option<quick::Hit>) {
+    let Some(panel) = app.quick.as_mut().filter(|p| p.visible) else {
+        return;
+    };
+    match hit {
+        Some(quick::Hit::Tile(radio)) => {
+            // Se ve al instante; el hilo de sistema lo confirma al terminar.
+            let state = match radio {
+                system::Radio::Wifi => &mut panel.model.system.wifi,
+                system::Radio::Bluetooth => &mut panel.model.system.bluetooth,
+            };
+            if let Some(on) = state {
+                *on = !*on;
+                panel.backend.set_radio(radio, *on);
+            }
+            panel.render();
+        }
+        Some(quick::Hit::Toggle(toggle)) => {
+            // Como los de Wi-Fi y Bluetooth: se ve al instante y el hilo
+            // de sistema lo confirma al releerlo.
+            if let Some(on) = panel.model.system.toggle_mut(toggle) {
+                *on = !*on;
+                let on = *on;
+                panel.backend.set_toggle(toggle, on);
+                // El modo avión apaga el Wi-Fi y el Bluetooth: se ve ya, sin
+                // esperar a que el hilo de sistema relea las radios. Al
+                // quitarlo, Windows decide cuáles vuelven.
+                if toggle == toggles::Toggle::Airplane && on {
+                    for radio in [
+                        &mut panel.model.system.wifi,
+                        &mut panel.model.system.bluetooth,
+                    ] {
+                        if radio.is_some() {
+                            *radio = Some(false);
+                        }
+                    }
+                }
+            }
+            panel.render();
+        }
+        Some(quick::Hit::Mute) => {
+            if let Some(volume) = &mut panel.model.volume {
+                volume.muted = !volume.muted;
+                status::set_mute(volume.muted);
+            }
+            panel.render();
+        }
+        Some(quick::Hit::More) => {
+            panel.hide();
+            status::open_quick_settings();
+        }
+        Some(quick::Hit::Language) => {
+            // Desde el mismo sitio: el panel de idioma sustituye a este.
+            panel.hide();
+            app.toggle_language();
+        }
+        Some(quick::Hit::List(radio)) => {
+            panel.set_view(quick::View::List(radio));
+            if radio == system::Radio::Wifi {
+                panel.backend.scan();
+            } else {
+                panel.backend.refresh();
+            }
+            panel.render();
+        }
+        Some(quick::Hit::AudioList) => {
+            panel.model.audio_app = None;
+            panel.set_view(quick::View::Audio);
+            panel.backend.refresh();
+            panel.render();
+        }
+        Some(quick::Hit::Back) => {
+            panel.model.join = None;
+            panel.model.audio_app = None;
+            panel.set_view(quick::View::Main);
+            panel.render();
+        }
+        Some(quick::Hit::Row(index)) => {
+            let open = |uri: &str| {
+                let _ = std::process::Command::new("explorer.exe").arg(uri).spawn();
+            };
+            let pending = |key: String, connect| quick::Pending {
+                key,
+                connect,
+                since: Instant::now(),
+            };
+            if panel.model.view == quick::View::Audio {
+                let row = panel.model.audio_rows().get(index).copied();
+                let mixer = &mut panel.model.system.audio;
+                // Se ve al instante; el hilo de sistema lo confirma al releer.
+                match row {
+                    Some(quick::AudioRow::Output(output)) => {
+                        if let Some(output) = mixer.outputs.get(output) {
+                            mixer.default = Some(output.id.clone());
+                            panel.backend.set_default_output(output.id.clone());
+                        }
+                    }
+                    Some(quick::AudioRow::App(app)) => {
+                        panel.model.toggle_audio_app(app);
+                    }
+                    Some(quick::AudioRow::Choice(app, output)) => {
+                        let id = output
+                            .and_then(|o| mixer.outputs.get(o))
+                            .map(|o| o.id.clone());
+                        if let Some(app) = mixer.apps.get_mut(app) {
+                            app.output = id.clone();
+                            panel.backend.set_app_output(app.pids.clone(), id);
+                        }
+                        panel.model.audio_app = None;
+                        panel.model.scroll_list(0.0);
+                    }
+                    _ => {}
+                }
+                panel.render();
+                return;
+            }
+            if panel.model.view == quick::View::List(system::Radio::Bluetooth) {
+                let Some(device) = panel.model.devices().get(index).cloned() else {
+                    return;
+                };
+                if device.audio {
+                    let connect = !device.connected;
+                    panel.model.pending = Some(pending(device.address.to_string(), connect));
+                    panel.backend.set_bluetooth_audio(device.address, connect);
+                } else {
+                    // Ratones, teclados… se conectan solos al encenderlos.
+                    panel.hide();
+                    open("ms-settings:bluetooth");
+                    return;
+                }
+                panel.render();
+                return;
+            }
+            let Some(network) = panel.model.networks().get(index).cloned() else {
+                return;
+            };
+            if network.connected {
+                panel.model.pending = Some(pending(network.ssid.clone(), false));
+                panel.backend.disconnect();
+            } else if let Some(profile) = network.profile.clone() {
+                panel.model.pending = Some(pending(network.ssid.clone(), true));
+                panel.backend.connect(profile);
+            } else if network.security == Some(wifi::Security::Open) {
+                // Red abierta: se conecta directamente, sin contraseña.
+                panel.model.toggle_join(index);
+                if let Some((ssid, security, password)) = panel.model.take_join(Instant::now()) {
+                    panel.backend.join(ssid, security, password);
+                }
+            } else if network.security.is_some() {
+                panel.model.toggle_join(index);
+            } else {
+                // Redes de empresa (con usuario) o WEP: en la lista de Windows.
+                panel.hide();
+                open("ms-availablenetworks:");
+                return;
+            }
+            panel.render();
+        }
+        Some(quick::Hit::JoinConfirm) => {
+            if let Some((ssid, security, password)) = panel.model.take_join(Instant::now()) {
+                panel.backend.join(ssid, security, password);
+            }
+            panel.render();
+        }
+        Some(quick::Hit::JoinCancel) => {
+            panel.model.join = None;
+            panel.model.scroll_list(0.0);
+            panel.render();
+        }
+        Some(quick::Hit::Settings) => {
+            let uri = match panel.model.view {
+                quick::View::List(system::Radio::Bluetooth) => "ms-settings:bluetooth",
+                // "Volumen y dispositivos de aplicaciones" de Windows.
+                quick::View::Audio => "ms-settings:apps-volume",
+                _ => "ms-settings:network-wifi",
+            };
+            panel.hide();
+            let _ = std::process::Command::new("explorer.exe").arg(uri).spawn();
+        }
+        _ => {}
     }
 }
 
@@ -874,183 +1113,8 @@ unsafe extern "system" fn quick_wndproc(
                     return;
                 }
                 let (x, y) = point(panel.scale);
-                match panel.model.hit_test(x, y) {
-                    Some(quick::Hit::Tile(radio)) => {
-                        // Se ve al instante; el hilo de sistema lo confirma al terminar.
-                        let state = match radio {
-                            system::Radio::Wifi => &mut panel.model.system.wifi,
-                            system::Radio::Bluetooth => &mut panel.model.system.bluetooth,
-                        };
-                        if let Some(on) = state {
-                            *on = !*on;
-                            panel.backend.set_radio(radio, *on);
-                        }
-                        panel.render();
-                    }
-                    Some(quick::Hit::Toggle(toggle)) => {
-                        // Como los de Wi-Fi y Bluetooth: se ve al instante y el hilo
-                        // de sistema lo confirma al releerlo.
-                        if let Some(on) = panel.model.system.toggle_mut(toggle) {
-                            *on = !*on;
-                            let on = *on;
-                            panel.backend.set_toggle(toggle, on);
-                            // El modo avión apaga el Wi-Fi y el Bluetooth: se ve ya, sin
-                            // esperar a que el hilo de sistema relea las radios. Al
-                            // quitarlo, Windows decide cuáles vuelven.
-                            if toggle == toggles::Toggle::Airplane && on {
-                                for radio in [
-                                    &mut panel.model.system.wifi,
-                                    &mut panel.model.system.bluetooth,
-                                ] {
-                                    if radio.is_some() {
-                                        *radio = Some(false);
-                                    }
-                                }
-                            }
-                        }
-                        panel.render();
-                    }
-                    Some(quick::Hit::Mute) => {
-                        if let Some(volume) = &mut panel.model.volume {
-                            volume.muted = !volume.muted;
-                            status::set_mute(volume.muted);
-                        }
-                        panel.render();
-                    }
-                    Some(quick::Hit::More) => {
-                        panel.hide();
-                        status::open_quick_settings();
-                    }
-                    Some(quick::Hit::List(radio)) => {
-                        panel.set_view(quick::View::List(radio));
-                        if radio == system::Radio::Wifi {
-                            panel.backend.scan();
-                        } else {
-                            panel.backend.refresh();
-                        }
-                        panel.render();
-                    }
-                    Some(quick::Hit::AudioList) => {
-                        panel.model.audio_app = None;
-                        panel.set_view(quick::View::Audio);
-                        panel.backend.refresh();
-                        panel.render();
-                    }
-                    Some(quick::Hit::Back) => {
-                        panel.model.join = None;
-                        panel.model.audio_app = None;
-                        panel.set_view(quick::View::Main);
-                        panel.render();
-                    }
-                    Some(quick::Hit::Row(index)) => {
-                        let open = |uri: &str| {
-                            let _ = std::process::Command::new("explorer.exe").arg(uri).spawn();
-                        };
-                        let pending = |key: String, connect| quick::Pending {
-                            key,
-                            connect,
-                            since: Instant::now(),
-                        };
-                        if panel.model.view == quick::View::Audio {
-                            let row = panel.model.audio_rows().get(index).copied();
-                            let mixer = &mut panel.model.system.audio;
-                            // Se ve al instante; el hilo de sistema lo confirma al releer.
-                            match row {
-                                Some(quick::AudioRow::Output(output)) => {
-                                    if let Some(output) = mixer.outputs.get(output) {
-                                        mixer.default = Some(output.id.clone());
-                                        panel.backend.set_default_output(output.id.clone());
-                                    }
-                                }
-                                Some(quick::AudioRow::App(app)) => {
-                                    panel.model.toggle_audio_app(app);
-                                }
-                                Some(quick::AudioRow::Choice(app, output)) => {
-                                    let id = output
-                                        .and_then(|o| mixer.outputs.get(o))
-                                        .map(|o| o.id.clone());
-                                    if let Some(app) = mixer.apps.get_mut(app) {
-                                        app.output = id.clone();
-                                        panel.backend.set_app_output(app.pids.clone(), id);
-                                    }
-                                    panel.model.audio_app = None;
-                                    panel.model.scroll_list(0.0);
-                                }
-                                _ => {}
-                            }
-                            panel.render();
-                            return;
-                        }
-                        if panel.model.view == quick::View::List(system::Radio::Bluetooth) {
-                            let Some(device) = panel.model.devices().get(index).cloned() else {
-                                return;
-                            };
-                            if device.audio {
-                                let connect = !device.connected;
-                                panel.model.pending =
-                                    Some(pending(device.address.to_string(), connect));
-                                panel.backend.set_bluetooth_audio(device.address, connect);
-                            } else {
-                                // Ratones, teclados… se conectan solos al encenderlos.
-                                panel.hide();
-                                open("ms-settings:bluetooth");
-                                return;
-                            }
-                            panel.render();
-                            return;
-                        }
-                        let Some(network) = panel.model.networks().get(index).cloned() else {
-                            return;
-                        };
-                        if network.connected {
-                            panel.model.pending = Some(pending(network.ssid.clone(), false));
-                            panel.backend.disconnect();
-                        } else if let Some(profile) = network.profile.clone() {
-                            panel.model.pending = Some(pending(network.ssid.clone(), true));
-                            panel.backend.connect(profile);
-                        } else if network.security == Some(wifi::Security::Open) {
-                            // Red abierta: se conecta directamente, sin contraseña.
-                            panel.model.toggle_join(index);
-                            if let Some((ssid, security, password)) =
-                                panel.model.take_join(Instant::now())
-                            {
-                                panel.backend.join(ssid, security, password);
-                            }
-                        } else if network.security.is_some() {
-                            panel.model.toggle_join(index);
-                        } else {
-                            // Redes de empresa (con usuario) o WEP: en la lista de Windows.
-                            panel.hide();
-                            open("ms-availablenetworks:");
-                            return;
-                        }
-                        panel.render();
-                    }
-                    Some(quick::Hit::JoinConfirm) => {
-                        if let Some((ssid, security, password)) =
-                            panel.model.take_join(Instant::now())
-                        {
-                            panel.backend.join(ssid, security, password);
-                        }
-                        panel.render();
-                    }
-                    Some(quick::Hit::JoinCancel) => {
-                        panel.model.join = None;
-                        panel.model.scroll_list(0.0);
-                        panel.render();
-                    }
-                    Some(quick::Hit::Settings) => {
-                        let uri = match panel.model.view {
-                            quick::View::List(system::Radio::Bluetooth) => "ms-settings:bluetooth",
-                            // "Volumen y dispositivos de aplicaciones" de Windows.
-                            quick::View::Audio => "ms-settings:apps-volume",
-                            _ => "ms-settings:network-wifi",
-                        };
-                        panel.hide();
-                        let _ = std::process::Command::new("explorer.exe").arg(uri).spawn();
-                    }
-                    _ => {}
-                }
+                let hit = panel.model.hit_test(x, y);
+                press_quick(app, hit);
             });
         }
         // La rueda sobre una barra la mueve de 2 % en 2 %.
@@ -1108,9 +1172,38 @@ unsafe extern "system" fn quick_wndproc(
                     return;
                 };
                 let Some(join) = &mut panel.model.join else {
-                    // Sin formulario, Escape cierra el panel.
-                    if wparam.0 == 0x1B {
-                        panel.hide();
+                    // Sin formulario: Escape cierra el panel, arriba y abajo recorren lo
+                    // que se puede elegir, Enter o espacio lo pulsan, e izquierda y
+                    // derecha pasan al panel vecino (o mueven la barra elegida).
+                    match wparam.0 {
+                        0x1B => panel.hide(),
+                        0x26 | 0x28 => {
+                            panel
+                                .model
+                                .move_focus(if wparam.0 == 0x26 { -1 } else { 1 });
+                            panel.render();
+                        }
+                        0x25 | 0x27 => {
+                            let step = if wparam.0 == 0x25 { -1 } else { 1 };
+                            let slider = match panel.model.hovered {
+                                Some(quick::Hit::Slider(slider)) => Some(slider),
+                                _ => None,
+                            };
+                            match slider.and_then(|s| Some((s, panel.model.value(s)?))) {
+                                Some((slider, value)) => {
+                                    let value = ((value * 50.0).round() + step as f32)
+                                        .clamp(0.0, 50.0)
+                                        / 50.0;
+                                    panel.set_slider(slider, value);
+                                }
+                                None => app.step_menu(step),
+                            }
+                        }
+                        0x0D | 0x20 => {
+                            let hit = panel.model.hovered;
+                            press_quick(app, hit);
+                        }
+                        _ => {}
                     }
                     return;
                 };
@@ -1647,6 +1740,30 @@ struct App {
     update_events: std::sync::mpsc::Receiver<UpdateEvent>,
     /// Ventanas que piden atención (ver `attention`).
     attention: attention::Attention,
+    /// El dock se recorre con el teclado (Win+T, Win+B): la ventana que estaba
+    /// activa antes, para devolverle el foco con Escape.
+    keyboard_nav: Option<isize>,
+    /// Sitio reservado en el modo siempre visible (ver `appbar`).
+    appbar: Option<appbar::AppBar>,
+    /// Windows avisó a esa barra de una app a pantalla completa en su monitor.
+    appbar_fullscreen: bool,
+    /// Barra superior con los controles, si está activada (ver `topbar`).
+    top: Option<TopBarWindow>,
+    /// El panel abierto salió de la barra superior: el dock no tiene que asomarse.
+    panels_from_top: bool,
+    /// Ventana de configuración (ver `settings`).
+    settings: Option<SettingsWindow>,
+}
+
+/// Cómo abrir una app del dock.
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum Launch {
+    /// La trae al frente, o la abre si no está abierta.
+    Switch,
+    /// Otra instancia (Mayús+clic, clic central).
+    NewInstance,
+    /// Como administrador (Ctrl+Mayús+clic).
+    Admin,
 }
 
 /// Respuesta de los hilos de las actualizaciones.
@@ -1755,6 +1872,12 @@ impl App {
             update_sender,
             update_events,
             attention: attention::Attention::install(hwnd),
+            keyboard_nav: None,
+            appbar: None,
+            appbar_fullscreen: false,
+            top: None,
+            panels_from_top: false,
+            settings: None,
         })
     }
 
@@ -1824,15 +1947,15 @@ impl App {
                 && cursor.y >= rect.top
                 && cursor.y < rect.bottom
         };
-        if inside(self.hwnd) || popups.into_iter().flatten().any(inside) {
+        let top_bar = self.top.as_ref().is_some_and(|top| inside(top.hwnd));
+        if inside(self.hwnd) || top_bar || popups.into_iter().flatten().any(inside) {
             return;
         }
         self.close_popups();
     }
 
-    /// Abre el menú de GlassBar en el cursor, cerrando los paneles abiertos.
-    fn open_glassbar_menu(&mut self) {
-        self.close_popups();
+    /// Abre en el cursor el menú del icono de GlassBar (configuración y salir).
+    fn open_tray_menu(&mut self) {
         if self.app_menu.is_none() {
             match AppMenuWindow::new(self.hwnd) {
                 Ok(menu) => self.app_menu = Some(menu),
@@ -1843,19 +1966,13 @@ impl App {
         unsafe {
             let _ = GetCursorPos(&mut cursor);
         }
-        let bounds = (self.screen_left, self.screen_right);
-        let updates = appmenu::Updates {
-            checking: self.checking,
-            available: self.new_release.as_ref().map(|r| r.version.to_string()),
-            busy: self.updating,
-        };
+        let (screen, _) = monitors::get_info(monitors::at(cursor));
         if let Some(menu) = &mut self.app_menu {
-            menu.open_glassbar(
-                &self.styles,
-                autostart::is_enabled(),
-                &updates,
+            menu.open_at_cursor(
+                appmenu::tray(),
+                MenuPurpose::GlassBar,
                 cursor,
-                bounds,
+                (screen.left, screen.right),
             );
         }
     }
@@ -1958,7 +2075,7 @@ impl App {
                 UpdateEvent::Downloaded(Ok(installer)) => match update::install(&installer) {
                     // El instalador cierra GlassBar si sigue abierto y lo vuelve a abrir.
                     Ok(()) => {
-                        self.shell.restore();
+                        self.release_shell();
                         unsafe {
                             PostQuitMessage(0);
                         }
@@ -1971,6 +2088,7 @@ impl App {
     }
 
     fn update_failed(&mut self, error: &str) {
+        self.refresh_settings();
         self.updating = false;
         self.tray.notify(
             "No se pudo actualizar GlassBar",
@@ -2053,14 +2171,15 @@ impl App {
                 Err(_) => return,
             }
         }
-        let anchor = self.pos.x + self.bar.status_group_center(self.scale).round() as i32;
+        let (anchor, edge, _) = self.panel_edge(HoverTarget::Status(0));
         if let Some(panel) = &mut self.quick {
             panel.model.volume = self.bar.status.volume;
             panel.model.battery = self.bar.status.battery;
-            panel.place(anchor, self.y_shown);
+            panel.model.language = self.bar.keyboard.as_ref().map(|k| k.language.clone());
+            panel.place(anchor, edge);
             panel.show();
         }
-        self.expand();
+        self.opened_from(edge);
     }
 
     fn toggle_launcher(&mut self) {
@@ -2132,12 +2251,34 @@ impl App {
                 Err(_) => return,
             }
         }
-        let anchor = self.pos.x + self.bar.overflow_center(self.scale).round() as i32;
-        let (top, bounds) = (self.y_shown, (self.screen_left, self.screen_right));
+        let (anchor, edge, bounds) = self.panel_edge(HoverTarget::Overflow);
         if let Some(panel) = &mut self.tray_panel {
-            panel.show(anchor, top, bounds);
+            panel.show(anchor, edge, bounds);
         }
-        self.expand();
+        self.opened_from(edge);
+    }
+
+    /// Izquierda o derecha con un panel de la barra abierto: pasa al panel del botón
+    /// vecino, como en una barra de menús.
+    fn step_menu(&mut self, step: isize) {
+        let open = if self.tray_panel.as_ref().is_some_and(|p| p.visible) {
+            HoverTarget::Overflow
+        } else if self.language.as_ref().is_some_and(|p| p.visible) {
+            HoverTarget::Language
+        } else if self.quick.as_ref().is_some_and(|p| p.visible) {
+            HoverTarget::Status(0)
+        } else if self.calendar.as_ref().is_some_and(|p| p.visible) {
+            HoverTarget::Clock
+        } else {
+            return;
+        };
+        let language = self.bar.keyboard.is_some() && self.top.is_none();
+        match neighbor_menu(open, step, language) {
+            HoverTarget::Overflow => self.toggle_tray_panel(),
+            HoverTarget::Language => self.toggle_language(),
+            HoverTarget::Status(_) => self.toggle_quick(),
+            _ => self.toggle_calendar(),
+        }
     }
 
     /// Abre o cierra el panel de idioma sobre el indicador. El teclado elegido se
@@ -2155,13 +2296,12 @@ impl App {
             }
         }
         let target = unsafe { windows::Win32::UI::WindowsAndMessaging::GetForegroundWindow() };
-        let anchor = self.pos.x + self.bar.language_center(self.scale).round() as i32;
+        let (anchor, edge, bounds) = self.panel_edge(HoverTarget::Language);
         let current = self.bar.keyboard.as_ref().map(|k| k.id);
-        let (top, bounds) = (self.y_shown, (self.screen_left, self.screen_right));
         if let Some(panel) = &mut self.language {
-            panel.show(target, current, anchor, top, bounds);
+            panel.show(target, current, anchor, edge, bounds);
         }
-        self.expand();
+        self.opened_from(edge);
     }
 
     /// Hay algo abierto desde el dock (un panel, un menú, un arrastre) que se
@@ -2213,6 +2353,10 @@ impl App {
         self.relayout();
         self.check_priority(false);
         self.update_style();
+        self.sync_appbar();
+        if let Some(top) = &mut self.top {
+            top.place();
+        }
     }
 
     /// Marca las apps con alguna ventana que pide atención; `true` si cambió alguna.
@@ -2274,12 +2418,537 @@ impl App {
                 Err(_) => return,
             }
         }
-        let anchor = self.pos.x + self.bar.clock_center(self.scale).round() as i32;
-        let (top, bounds) = (self.y_shown, (self.screen_left, self.screen_right));
+        let (anchor, edge, bounds) = self.panel_edge(HoverTarget::Clock);
         if let Some(panel) = &mut self.calendar {
-            panel.show(anchor, top, bounds);
+            panel.show(anchor, edge, bounds);
+        }
+        self.opened_from(edge);
+    }
+
+    /// Lo que hace un clic (o Enter con el teclado) sobre `target`; `launch` dice
+    /// cómo abrir una app.
+    fn click(&mut self, target: HoverTarget, launch: Launch) {
+        match target {
+            HoverTarget::PrimaryApp(_) | HoverTarget::OpenApp(_) if launch != Launch::Switch => {
+                if let Some(menu) = &mut self.launcher {
+                    menu.hide();
+                }
+                if let Some(a) = self.bar.item_mut(target) {
+                    a.press_spring.set_target(1.0);
+                    let entry = a.pin_entry();
+                    let opened = if launch == Launch::Admin {
+                        apps::launch_entry_as_admin(&entry)
+                    } else {
+                        apps::launch_entry(&entry)
+                    };
+                    if opened {
+                        let _ = catalog::record(&entry);
+                    }
+                }
+            }
+            HoverTarget::Launcher => {
+                self.bar.launcher_press.set_target(1.0);
+                self.toggle_launcher();
+            }
+            HoverTarget::Language => {
+                if let Some(tip) = &mut self.tooltip {
+                    tip.hide();
+                }
+                self.toggle_language();
+            }
+            HoverTarget::PrimaryApp(_) => {
+                if let Some(menu) = &mut self.launcher {
+                    menu.hide();
+                }
+                // La ventana que pide atención, si la hay, como en Windows.
+                let attention = &self.attention;
+                if let Some(a) = self.bar.item_mut(target) {
+                    a.press_spring.set_target(1.0);
+                    if let Some(window) = attention.first_of(&a.windows) {
+                        apps::focus_window(window);
+                    } else if a.activate() {
+                        let _ = catalog::record(&a.entry);
+                    }
+                }
+            }
+            HoverTarget::OpenApp(_) => {
+                if let Some(menu) = &mut self.launcher {
+                    menu.hide();
+                }
+                let attention = &self.attention;
+                if let Some(a) = self.bar.item_mut(target) {
+                    a.press_spring.set_target(1.0);
+                    if let Some(hwnd) = attention.first_of(&a.windows).or(a.window) {
+                        apps::focus_window(hwnd);
+                    }
+                }
+            }
+            HoverTarget::Overflow => {
+                if let Some(menu) = &mut self.launcher {
+                    menu.hide();
+                }
+                if let Some(tip) = &mut self.tooltip {
+                    tip.hide();
+                }
+                // Siempre el panel propio: si la bandeja propia no pudo ponerse
+                // delante de la de Explorer, sale vacío y lo dice.
+                self.toggle_tray_panel();
+            }
+            HoverTarget::Status(_) => {
+                if let Some(tip) = &mut self.tooltip {
+                    tip.hide();
+                }
+                self.toggle_quick();
+            }
+            HoverTarget::ShowDesktop => {
+                if let Some(tip) = &mut self.tooltip {
+                    tip.hide();
+                }
+                self.close_popups();
+                shell::toggle_desktop();
+            }
+            HoverTarget::Clock => {
+                if let Some(tip) = &mut self.tooltip {
+                    tip.hide();
+                }
+                self.toggle_calendar();
+            }
+        }
+    }
+
+    /// Abre sobre su icono el menú de la app `target` (su jump list y sus opciones).
+    fn open_app_menu(&mut self, target: HoverTarget) {
+        let Some(item) = self.bar.item_mut(target) else {
+            return;
+        };
+        let (name, windows) = (item.entry.name.clone(), item.windows.len());
+        let icon = item.icon.clone();
+        let launch = item.pin_entry().command;
+        // Su jump list, como en la barra de Windows.
+        let jump = jumplist::app_id(&launch, &item.windows)
+            .map(|id| jumplist::sections(&id))
+            .unwrap_or_default();
+        // "Finalizar tarea" si está activado en Windows y hay qué terminar
+        // (el Explorador no, que es el escritorio).
+        let end_task = apps::end_task_enabled() && !item.task_processes().is_empty();
+        let chosen = MenuApp {
+            command: item.entry.command.clone(),
+            pinned: matches!(target, HoverTarget::PrimaryApp(_)),
+            launch,
+            jump,
+        };
+        // Se abre sobre el icono de la app, como en Windows.
+        let anchor = self.pos.x
+            + self
+                .bar
+                .item_label(target, self.scale)
+                .map(|(_, cx)| cx.round() as i32)
+                .unwrap_or_default();
+        self.close_popups();
+        if self.app_menu.is_none() {
+            match AppMenuWindow::new(self.hwnd) {
+                Ok(menu) => self.app_menu = Some(menu),
+                Err(_) => return,
+            }
+        }
+        let (top, bounds) = (self.y_shown, (self.screen_left, self.screen_right));
+        if let Some(menu) = &mut self.app_menu {
+            menu.open(
+                &name,
+                icon.as_ref(),
+                windows,
+                end_task,
+                chosen,
+                anchor,
+                top,
+                bounds,
+            );
         }
         self.expand();
+    }
+
+    /// La app en la posición `index` del dock (anclados y luego abiertos).
+    fn app_at(&self, index: usize) -> Option<HoverTarget> {
+        let pinned = self.bar.primary_apps.len();
+        if index < pinned {
+            Some(HoverTarget::PrimaryApp(index))
+        } else if index - pinned < self.bar.open_apps.len() {
+            Some(HoverTarget::OpenApp(index - pinned))
+        } else {
+            None
+        }
+    }
+
+    /// Win+número: la ventana que pide atención, si la hay; si la app ya está
+    /// delante con varias ventanas, la que lleva más tiempo sin usarse (así se
+    /// recorren todas); si no, como un clic.
+    fn switch_to(&mut self, target: HoverTarget) {
+        let attention = &self.attention;
+        let Some(app) = self.bar.item_mut(target) else {
+            return;
+        };
+        if let Some(window) = attention.first_of(&app.windows) {
+            apps::focus_window(window);
+            return;
+        }
+        let foreground =
+            unsafe { windows::Win32::UI::WindowsAndMessaging::GetForegroundWindow() }.0 as isize;
+        if app.windows.len() > 1 && app.windows.contains(&foreground) {
+            if let Some(&oldest) = app.windows.last() {
+                apps::focus_window(oldest);
+                return;
+            }
+        }
+        if app.activate() {
+            let _ = catalog::record(&app.entry);
+        }
+    }
+
+    /// Atiende un atajo de la barra (ver `winkey`).
+    fn run_shortcut(&mut self, shortcut: winkey::Shortcut) {
+        use winkey::{AppMode, Shortcut};
+        match shortcut {
+            Shortcut::App(index, mode) => {
+                let Some(target) = self.app_at(index) else {
+                    return;
+                };
+                if let Some(menu) = &mut self.launcher {
+                    menu.hide();
+                }
+                match mode {
+                    AppMode::Switch => self.switch_to(target),
+                    AppMode::NewInstance => self.click(target, Launch::NewInstance),
+                    AppMode::Admin => self.click(target, Launch::Admin),
+                    AppMode::Menu => {
+                        self.expand();
+                        self.open_app_menu(target);
+                    }
+                }
+            }
+            Shortcut::FocusDock => {
+                let first = self.app_at(0).unwrap_or(HoverTarget::Launcher);
+                self.enter_keyboard_nav(first);
+            }
+            // Con la barra superior, la flecha no está en el dock: se abre su panel.
+            Shortcut::FocusTray if self.top.is_some() => self.toggle_tray_panel(),
+            Shortcut::FocusTray => self.enter_keyboard_nav(HoverTarget::Overflow),
+            Shortcut::Quick => self.toggle_quick(),
+            Shortcut::Calendar => self.toggle_calendar(),
+        }
+    }
+
+    /// Empieza a recorrer el dock con el teclado, resaltando `target`.
+    fn enter_keyboard_nav(&mut self, target: HoverTarget) {
+        self.close_popups();
+        if self.keyboard_nav.is_none() {
+            let previous =
+                unsafe { windows::Win32::UI::WindowsAndMessaging::GetForegroundWindow() };
+            self.keyboard_nav = Some(previous.0 as isize);
+        }
+        self.expand();
+        take_focus(self.hwnd);
+        self.bar.update_hover(Some(target));
+        self.restart_tooltip();
+        self.start_animating();
+        self.render();
+    }
+
+    /// Deja de recorrer el dock con el teclado; con `back`, devuelve el foco a la
+    /// ventana que lo tenía.
+    fn leave_keyboard_nav(&mut self, back: bool) {
+        let Some(previous) = self.keyboard_nav.take() else {
+            return;
+        };
+        if back {
+            let previous = HWND(previous as *mut _);
+            unsafe {
+                use windows::Win32::UI::WindowsAndMessaging::{IsWindow, SetForegroundWindow};
+                if IsWindow(Some(previous)).as_bool() {
+                    let _ = SetForegroundWindow(previous);
+                }
+            }
+        }
+        self.bar.update_hover(None);
+        self.restart_tooltip();
+        self.start_animating();
+        self.render();
+    }
+
+    /// Una tecla con el dock recorrido con el teclado; `true` si la atendió.
+    fn dock_key(&mut self, key: u32) -> bool {
+        use windows::Win32::UI::Input::KeyboardAndMouse::{GetKeyState, VK_CONTROL, VK_SHIFT};
+        if self.keyboard_nav.is_none() {
+            return false;
+        }
+        let shift = unsafe { GetKeyState(VK_SHIFT.0 as i32) } < 0;
+        let ctrl = unsafe { GetKeyState(VK_CONTROL.0 as i32) } < 0;
+        let current = self.bar.hovered;
+        // Izquierda, derecha, Tab (Mayús+Tab hacia atrás), Inicio y Fin.
+        let step = match key {
+            0x25 => Some(-1),
+            0x27 => Some(1),
+            0x09 => Some(if shift { -1 } else { 1 }),
+            0x24 => Some(-1000),
+            0x23 => Some(1000),
+            _ => None,
+        };
+        if let Some(step) = step {
+            let next = self.bar.focus_step(current, step);
+            self.bar.update_hover(Some(next));
+            self.restart_tooltip();
+            self.start_animating();
+            self.render();
+            return true;
+        }
+        match key {
+            // Enter o espacio: como un clic (Mayús, otra instancia; Ctrl+Mayús, administrador).
+            0x0D | 0x20 => {
+                let Some(target) = current else {
+                    return true;
+                };
+                let launch = match (shift, ctrl) {
+                    (true, true) => Launch::Admin,
+                    (true, false) => Launch::NewInstance,
+                    _ => Launch::Switch,
+                };
+                self.leave_keyboard_nav(false);
+                self.click(target, launch);
+                self.start_animating();
+                self.render();
+                true
+            }
+            // Tecla de menú o Mayús+F10: el menú de la app.
+            0x5D | 0x79 if key == 0x5D || shift => {
+                if let Some(target @ (HoverTarget::PrimaryApp(_) | HoverTarget::OpenApp(_))) =
+                    current
+                {
+                    self.leave_keyboard_nav(false);
+                    self.open_app_menu(target);
+                }
+                true
+            }
+            0x1B => {
+                self.leave_keyboard_nav(true);
+                true
+            }
+            _ => false,
+        }
+    }
+
+    /// Altura que reserva el modo siempre visible: del borde superior del dock al
+    /// borde inferior del monitor.
+    fn reserved_height(&self) -> i32 {
+        self.screen_bottom - self.y_shown
+    }
+
+    /// Pone o quita el sitio reservado según el modo, en el monitor del dock.
+    fn sync_appbar(&mut self) {
+        if !self.styles.always_visible() {
+            self.appbar = None;
+            self.appbar_fullscreen = false;
+            return;
+        }
+        if self.appbar.is_none() {
+            self.appbar = appbar::AppBar::register(self.hwnd, WM_APPBAR);
+        }
+        if let Some(bar) = &self.appbar {
+            let monitor = windows::Win32::Foundation::RECT {
+                left: self.screen_left,
+                top: self.screen_top,
+                right: self.screen_right,
+                bottom: self.screen_bottom,
+            };
+            bar.place(monitor, self.reserved_height(), false);
+        }
+    }
+
+    /// Al salir: devuelve la barra nativa y el sitio reservado.
+    fn release_shell(&mut self) {
+        self.appbar = None;
+        self.top = None;
+        self.shell.restore();
+    }
+
+    /// Dónde abrir el panel de `target`: bajo su sitio en la barra superior, si
+    /// está, o sobre su sitio en el dock. Centro, borde y límites de la pantalla.
+    fn panel_edge(&self, target: HoverTarget) -> (i32, Edge, (i32, i32)) {
+        if let Some(top) = &self.top {
+            if let Some(center) = top.model.center(target) {
+                let edge = Edge {
+                    y: top.rect.top + top.height(),
+                    below: true,
+                    monitor: top.monitor,
+                };
+                let x = top.rect.left + (center * top.scale).round() as i32;
+                return (x, edge, (top.rect.left, top.rect.right));
+            }
+        }
+        let center = match target {
+            HoverTarget::Status(_) => self.bar.status_group_center(self.scale),
+            HoverTarget::Language => self.bar.language_center(self.scale),
+            HoverTarget::Overflow => self.bar.overflow_center(self.scale),
+            HoverTarget::Clock => self.bar.clock_center(self.scale),
+            _ => self
+                .bar
+                .item_label(target, self.scale)
+                .map(|(_, cx)| cx)
+                .unwrap_or_default(),
+        };
+        let edge = Edge {
+            y: self.y_shown,
+            below: false,
+            monitor: monitors::dock(),
+        };
+        (
+            self.pos.x + center.round() as i32,
+            edge,
+            (self.screen_left, self.screen_right),
+        )
+    }
+
+    /// Tras abrir un panel: si salió del dock, el dock se muestra; si salió de la
+    /// barra superior, no hace falta.
+    fn opened_from(&mut self, edge: Edge) {
+        self.panels_from_top = edge.below;
+        if !edge.below {
+            self.expand();
+        }
+    }
+
+    /// Pone o quita la barra superior según el ajuste; con ella, el dock solo
+    /// lleva las apps.
+    fn sync_top_bar(&mut self) {
+        let on = self.styles.top_bar();
+        if on && self.top.is_none() {
+            match TopBarWindow::new() {
+                Ok(mut top) => {
+                    top.place();
+                    self.top = Some(top);
+                }
+                Err(_) => return,
+            }
+        } else if !on {
+            self.top = None;
+        }
+        if self.bar.compact != on {
+            self.close_popups();
+            self.bar.compact = on;
+            self.relayout();
+        }
+        self.update_active_app();
+        self.refresh_top_bar();
+    }
+
+    /// Pasa a la barra superior el estado, el teclado, la hora y la apariencia, y
+    /// la redibuja si algo cambió.
+    fn refresh_top_bar(&mut self) {
+        let Some(top) = &mut self.top else {
+            return;
+        };
+        top.model.status = self.bar.status;
+        top.model.keyboard = self.bar.keyboard.clone();
+        top.model.appearance = self.bar.appearance;
+        top.model.clock = clock::day_and_time();
+        top.render();
+    }
+
+    /// El nombre de la app activa para la barra superior. Las ventanas de GlassBar
+    /// no cuentan: abrir un panel no cambia el nombre.
+    fn update_active_app(&mut self) {
+        let Some(top) = &mut self.top else {
+            return;
+        };
+        if let Some(name) = active_app_name() {
+            top.model.app = name;
+        }
+    }
+
+    /// El cursor se movió por la barra superior (`x`, `y` en píxeles de la ventana).
+    fn top_hover(&mut self, x: i32, y: i32) {
+        let Some(top) = &mut self.top else {
+            return;
+        };
+        let target = top
+            .model
+            .hit_test(x as f32 / top.scale, y as f32 / top.scale);
+        if target != top.model.hovered {
+            top.model.hovered = target;
+            top.render();
+        }
+    }
+
+    /// Clic derecho en la barra superior: en el logo de Inicio, el menú de Windows.
+    fn top_right_click(&mut self, x: i32, y: i32) {
+        let Some(top) = &self.top else {
+            return;
+        };
+        let target = top
+            .model
+            .hit_test(x as f32 / top.scale, y as f32 / top.scale);
+        if target == Some(HoverTarget::Launcher) {
+            self.open_windows_menu();
+        }
+    }
+
+    /// Clic en la barra superior: lo mismo que en el dock.
+    fn top_click(&mut self, x: i32, y: i32) {
+        let Some(top) = &self.top else {
+            return;
+        };
+        let target = top
+            .model
+            .hit_test(x as f32 / top.scale, y as f32 / top.scale);
+        match target {
+            Some(HoverTarget::Launcher) => self.toggle_launcher(),
+            Some(target) => self.click(target, Launch::Switch),
+            None => {}
+        }
+    }
+
+    /// Estado de las actualizaciones para la configuración.
+    fn settings_updates(&self) -> settings::Updates {
+        settings::Updates {
+            checking: self.checking,
+            available: self.new_release.as_ref().map(|r| r.version.to_string()),
+            busy: self.updating,
+        }
+    }
+
+    /// Abre la ventana de configuración (con el icono de GlassBar en la bandeja).
+    fn open_settings(&mut self) {
+        self.close_popups();
+        let model = settings::SettingsState::new(
+            self.styles.clone(),
+            autostart::is_enabled(),
+            self.settings_updates(),
+        );
+        if self.settings.is_none() {
+            match SettingsWindow::new(self.hwnd, model.clone()) {
+                Ok(window) => self.settings = Some(window),
+                Err(_) => return,
+            }
+        }
+        if let Some(window) = &mut self.settings {
+            if window.visible {
+                take_focus(window.hwnd);
+                return;
+            }
+            window.model = model;
+            window.show();
+        }
+    }
+
+    /// Vuelve a leer los ajustes en la configuración abierta, tras cambiar alguno.
+    fn refresh_settings(&mut self) {
+        let updates = self.settings_updates();
+        let styles = self.styles.clone();
+        let Some(window) = self.settings.as_mut().filter(|w| w.visible) else {
+            return;
+        };
+        window.model.styles = styles;
+        window.model.autostart = autostart::is_enabled();
+        window.model.updates = updates;
+        window.render();
     }
 
     fn check_priority(&mut self, raise: bool) {
@@ -2289,12 +2958,31 @@ impl App {
             right: self.screen_right,
             bottom: self.screen_bottom,
         };
-        self.fullscreen = priority::fullscreen_app(monitor);
-        if raise && !self.fullscreen {
-            priority::raise(self.hwnd);
-            // Su desenfoque, otra vez justo debajo.
-            self.sync_backdrop();
+        self.fullscreen = priority::fullscreen_app(monitor)
+            || priority::system_fullscreen()
+            || (self.appbar.is_some() && self.appbar_fullscreen);
+        // Escondido no hace falta: se pone encima al mostrarse (ver `reveal`). Y a
+        // una ventana "siempre encima" que se acaba de activar no se le quita el sitio.
+        let other_topmost = priority::foreground_topmost();
+        if raise && !self.fullscreen && self.visibility.expanded && !other_topmost {
+            self.raise();
         }
+        if let Some(top) = &mut self.top {
+            let fullscreen = priority::fullscreen_app(top.rect)
+                || priority::system_fullscreen()
+                || top.appbar_fullscreen;
+            top.set_hidden(fullscreen);
+            if raise && !fullscreen && !other_topmost {
+                priority::raise_below_overlapping(top.hwnd, top.rect);
+            }
+        }
+    }
+
+    /// Pone el dock por encima de las demás ventanas "siempre encima", con su
+    /// desenfoque justo debajo.
+    fn raise(&self) {
+        priority::raise(self.hwnd);
+        self.sync_backdrop();
     }
 
     /// Ancla o desancla en el dock una app desde el lanzador, que sigue abierto
@@ -2394,6 +3082,7 @@ impl App {
                         | HoverTarget::Status(_)
                         | HoverTarget::Language
                         | HoverTarget::Clock
+                        | HoverTarget::ShowDesktop
                 )
             ) && self.bar.pressed.is_none()
             {
@@ -2407,10 +3096,7 @@ impl App {
             return;
         };
         // El nombre de la flecha o del estado taparía el panel que ellos mismos abren.
-        if target == HoverTarget::Overflow
-            && (shell::overflow_window().is_some()
-                || self.tray_panel.as_ref().is_some_and(|p| p.visible))
-        {
+        if target == HoverTarget::Overflow && self.tray_panel.as_ref().is_some_and(|p| p.visible) {
             return;
         }
         if matches!(target, HoverTarget::Status(_))
@@ -2517,6 +3203,10 @@ impl App {
         self.visibility.reveal();
         if hidden {
             self.update_style();
+            // Escondido pudo quedar debajo de otra ventana "siempre encima".
+            if !self.fullscreen {
+                self.raise();
+            }
         }
     }
 
@@ -2618,6 +3308,16 @@ unsafe extern "system" fn wndproc(hwnd: HWND, msg: u32, wparam: WPARAM, lparam: 
         // por otros ajustes): se vuelve a leer y, si es otro, se redibuja lo abierto.
         windows::Win32::UI::WindowsAndMessaging::WM_SETTINGCHANGE
         | WM_DWMCOLORIZATIONCOLORCHANGED => {
+            // Explorer avisa con WM_SETTINGCHANGE al cambiar el ocultar automático
+            // de su barra y recalcular el área de trabajo.
+            if msg == windows::Win32::UI::WindowsAndMessaging::WM_SETTINGCHANGE {
+                let _ = windows::Win32::UI::WindowsAndMessaging::PostMessageW(
+                    Some(hwnd),
+                    WM_WORK_AREA,
+                    WPARAM(0),
+                    LPARAM(0),
+                );
+            }
             with_app(|app| {
                 if accent::refresh() {
                     app.render();
@@ -2630,6 +3330,35 @@ unsafe extern "system" fn wndproc(hwnd: HWND, msg: u32, wparam: WPARAM, lparam: 
                 }
             });
             DefWindowProcW(hwnd, msg, wparam, lparam)
+        }
+        WM_TRAY_MENU => {
+            with_app(|app| app.open_tray_menu());
+            LRESULT(0)
+        }
+        WM_SHORTCUT => {
+            if let Some(shortcut) = winkey::Shortcut::decode(wparam.0) {
+                with_app(|app| app.run_shortcut(shortcut));
+            }
+            LRESULT(0)
+        }
+        WM_APPBAR => {
+            match wparam.0 {
+                appbar::ABN_POSCHANGED => {
+                    with_app(|app| app.sync_appbar());
+                }
+                appbar::ABN_FULLSCREENAPP => {
+                    with_app(|app| {
+                        app.appbar_fullscreen = lparam.0 != 0;
+                        app.check_priority(false);
+                    });
+                }
+                _ => {}
+            }
+            LRESULT(0)
+        }
+        WM_WORK_AREA => {
+            with_app(|app| app.shell.keep_work_area());
+            LRESULT(0)
         }
         WM_UPDATE => {
             with_app(|app| app.handle_update_events());
@@ -2667,6 +3396,8 @@ unsafe extern "system" fn wndproc(hwnd: HWND, msg: u32, wparam: WPARAM, lparam: 
                 app.check_priority(!tray_menu);
                 app.update_keyboard();
                 app.update_style();
+                app.update_active_app();
+                app.refresh_top_bar();
             });
             LRESULT(0)
         }
@@ -2677,7 +3408,7 @@ unsafe extern "system" fn wndproc(hwnd: HWND, msg: u32, wparam: WPARAM, lparam: 
                     let mut cursor = POINT::default();
                     let _ = GetCursorPos(&mut cursor);
                     let monitor = monitors::at(cursor);
-                    if monitor != monitors::dock() {
+                    if monitor != monitors::dock() && !app.styles.always_visible() {
                         app.move_to_monitor(monitor);
                     }
                 }
@@ -2828,79 +3559,48 @@ unsafe extern "system" fn wndproc(hwnd: HWND, msg: u32, wparam: WPARAM, lparam: 
                     return;
                 }
                 if let Some(target) = app.bar.pressed.take() {
-                    match target {
-                        HoverTarget::Launcher => {
-                            app.bar.launcher_press.set_target(1.0);
-                            app.toggle_launcher();
-                        }
-                        HoverTarget::Language => {
-                            if let Some(tip) = &mut app.tooltip {
-                                tip.hide();
-                            }
-                            app.toggle_language();
-                        }
-                        HoverTarget::PrimaryApp(_) => {
-                            if let Some(menu) = &mut app.launcher {
-                                menu.hide();
-                            }
-                            // La ventana que pide atención, si la hay, como en Windows.
-                            let attention = &app.attention;
-                            if let Some(a) = app.bar.item_mut(target) {
-                                a.press_spring.set_target(1.0);
-                                if let Some(window) = attention.first_of(&a.windows) {
-                                    apps::focus_window(window);
-                                } else if a.activate() {
-                                    let _ = catalog::record(&a.entry);
-                                }
-                            }
-                        }
-                        HoverTarget::OpenApp(_) => {
-                            if let Some(menu) = &mut app.launcher {
-                                menu.hide();
-                            }
-                            let attention = &app.attention;
-                            if let Some(a) = app.bar.item_mut(target) {
-                                a.press_spring.set_target(1.0);
-                                if let Some(hwnd) = attention.first_of(&a.windows).or(a.window) {
-                                    apps::focus_window(hwnd);
-                                }
-                            }
-                        }
-                        HoverTarget::Overflow => {
-                            if let Some(menu) = &mut app.launcher {
-                                menu.hide();
-                            }
-                            if let Some(tip) = &mut app.tooltip {
-                                tip.hide();
-                            }
-                            if app.systray.is_some() {
-                                app.toggle_tray_panel();
-                            } else {
-                                shell::toggle_overflow(
-                                    app.pos.x + app.bar.overflow_center(app.scale).round() as i32,
-                                    app.y_shown,
-                                    app.screen_left,
-                                    app.screen_right,
-                                );
-                            }
-                        }
-                        HoverTarget::Status(_) => {
-                            if let Some(tip) = &mut app.tooltip {
-                                tip.hide();
-                            }
-                            app.toggle_quick();
-                        }
-                        HoverTarget::Clock => {
-                            if let Some(tip) = &mut app.tooltip {
-                                tip.hide();
-                            }
-                            app.toggle_calendar();
-                        }
-                    }
+                    // Como en Windows: Mayús abre otra instancia y Ctrl+Mayús, como administrador.
+                    let (shift, ctrl) = (wparam.0 & 0x4 != 0, wparam.0 & 0x8 != 0);
+                    let launch = match (shift, ctrl) {
+                        (true, true) => Launch::Admin,
+                        (true, false) => Launch::NewInstance,
+                        _ => Launch::Switch,
+                    };
+                    app.click(target, launch);
                     app.start_animating();
                     app.render();
                 }
             });
+            LRESULT(0)
+        }
+
+        // Clic central sobre una app: otra instancia, como en la barra de Windows.
+        windows::Win32::UI::WindowsAndMessaging::WM_MBUTTONUP => {
+            with_app(|app| {
+                let x = (lparam.0 & 0xffff) as i16 as f32;
+                let y = ((lparam.0 >> 16) & 0xffff) as i16 as f32;
+                let target = app.bar.hit_test(x, y, app.scale);
+                if let Some(target @ (HoverTarget::PrimaryApp(_) | HoverTarget::OpenApp(_))) =
+                    target
+                {
+                    app.click(target, Launch::NewInstance);
+                    app.start_animating();
+                    app.render();
+                }
+            });
+            LRESULT(0)
+        }
+
+        // Con el dock recorrido con el teclado (Win+T, Win+B).
+        windows::Win32::UI::WindowsAndMessaging::WM_KEYDOWN
+        | windows::Win32::UI::WindowsAndMessaging::WM_SYSKEYDOWN => {
+            if with_app(|app| app.dock_key(wparam.0 as u32)) == Some(true) {
+                return LRESULT(0);
+            }
+            DefWindowProcW(hwnd, msg, wparam, lparam)
+        }
+        windows::Win32::UI::WindowsAndMessaging::WM_KILLFOCUS => {
+            with_app(|app| app.leave_keyboard_nav(false));
             LRESULT(0)
         }
 
@@ -2938,61 +3638,13 @@ unsafe extern "system" fn wndproc(hwnd: HWND, msg: u32, wparam: WPARAM, lparam: 
                 match target {
                     // Sobre una app: su propio menú, como en la barra de Windows.
                     Some(target @ (HoverTarget::PrimaryApp(_) | HoverTarget::OpenApp(_))) => {
-                        let Some(item) = app.bar.item_mut(target) else {
-                            return;
-                        };
-                        let (name, windows) = (item.entry.name.clone(), item.windows.len());
-                        let icon = item.icon.clone();
-                        let launch = item.pin_entry().command;
-                        // Su jump list, como en la barra de Windows.
-                        let jump = jumplist::app_id(&launch, &item.windows)
-                            .map(|id| jumplist::sections(&id))
-                            .unwrap_or_default();
-                        // "Finalizar tarea" si está activado en Windows y hay qué terminar
-                        // (el Explorador no, que es el escritorio).
-                        let end_task =
-                            apps::end_task_enabled() && !item.task_processes().is_empty();
-                        let chosen = MenuApp {
-                            command: item.entry.command.clone(),
-                            pinned: matches!(target, HoverTarget::PrimaryApp(_)),
-                            launch,
-                            jump,
-                        };
-                        // Se abre sobre el icono de la app, como en Windows.
-                        let anchor = app.pos.x
-                            + app
-                                .bar
-                                .item_label(target, app.scale)
-                                .map(|(_, cx)| cx.round() as i32)
-                                .unwrap_or_default();
-                        app.close_popups();
-                        if app.app_menu.is_none() {
-                            match AppMenuWindow::new(app.hwnd) {
-                                Ok(menu) => app.app_menu = Some(menu),
-                                Err(_) => return,
-                            }
-                        }
-                        let (top, bounds) = (app.y_shown, (app.screen_left, app.screen_right));
-                        if let Some(menu) = &mut app.app_menu {
-                            menu.open(
-                                &name,
-                                icon.as_ref(),
-                                windows,
-                                end_task,
-                                chosen,
-                                anchor,
-                                top,
-                                bounds,
-                            );
-                        }
-                        app.expand();
+                        app.open_app_menu(target);
                     }
                     // Sobre el botón de inicio, el de Windows (Win+X).
                     Some(HoverTarget::Launcher) => app.open_windows_menu(),
-                    // En el resto del dock, el de GlassBar.
-                    _ => {
-                        app.open_glassbar_menu();
-                    }
+                    // En el resto del dock, nada: la configuración se abre con el
+                    // icono de GlassBar en la bandeja.
+                    _ => {}
                 }
             });
             LRESULT(0)
@@ -3031,6 +3683,7 @@ unsafe extern "system" fn wndproc(hwnd: HWND, msg: u32, wparam: WPARAM, lparam: 
             } else if id == TIMER_TICK {
                 with_app(|app| {
                     app.shell.maintain();
+                    app.refresh_top_bar();
                     // Pasar a pantalla completa (F11) no cambia la ventana activa.
                     app.check_priority(false);
                     // Red, volumen y batería; si aparece o desaparece la batería cambia el ancho.
@@ -3115,7 +3768,9 @@ unsafe extern "system" fn wndproc(hwnd: HWND, msg: u32, wparam: WPARAM, lparam: 
                     // El dock pasa al monitor de cuyo borde inferior se acerca el cursor,
                     // como si cada pantalla tuviera el suyo.
                     let monitor = monitors::at(pt);
-                    if monitor != monitors::dock() && !app.busy() {
+                    // Siempre visible, el dock no cambia de monitor: con él se movería
+                    // el sitio reservado y las ventanas de las dos pantallas.
+                    if monitor != monitors::dock() && !app.busy() && !app.styles.always_visible() {
                         let (rc, dpi) = monitors::get_info(monitor);
                         if cursor_at_edge(pt, rc.left, rc.right, rc.bottom, dpi) {
                             app.move_to_monitor(monitor);
@@ -3157,22 +3812,23 @@ unsafe extern "system" fn wndproc(hwnd: HWND, msg: u32, wparam: WPARAM, lparam: 
                         && pt.y < app.screen_bottom;
                     app.visibility.sample(
                         (at_edge && !app.fullscreen)
+                            || (app.styles.always_visible() && !app.fullscreen)
+                            || app.keyboard_nav.is_some()
                             || inside
                             || app.bar.drag.is_some()
                             || app.launcher.as_ref().is_some_and(|l| l.visible)
-                            || app.quick.as_ref().is_some_and(|q| q.visible)
-                            || app.language.as_ref().is_some_and(|l| l.visible)
-                            || app.calendar.as_ref().is_some_and(|c| c.visible)
-                            || app.tray_panel.as_ref().is_some_and(|p| p.visible)
+                            // Los paneles abiertos desde la barra superior no lo asoman.
+                            || (!app.panels_from_top
+                                && (app.quick.as_ref().is_some_and(|q| q.visible)
+                                    || app.language.as_ref().is_some_and(|l| l.visible)
+                                    || app.calendar.as_ref().is_some_and(|c| c.visible)
+                                    || app.tray_panel.as_ref().is_some_and(|p| p.visible)
+                                    || app.tray_panel.as_ref().is_some_and(|p| p.menu.is_some())))
                             || app.app_menu.as_ref().is_some_and(|m| m.visible)
                             || app.preview.as_ref().is_some_and(|p| p.visible)
-                            // El panel de iconos ocultos abierto sobre la flecha; se mira
-                            // al final porque recorre las ventanas, y solo con el dock fuera.
-                            || (app.visibility.expanded && shell::overflow_window().is_some())
                             // El menú de un icono de la bandeja abierto, o un icono recién
                             // pulsado, que puede tardar en abrir el suyo. Los menús de
                             // otros programas no cuentan.
-                            || app.tray_panel.as_ref().is_some_and(|p| p.menu.is_some())
                             || app
                                 .tray_clicked
                                 .is_some_and(|at| at.elapsed() < Duration::from_millis(1500)),
@@ -3192,10 +3848,17 @@ unsafe extern "system" fn wndproc(hwnd: HWND, msg: u32, wparam: WPARAM, lparam: 
 
         WM_TRAY => {
             let event = (lparam.0 & 0xffff) as u32;
+            // Clic derecho en el icono de GlassBar: su menú, con Configuración y Salir.
+            // Se abre después, en su propio mensaje: desde el panel de apps en segundo
+            // plano el clic llega mientras GlassBar aún atiende ese panel, y entonces
+            // no podría abrirse.
             if event == WM_RBUTTONUP {
-                with_app(|app| {
-                    app.open_glassbar_menu();
-                });
+                let _ = windows::Win32::UI::WindowsAndMessaging::PostMessageW(
+                    Some(hwnd),
+                    WM_TRAY_MENU,
+                    WPARAM(0),
+                    LPARAM(0),
+                );
             } else if event == tray::NIN_BALLOONUSERCLICK {
                 // Clic en el aviso de una versión nueva: se actualiza.
                 with_app(|app| app.start_update());
@@ -3205,14 +3868,14 @@ unsafe extern "system" fn wndproc(hwnd: HWND, msg: u32, wparam: WPARAM, lparam: 
 
         windows::Win32::UI::WindowsAndMessaging::WM_ENDSESSION => {
             if wparam.0 != 0 {
-                with_app(|app| app.shell.restore());
+                with_app(|app| app.release_shell());
                 toggles::restore_saver();
             }
             DefWindowProcW(hwnd, msg, wparam, lparam)
         }
         WM_DESTROY => {
             with_app(|app| {
-                app.shell.restore();
+                app.release_shell();
             });
             PostQuitMessage(0);
             LRESULT(0)
@@ -3272,7 +3935,7 @@ impl LanguageWindow {
         target: HWND,
         current: Option<isize>,
         anchor_x: i32,
-        dock_top: i32,
+        edge: Edge,
         (left, right): (i32, i32),
     ) {
         self.target = target;
@@ -3284,7 +3947,7 @@ impl LanguageWindow {
             current,
             hovered: None,
         };
-        let (_, dpi) = monitors::get_info(monitors::dock());
+        let (_, dpi) = monitors::get_info(edge.monitor);
         self.scale = dpi.max(0.3);
         let width = (language::WIDTH * self.scale).ceil() as u32;
         let height = (self.model.height() * self.scale).ceil() as u32;
@@ -3298,7 +3961,7 @@ impl LanguageWindow {
                 left + margin,
                 (right - width as i32 - margin).max(left + margin),
             ),
-            y: dock_top - height as i32 - margin,
+            y: edge.panel_top(height as i32, margin),
         };
         self.visible = true;
         self.transition.open(Instant::now());
@@ -3446,6 +4109,7 @@ unsafe extern "system" fn language_wndproc(
                             .move_selection(if wparam.0 == 0x26 { -1 } else { 1 });
                         panel.render();
                     }
+                    0x25 | 0x27 => app.step_menu(if wparam.0 == 0x25 { -1 } else { 1 }),
                     0x0D => {
                         if let Some(language::Hit::Layout(index)) = panel.model.hovered {
                             choose_language(app, index);
@@ -3501,10 +4165,10 @@ impl CalendarWindow {
         })
     }
     /// Lo abre sobre `anchor_x`, encima del dock, en el mes de hoy.
-    fn show(&mut self, anchor_x: i32, dock_top: i32, (left, right): (i32, i32)) {
+    fn show(&mut self, anchor_x: i32, edge: Edge, (left, right): (i32, i32)) {
         let today = calendar::today();
         self.model = calendar::CalendarState::new(today, calendar::names(today));
-        let (_, dpi) = monitors::get_info(monitors::dock());
+        let (_, dpi) = monitors::get_info(edge.monitor);
         self.scale = dpi.max(0.3);
         let width = (calendar::WIDTH * self.scale).ceil() as u32;
         let height = (calendar::HEIGHT * self.scale).ceil() as u32;
@@ -3518,7 +4182,7 @@ impl CalendarWindow {
                 left + margin,
                 (right - width as i32 - margin).max(left + margin),
             ),
-            y: dock_top - height as i32 - margin,
+            y: edge.panel_top(height as i32, margin),
         };
         self.visible = true;
         self.transition.open(Instant::now());
@@ -3667,8 +4331,10 @@ unsafe extern "system" fn calendar_wndproc(
                 };
                 match wparam.0 {
                     0x1B => panel.hide(),
-                    0x21 | 0x25 | 0x26 => panel.shift(-1),
-                    0x22 | 0x27 | 0x28 => panel.shift(1),
+                    // Arriba y abajo cambian de mes; izquierda y derecha, de panel.
+                    0x21 | 0x26 => panel.shift(-1),
+                    0x22 | 0x28 => panel.shift(1),
+                    0x25 | 0x27 => app.step_menu(if wparam.0 == 0x25 { -1 } else { 1 }),
                     0x24 => {
                         if panel.model.go_today() {
                             panel.render();
@@ -3729,7 +4395,7 @@ struct TrayWindow {
     visible: bool,
     transition: launcher::Transition,
     /// Dónde abrirlo: centro de la flecha, borde superior del dock y bordes de la pantalla.
-    anchor: (i32, i32, (i32, i32)),
+    anchor: (i32, Edge, (i32, i32)),
     /// Clic derecho en un icono, mientras su menú sigue abierto (o por abrirse): el
     /// panel sigue abierto aunque el menú se lleve el foco.
     menu: Option<TrayMenu>,
@@ -3765,14 +4431,14 @@ impl TrayWindow {
             model: traypanel::TrayPanel::default(),
             visible: false,
             transition: launcher::Transition::hidden(),
-            anchor: (0, 0, (0, 0)),
+            anchor: (0, Edge::default(), (0, 0)),
             menu: None,
             close_after: None,
         })
     }
-    fn show(&mut self, anchor_x: i32, dock_top: i32, bounds: (i32, i32)) {
-        self.anchor = (anchor_x, dock_top, bounds);
-        let (_, dpi) = monitors::get_info(monitors::dock());
+    fn show(&mut self, anchor_x: i32, edge: Edge, bounds: (i32, i32)) {
+        self.anchor = (anchor_x, edge, bounds);
+        let (_, dpi) = monitors::get_info(edge.monitor);
         self.scale = dpi.max(0.3);
         self.visible = true;
         self.transition.open(Instant::now());
@@ -3819,14 +4485,14 @@ impl TrayWindow {
                 Err(_) => return,
             }
         }
-        let (anchor_x, dock_top, (left, right)) = self.anchor;
+        let (anchor_x, edge, (left, right)) = self.anchor;
         let margin = (12.0 * self.scale).round() as i32;
         self.pos = POINT {
             x: (anchor_x - width as i32 / 2).clamp(
                 left + margin,
                 (right - width as i32 - margin).max(left + margin),
             ),
-            y: dock_top - height as i32 - margin,
+            y: edge.panel_top(height as i32, margin),
         };
         self.render();
     }
@@ -3930,7 +4596,7 @@ struct MenuApp {
 enum MenuPurpose {
     /// El de una app del dock.
     App(MenuApp),
-    /// El de GlassBar: estilos, iniciar con Windows y salir.
+    /// El del icono de GlassBar en la bandeja: configuración y salir.
     GlassBar,
     /// El del botón de inicio, con las opciones del de Windows (Win+X).
     Windows,
@@ -4106,18 +4772,6 @@ impl AppMenuWindow {
 
     /// Abre el menú de GlassBar con su esquina inferior izquierda en el cursor,
     /// como el de un clic derecho en Windows.
-    fn open_glassbar(
-        &mut self,
-        styles: &style::Styles,
-        autostart: bool,
-        updates: &appmenu::Updates,
-        cursor: POINT,
-        (left, right): (i32, i32),
-    ) {
-        let root = appmenu::glassbar(styles, autostart, updates);
-        self.open_at_cursor(root, MenuPurpose::GlassBar, cursor, (left, right));
-    }
-
     /// Abre el menú del botón de inicio en el cursor, como el de Windows (Win+X).
     fn open_windows(&mut self, cursor: POINT, bounds: (i32, i32)) {
         self.open_at_cursor(winx::menu(), MenuPurpose::Windows, cursor, bounds);
@@ -4173,6 +4827,11 @@ impl AppMenuWindow {
             ),
             y: bottom - height as i32,
         };
+        // Pulsado en la barra superior no cabe encima: se abre hacia abajo.
+        let (screen, _) = monitors::get_info(monitors::at(POINT { x, y: bottom }));
+        if self.pos.y < screen.top {
+            self.pos.y = bottom;
+        }
         self.visible = true;
         self.transition.open(Instant::now());
         self.render();
@@ -4491,21 +5150,33 @@ unsafe extern "system" fn tray_wndproc(
         let _ = GetCursorPos(&mut at);
         at
     };
-    // Pulsación sobre un icono: se la manda a su programa.
-    let press = |click: systray::Click| {
+    // Pulsación sobre un icono: se la manda a su programa. Con `chosen`, el icono
+    // elegido con el teclado en lugar del que está bajo el cursor.
+    let press = |click: systray::Click, chosen: Option<usize>| {
         with_app(|app| {
             let Some(panel) = app.tray_panel.as_mut().filter(|p| p.visible) else {
                 return;
             };
             let (x, y) = point(panel.scale);
-            if let Some(index) = panel.model.hit_test(x, y) {
+            let index = chosen.or_else(|| panel.model.hit_test(x, y));
+            if let Some(index) = index {
                 let _ = unsafe { KillTimer(Some(hwnd), TIMER_TIP) };
                 if let Some(tip) = &mut app.tooltip {
                     tip.hide();
                 }
                 app.tray_clicked = Some(Instant::now());
                 let key = panel.model.icons[index].key;
-                let at = cursor();
+                // Con el teclado, el menú del icono sale sobre él y no bajo el cursor.
+                let at = match chosen {
+                    Some(index) => {
+                        let (cx, cy) = panel.model.center(index);
+                        POINT {
+                            x: panel.pos.x + (cx * panel.scale).round() as i32,
+                            y: panel.pos.y + (cy * panel.scale).round() as i32,
+                        }
+                    }
+                    None => cursor(),
+                };
                 match click {
                     // Sigue abierto mientras está el menú del icono (el proceso se
                     // pone al mandarle el clic, justo después).
@@ -4646,7 +5317,7 @@ unsafe extern "system" fn tray_wndproc(
             let _ = ReleaseCapture();
             // Soltar tras arrastrar no es un clic en el icono.
             if dragged != Some(true) {
-                press(systray::Click::Left);
+                press(systray::Click::Left, None);
             }
         }
         WM_CAPTURECHANGED => {
@@ -4660,10 +5331,41 @@ unsafe extern "system" fn tray_wndproc(
                 }
             });
         }
-        WM_LBUTTONDBLCLK => press(systray::Click::Double),
-        WM_RBUTTONUP => press(systray::Click::Right),
-        WM_KEYDOWN if wparam.0 == 0x1B => {
-            with_app(|app| app.tray_panel.as_mut().map(TrayWindow::hide));
+        WM_LBUTTONDBLCLK => press(systray::Click::Double, None),
+        WM_RBUTTONUP => press(systray::Click::Right, None),
+        // Escape lo cierra; arriba y abajo recorren los iconos; Enter o espacio los
+        // pulsan y la tecla de menú (o Mayús+F10) abre su menú; izquierda y derecha
+        // pasan al panel vecino.
+        WM_KEYDOWN => {
+            let key = wparam.0;
+            let shift = windows::Win32::UI::Input::KeyboardAndMouse::GetKeyState(0x10) < 0;
+            let chosen = with_app(|app| {
+                let panel = app.tray_panel.as_mut().filter(|p| p.visible)?;
+                let click = match key {
+                    0x1B => {
+                        panel.hide();
+                        return None;
+                    }
+                    0x26 | 0x28 => {
+                        panel.model.move_focus(if key == 0x26 { -1 } else { 1 });
+                        panel.render();
+                        return None;
+                    }
+                    0x25 | 0x27 => {
+                        app.step_menu(if key == 0x25 { -1 } else { 1 });
+                        return None;
+                    }
+                    0x0D | 0x20 => systray::Click::Left,
+                    0x5D => systray::Click::Right,
+                    0x79 if shift => systray::Click::Right,
+                    _ => return None,
+                };
+                panel.model.hovered.map(|index| (click, index))
+            })
+            .flatten();
+            if let Some((click, index)) = chosen {
+                press(click, Some(index));
+            }
         }
         _ => return DefWindowProcW(hwnd, msg, wparam, lparam),
     }
@@ -5062,14 +5764,555 @@ fn handle_app_command(app: &mut App, target: HoverTarget, cmd: u32) {
     }
 }
 
+/// Nombre de la app activa: la descripción de su ejecutable ("Google Chrome"), su
+/// título en las apps de Store (que comparten `ApplicationFrameHost.exe`) o
+/// "Escritorio". `None` si es una ventana de GlassBar.
+fn active_app_name() -> Option<String> {
+    use windows::Win32::UI::WindowsAndMessaging::{
+        GetClassNameW, GetForegroundWindow, GetWindowThreadProcessId,
+    };
+    unsafe {
+        let window = GetForegroundWindow();
+        if window.is_invalid() {
+            return Some("Escritorio".into());
+        }
+        let mut pid = 0;
+        GetWindowThreadProcessId(window, Some(&mut pid));
+        if pid == std::process::id() {
+            return None;
+        }
+        let mut class = [0u16; 64];
+        let len = GetClassNameW(window, &mut class).max(0) as usize;
+        let class = String::from_utf16_lossy(&class[..len]);
+        if matches!(class.as_str(), "Progman" | "WorkerW" | "Shell_TrayWnd") {
+            return Some("Escritorio".into());
+        }
+        let (exe, _) = apps::process_info(pid)?;
+        let file = exe.rsplit('\\').next().unwrap_or_default();
+        if file.eq_ignore_ascii_case("ApplicationFrameHost.exe") {
+            let title = window_title(window.0 as isize);
+            if !title.is_empty() {
+                return Some(title);
+            }
+        }
+        apps::file_description(&exe)
+            .filter(|name| !name.trim().is_empty())
+            .or_else(|| {
+                std::path::Path::new(&exe)
+                    .file_stem()
+                    .map(|s| s.to_string_lossy().into_owned())
+            })
+    }
+}
+
+/// La barra superior: una franja fina en lo alto del monitor principal, con su
+/// sitio reservado (las ventanas maximizadas empiezan debajo).
+struct TopBarWindow {
+    hwnd: HWND,
+    surface: Option<Surface>,
+    scale: f32,
+    monitor: windows::Win32::Graphics::Gdi::HMONITOR,
+    /// Rectángulo del monitor.
+    rect: windows::Win32::Foundation::RECT,
+    model: topbar::TopBar,
+    /// Lo último dibujado, para no repetirlo si nada cambió.
+    drawn: Option<topbar::TopBar>,
+    appbar: Option<appbar::AppBar>,
+    /// Windows avisó de una app a pantalla completa en su monitor.
+    appbar_fullscreen: bool,
+    hidden: bool,
+}
+
+impl TopBarWindow {
+    fn new() -> Result<Self> {
+        let hwnd = unsafe {
+            CreateWindowExW(
+                WS_EX_LAYERED | WS_EX_TOPMOST | WS_EX_TOOLWINDOW | WS_EX_NOACTIVATE,
+                w!("GlassBarTop"),
+                w!("GlassBar — Barra superior"),
+                WS_POPUP,
+                0,
+                0,
+                1,
+                1,
+                // Sin dueña: una ventana con dueña siempre queda encima de ella, y el
+                // dock se pone encima de todo al mostrarse; la barra lo seguiría y
+                // taparía a Notch Isla.
+                None,
+                None,
+                Some(GetModuleHandleW(None)?.into()),
+                None,
+            )?
+        };
+        Ok(Self {
+            hwnd,
+            surface: None,
+            scale: 1.0,
+            monitor: monitors::primary(),
+            rect: Default::default(),
+            model: topbar::TopBar::new(),
+            drawn: None,
+            appbar: None,
+            appbar_fullscreen: false,
+            hidden: true,
+        })
+    }
+
+    /// Alto en píxeles.
+    fn height(&self) -> i32 {
+        (topbar::HEIGHT * self.scale).ceil() as i32
+    }
+
+    /// Se coloca arriba del monitor principal, reserva su sitio y se muestra.
+    fn place(&mut self) {
+        self.monitor = monitors::primary();
+        let (rect, dpi) = monitors::get_info(self.monitor);
+        self.rect = rect;
+        self.scale = dpi.max(0.3);
+        let width = (rect.right - rect.left).max(1) as u32;
+        let height = self.height() as u32;
+        if self
+            .surface
+            .as_ref()
+            .is_none_or(|s| s.width != width || s.height != height)
+        {
+            self.surface = Surface::new(width, height).ok();
+        }
+        self.model.width = width as f32 / self.scale;
+        if self.appbar.is_none() {
+            self.appbar = appbar::AppBar::register(self.hwnd, WM_TOP_APPBAR);
+        }
+        if let Some(bar) = &self.appbar {
+            bar.place(rect, height as i32, true);
+        }
+        self.drawn = None;
+        self.render();
+        if self.hidden {
+            self.set_hidden(false);
+        }
+        // Al crearse queda encima de todo; una isla como Notch Isla tiene que
+        // seguir encima de ella.
+        priority::raise_below_overlapping(self.hwnd, self.rect);
+    }
+
+    fn render(&mut self) {
+        if self.drawn.as_ref() == Some(&self.model) {
+            return;
+        }
+        let Some(surface) = &mut self.surface else {
+            return;
+        };
+        self.model.draw(&mut surface.pixmap, self.scale);
+        surface.copy_to_dib();
+        let size = SIZE {
+            cx: surface.width as i32,
+            cy: surface.height as i32,
+        };
+        let pos = POINT {
+            x: self.rect.left,
+            y: self.rect.top,
+        };
+        let blend = BLENDFUNCTION {
+            BlendOp: AC_SRC_OVER as u8,
+            BlendFlags: 0,
+            SourceConstantAlpha: 255,
+            AlphaFormat: AC_SRC_ALPHA as u8,
+        };
+        unsafe {
+            let _ = UpdateLayeredWindow(
+                self.hwnd,
+                None,
+                Some(&pos),
+                Some(&size),
+                Some(surface.dc),
+                Some(&POINT { x: 0, y: 0 }),
+                COLORREF(0),
+                Some(&blend),
+                ULW_ALPHA,
+            );
+        }
+        self.drawn = Some(self.model.clone());
+    }
+
+    /// Se aparta con una app a pantalla completa, como la barra de Windows.
+    fn set_hidden(&mut self, hidden: bool) {
+        if hidden == self.hidden {
+            return;
+        }
+        self.hidden = hidden;
+        unsafe {
+            let _ = ShowWindow(self.hwnd, if hidden { SW_HIDE } else { SW_SHOWNOACTIVATE });
+        }
+    }
+}
+
+impl Drop for TopBarWindow {
+    fn drop(&mut self) {
+        // Primero se devuelve su sitio, con la ventana aún viva.
+        self.appbar = None;
+        unsafe {
+            let _ = windows::Win32::UI::WindowsAndMessaging::DestroyWindow(self.hwnd);
+        }
+    }
+}
+
+unsafe extern "system" fn topbar_wndproc(
+    hwnd: HWND,
+    msg: u32,
+    wparam: WPARAM,
+    lparam: LPARAM,
+) -> LRESULT {
+    let x = (lparam.0 & 0xffff) as i16 as i32;
+    let y = ((lparam.0 >> 16) & 0xffff) as i16 as i32;
+    match msg {
+        WM_MOUSEMOVE => {
+            let mut track = TRACKMOUSEEVENT {
+                cbSize: std::mem::size_of::<TRACKMOUSEEVENT>() as u32,
+                dwFlags: TME_LEAVE,
+                hwndTrack: hwnd,
+                dwHoverTime: 0,
+            };
+            let _ = TrackMouseEvent(&mut track);
+            with_app(|app| app.top_hover(x, y));
+            LRESULT(0)
+        }
+        WM_MOUSELEAVE => {
+            with_app(|app| app.top_hover(-1, -1));
+            LRESULT(0)
+        }
+        WM_LBUTTONUP => {
+            with_app(|app| app.top_click(x, y));
+            LRESULT(0)
+        }
+        // Clic derecho en el logo de Inicio: el menú de Windows (Win+X), como en el
+        // dock. En el resto de la barra, nada.
+        WM_RBUTTONUP => {
+            with_app(|app| app.top_right_click(x, y));
+            LRESULT(0)
+        }
+        // La rueda sobre el estado sube o baja el volumen, como en el dock.
+        windows::Win32::UI::WindowsAndMessaging::WM_MOUSEWHEEL => {
+            with_app(|app| {
+                let over_status = app
+                    .top
+                    .as_ref()
+                    .is_some_and(|top| matches!(top.model.hovered, Some(HoverTarget::Status(_))));
+                if over_status {
+                    let delta = ((wparam.0 >> 16) & 0xffff) as i16 as f32 / 120.0;
+                    status::change_volume(delta);
+                    app.bar.status = app.status.read();
+                    app.refresh_top_bar();
+                }
+            });
+            LRESULT(0)
+        }
+        WM_MOUSEACTIVATE => LRESULT(MA_NOACTIVATE as isize),
+        WM_TOP_APPBAR => {
+            match wparam.0 {
+                appbar::ABN_POSCHANGED => {
+                    with_app(|app| {
+                        if let Some(top) = &mut app.top {
+                            top.place();
+                        }
+                    });
+                }
+                appbar::ABN_FULLSCREENAPP => {
+                    with_app(|app| {
+                        if let Some(top) = &mut app.top {
+                            top.appbar_fullscreen = lparam.0 != 0;
+                        }
+                        app.check_priority(false);
+                    });
+                }
+                _ => {}
+            }
+            LRESULT(0)
+        }
+        _ => DefWindowProcW(hwnd, msg, wparam, lparam),
+    }
+}
+
+/// Ventana de configuración (ver `settings`), centrada en el monitor del dock.
+struct SettingsWindow {
+    hwnd: HWND,
+    backdrop: Option<style::Backdrop>,
+    surface: Option<Surface>,
+    pos: POINT,
+    scale: f32,
+    model: settings::SettingsState,
+    visible: bool,
+    transition: launcher::Transition,
+    /// Arrastrando la ventana por su cabecera: distancia del cursor a su esquina.
+    grab: Option<POINT>,
+    /// Donde la dejó el usuario; al volver a abrirla sale ahí en vez de centrada.
+    placed: Option<POINT>,
+}
+impl SettingsWindow {
+    fn new(owner: HWND, model: settings::SettingsState) -> Result<Self> {
+        let hwnd = unsafe {
+            CreateWindowExW(
+                WS_EX_LAYERED | WS_EX_TOPMOST | WS_EX_TOOLWINDOW,
+                w!("GlassBarSettings"),
+                w!("GlassBar — Configuración"),
+                WS_POPUP,
+                0,
+                0,
+                1,
+                1,
+                Some(owner),
+                None,
+                Some(GetModuleHandleW(None)?.into()),
+                None,
+            )?
+        };
+        Ok(Self {
+            hwnd,
+            backdrop: style::Backdrop::new(),
+            surface: None,
+            pos: POINT::default(),
+            scale: 1.0,
+            model,
+            visible: false,
+            transition: launcher::Transition::hidden(),
+            grab: None,
+            placed: None,
+        })
+    }
+    fn show(&mut self) {
+        let (screen, dpi) = monitors::get_info(monitors::dock());
+        self.scale = dpi.max(0.3);
+        let width = (settings::WIDTH * self.scale).ceil() as u32;
+        let height = (settings::height() * self.scale).ceil() as u32;
+        let Ok(surface) = Surface::new(width, height) else {
+            return;
+        };
+        self.surface = Some(surface);
+        let centered = POINT {
+            x: screen.left + ((screen.right - screen.left) - width as i32) / 2,
+            y: screen.top + ((screen.bottom - screen.top) - height as i32) / 2,
+        };
+        // Donde la dejó el usuario, si ese sitio sigue estando en una pantalla.
+        self.pos = self
+            .placed
+            .filter(|p| {
+                let area = monitors::work_area(monitors::at(*p));
+                p.x >= area.left
+                    && p.y >= area.top
+                    && p.x + width as i32 <= area.right
+                    && p.y + height as i32 <= area.bottom
+            })
+            .unwrap_or(centered);
+        self.visible = true;
+        self.transition.open(Instant::now());
+        self.render();
+        take_focus(self.hwnd);
+    }
+    fn render(&mut self) {
+        if let Some(surface) = &mut self.surface {
+            self.model.draw(&mut surface.pixmap, self.scale);
+            surface.copy_to_dib();
+        }
+        self.present();
+    }
+    fn present(&mut self) {
+        if let Some(surface) = &self.surface {
+            present_popup(
+                self.hwnd,
+                surface,
+                self.pos,
+                self.scale,
+                &self.transition,
+                self.visible,
+                false,
+                self.backdrop.as_ref(),
+                &[panel_shape(surface, self.scale, 12.0)],
+            );
+        }
+    }
+    fn hide(&mut self) {
+        if !self.visible {
+            return;
+        }
+        self.visible = false;
+        self.model.hovered = None;
+        self.model.dragging = false;
+        self.grab = None;
+        self.transition.close(Instant::now());
+        self.present();
+    }
+}
+impl Drop for SettingsWindow {
+    fn drop(&mut self) {
+        unsafe {
+            let _ = windows::Win32::UI::WindowsAndMessaging::DestroyWindow(self.hwnd);
+        }
+    }
+}
+
+/// Cambia la opacidad de los paneles desde la barra de la configuración.
+fn set_settings_opacity(app: &mut App, x: f32) {
+    let value = settings::SettingsState::opacity_at(x);
+    app.styles.set_menu_opacity((value * 100.0).round() as u8);
+    glass::set_menu_opacity(app.styles.menu_opacity());
+    app.refresh_settings();
+}
+
+unsafe extern "system" fn settings_wndproc(
+    hwnd: HWND,
+    msg: u32,
+    wparam: WPARAM,
+    lparam: LPARAM,
+) -> LRESULT {
+    use windows::Win32::UI::WindowsAndMessaging::{WA_INACTIVE, WM_ACTIVATE, WM_KEYDOWN};
+    let point = |scale: f32| {
+        (
+            (lparam.0 & 0xffff) as i16 as f32 / scale,
+            ((lparam.0 >> 16) & 0xffff) as i16 as f32 / scale,
+        )
+    };
+    match msg {
+        WM_ACTIVATE if (wparam.0 & 0xffff) as u32 == WA_INACTIVE => {
+            with_app(|app| app.settings.as_mut().map(SettingsWindow::hide));
+        }
+        WM_TIMER if wparam.0 == TIMER_ANIM => {
+            with_app(|app| app.settings.as_mut().map(SettingsWindow::present));
+        }
+        WM_MOUSEMOVE => {
+            with_app(|app| {
+                let Some(panel) = app.settings.as_mut().filter(|p| p.visible) else {
+                    return;
+                };
+                if let Some(grab) = panel.grab {
+                    let mut cursor = POINT::default();
+                    let _ = GetCursorPos(&mut cursor);
+                    // Sin salirse del área de trabajo del monitor del cursor (así no
+                    // tapa la barra superior).
+                    let screen = monitors::work_area(monitors::at(cursor));
+                    let (width, height) = panel
+                        .surface
+                        .as_ref()
+                        .map_or((0, 0), |s| (s.width as i32, s.height as i32));
+                    panel.pos = POINT {
+                        x: (cursor.x - grab.x)
+                            .clamp(screen.left, (screen.right - width).max(screen.left)),
+                        y: (cursor.y - grab.y)
+                            .clamp(screen.top, (screen.bottom - height).max(screen.top)),
+                    };
+                    panel.placed = Some(panel.pos);
+                    panel.present();
+                    return;
+                }
+                let (x, y) = point(panel.scale);
+                if panel.model.dragging {
+                    set_settings_opacity(app, x);
+                    return;
+                }
+                let mut track = TRACKMOUSEEVENT {
+                    cbSize: std::mem::size_of::<TRACKMOUSEEVENT>() as u32,
+                    dwFlags: TME_LEAVE,
+                    hwndTrack: hwnd,
+                    dwHoverTime: 0,
+                };
+                let _ = TrackMouseEvent(&mut track);
+                let hit = panel.model.hit_test(x, y);
+                if hit != panel.model.hovered {
+                    panel.model.hovered = hit;
+                    panel.render();
+                }
+            });
+        }
+        WM_MOUSELEAVE => {
+            with_app(|app| {
+                if let Some(panel) = app.settings.as_mut().filter(|p| p.visible) {
+                    if !panel.model.dragging && panel.model.hovered.take().is_some() {
+                        panel.render();
+                    }
+                }
+            });
+        }
+        WM_LBUTTONDOWN => {
+            with_app(|app| {
+                let Some(panel) = app.settings.as_mut().filter(|p| p.visible) else {
+                    return;
+                };
+                let (x, y) = point(panel.scale);
+                if settings::SettingsState::in_title(x, y) {
+                    let mut cursor = POINT::default();
+                    let _ = GetCursorPos(&mut cursor);
+                    panel.grab = Some(POINT {
+                        x: cursor.x - panel.pos.x,
+                        y: cursor.y - panel.pos.y,
+                    });
+                    let _ = SetCapture(hwnd);
+                    return;
+                }
+                if panel.model.hit_test(x, y) == Some(settings::Hit::Opacity) {
+                    panel.model.dragging = true;
+                    let _ = SetCapture(hwnd);
+                    set_settings_opacity(app, x);
+                }
+            });
+        }
+        WM_LBUTTONUP => {
+            with_app(|app| {
+                let Some(panel) = app.settings.as_mut().filter(|p| p.visible) else {
+                    return;
+                };
+                if panel.grab.take().is_some() {
+                    let _ = ReleaseCapture();
+                    return;
+                }
+                if panel.model.dragging {
+                    panel.model.dragging = false;
+                    let _ = ReleaseCapture();
+                    let _ = app.styles.save();
+                    app.refresh_settings();
+                    return;
+                }
+                let (x, y) = point(panel.scale);
+                let Some(hit) = panel.model.hit_test(x, y) else {
+                    return;
+                };
+                if hit == settings::Hit::Close {
+                    panel.hide();
+                    return;
+                }
+                if let Some(command) = panel.model.command(hit) {
+                    handle_menu_command(app, command);
+                    app.refresh_settings();
+                }
+            });
+        }
+        WM_KEYDOWN if wparam.0 == 0x1B => {
+            with_app(|app| app.settings.as_mut().map(SettingsWindow::hide));
+        }
+        _ => return DefWindowProcW(hwnd, msg, wparam, lparam),
+    }
+    LRESULT(0)
+}
+
 fn handle_menu_command(app: &mut App, cmd: u32) {
     match cmd {
         CMD_AUTOSTART => {
             let active = autostart::is_enabled();
             autostart::set(!active);
         }
+        CMD_AUTOHIDE => {
+            let always = !app.styles.always_visible();
+            app.styles.set_always_visible(always);
+            let _ = app.styles.save();
+            app.sync_appbar();
+            app.expand();
+        }
+        CMD_SETTINGS => app.open_settings(),
+        CMD_TOP_BAR => {
+            let on = !app.styles.top_bar();
+            app.styles.set_top_bar(on);
+            let _ = app.styles.save();
+            app.sync_top_bar();
+        }
         CMD_EXIT => {
-            app.shell.restore();
+            app.release_shell();
             unsafe {
                 PostQuitMessage(0);
             }
@@ -5316,6 +6559,30 @@ fn main() -> Result<()> {
             return Err(windows::core::Error::from_thread());
         }
 
+        let top_class = WNDCLASSEXW {
+            cbSize: std::mem::size_of::<WNDCLASSEXW>() as u32,
+            lpfnWndProc: Some(topbar_wndproc),
+            hInstance: instance.into(),
+            hCursor: LoadCursorW(None, IDC_ARROW)?,
+            lpszClassName: w!("GlassBarTop"),
+            ..Default::default()
+        };
+        if RegisterClassExW(&top_class) == 0 {
+            return Err(windows::core::Error::from_thread());
+        }
+
+        let settings_class = WNDCLASSEXW {
+            cbSize: std::mem::size_of::<WNDCLASSEXW>() as u32,
+            lpfnWndProc: Some(settings_wndproc),
+            hInstance: instance.into(),
+            hCursor: LoadCursorW(None, IDC_ARROW)?,
+            lpszClassName: w!("GlassBarSettings"),
+            ..Default::default()
+        };
+        if RegisterClassExW(&settings_class) == 0 {
+            return Err(windows::core::Error::from_thread());
+        }
+
         let tooltip_class = WNDCLASSEXW {
             cbSize: std::mem::size_of::<WNDCLASSEXW>() as u32,
             lpfnWndProc: Some(tooltip_wndproc),
@@ -5345,6 +6612,8 @@ fn main() -> Result<()> {
 
         windows::Win32::UI::Shell::DragAcceptFiles(hwnd, true);
         let mut app = App::new(hwnd)?;
+        app.sync_appbar();
+        app.sync_top_bar();
         app.render();
 
         let _ = ShowWindow(hwnd, SW_SHOWNOACTIVATE);
@@ -5370,7 +6639,7 @@ fn main() -> Result<()> {
         APP.with(|cell| *cell.borrow_mut() = Some(app));
 
         // La tecla Windows abre el lanzador propio; se quita al salir del bucle.
-        let _winkey = winkey::WinKey::install(hwnd, WM_SHOW_LAUNCHER);
+        let _winkey = winkey::WinKey::install(hwnd, WM_SHOW_LAUNCHER, WM_SHORTCUT);
         let _foreground = priority::ForegroundWatch::install(hwnd, WM_FOREGROUND);
 
         let mut msg = MSG::default();
@@ -5385,4 +6654,24 @@ fn main() -> Result<()> {
         toggles::restore_saver();
     }
     Ok(())
+}
+
+#[cfg(test)]
+mod menu_tests {
+    use super::*;
+    #[test]
+    fn left_and_right_follow_the_bar_and_wrap() {
+        let next = |open, step, language| neighbor_menu(open, step, language);
+        assert_eq!(next(HoverTarget::Overflow, 1, true), HoverTarget::Language);
+        assert_eq!(
+            next(HoverTarget::Overflow, 1, false),
+            HoverTarget::Status(0)
+        );
+        assert_eq!(next(HoverTarget::Clock, 1, true), HoverTarget::Overflow);
+        assert_eq!(next(HoverTarget::Overflow, -1, true), HoverTarget::Clock);
+        assert_eq!(
+            next(HoverTarget::Status(0), -1, true),
+            HoverTarget::Language
+        );
+    }
 }

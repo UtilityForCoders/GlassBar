@@ -4,7 +4,7 @@
 //! está solo el contenido y su dibujo; la ventana que lo muestra está en `main`.
 use crate::apps::{fill_rounded, stroke_rounded};
 use crate::clock::{draw_icon, draw_text, fit_text, text_width};
-use crate::style::{Appearance, Choice, Shape, State, Styles};
+use crate::style::Shape;
 use tiny_skia::{Pixmap, PixmapPaint, Transform};
 
 /// Opciones fijas del menú de una app.
@@ -21,13 +21,7 @@ pub const GLYPH_PIN: char = '\u{E718}';
 pub const GLYPH_UNPIN: char = '\u{E77A}';
 pub const GLYPH_END_TASK: char = '\u{E71A}';
 pub const GLYPH_CLOSE: char = '\u{E8BB}';
-/// Marca de la opción elegida.
-pub const GLYPH_CHECK: char = '\u{E73E}';
 const GLYPH_CHEVRON: char = '\u{E76C}';
-const GLYPH_EXIT: char = '\u{E7E8}';
-const GLYPH_DOWNLOAD: char = '\u{E896}';
-const GLYPH_REFRESH: char = '\u{E72C}';
-const GLYPH_OPACITY: char = '\u{E790}';
 
 /// Lado de los iconos, en unidades lógicas (los iconos pequeños de Windows).
 pub const ICON: f32 = 16.0;
@@ -59,17 +53,6 @@ pub enum Icon {
     Glyph(char),
 }
 
-impl Icon {
-    /// La marca de las opciones elegidas; sin elegir, el hueco vacío.
-    pub fn check(on: bool) -> Self {
-        if on {
-            Icon::Glyph(GLYPH_CHECK)
-        } else {
-            Icon::Image(None)
-        }
-    }
-}
-
 pub enum Entry {
     /// Título de sección ("Más visitado", "Tareas"…).
     Header(String),
@@ -85,7 +68,10 @@ pub enum Entry {
         menu: Box<AppMenu>,
     },
     Separator,
-    /// Barra para elegir un valor de 0 a 1 arrastrando o con las flechas.
+    /// Barra para elegir un valor de 0 a 1 arrastrando o con las flechas. Ningún
+    /// menú la usa ahora (la opacidad pasó a la configuración), pero el menú la
+    /// sigue sabiendo dibujar y mover.
+    #[allow(dead_code)]
     Slider {
         icon: Icon,
         label: String,
@@ -473,87 +459,28 @@ pub const CMD_UPDATE: u32 = 4;
 pub const CMD_UPDATE_CHECK: u32 = 5;
 /// Barra de la opacidad de los paneles y menús.
 pub const CMD_MENU_OPACITY: u32 = 6;
+/// Ocultar el dock automáticamente o dejarlo siempre a la vista.
+pub const CMD_AUTOHIDE: u32 = 7;
+/// Barra superior con los controles (estilo macOS).
+pub const CMD_TOP_BAR: u32 = 8;
+/// Abrir la ventana de configuración.
+pub const CMD_SETTINGS: u32 = 9;
 
-/// Estado de las actualizaciones que muestra el menú de GlassBar.
-#[derive(Default)]
-pub struct Updates {
-    /// Buscando ahora la última versión publicada.
-    pub checking: bool,
-    /// Versión nueva publicada ("0.3.0").
-    pub available: Option<String>,
-    /// Descargando o instalando.
-    pub busy: bool,
-}
-
-/// El menú de GlassBar: un submenú por situación con su apariencia (como en
-/// TranslucentTB), iniciar con Windows, actualizaciones y salir.
-pub fn glassbar(styles: &Styles, autostart: bool, updates: &Updates) -> AppMenu {
-    let mut entries = vec![
-        Entry::Header(format!("GlassBar v{}", env!("CARGO_PKG_VERSION"))),
+/// Menú del icono de GlassBar en la bandeja (clic derecho): configuración y salir.
+pub fn tray() -> AppMenu {
+    AppMenu::new(vec![
+        Entry::Item {
+            icon: Icon::Glyph('\u{E713}'),
+            label: "Configuración".into(),
+            command: CMD_SETTINGS,
+        },
         Entry::Separator,
-    ];
-    for state in State::ALL {
-        let look = styles.look(state);
-        let mut items = Vec::new();
-        if state != State::Desktop {
-            items.push(Entry::Item {
-                icon: Icon::check(look.enabled),
-                label: "Activado".into(),
-                command: Choice::Toggle(state).command(),
-            });
-            items.push(Entry::Separator);
-        }
-        for appearance in Appearance::ALL {
-            // Desactivada, sin marca: elegir una apariencia la activa.
-            items.push(Entry::Item {
-                icon: Icon::check(look.enabled && look.appearance == appearance),
-                label: appearance.name().into(),
-                command: Choice::Set(state, appearance).command(),
-            });
-        }
-        entries.push(Entry::Submenu {
-            icon: Icon::Glyph(state.glyph()),
-            label: state.name().into(),
-            menu: Box::new(AppMenu::new(items)),
-        });
-    }
-    entries.push(Entry::Separator);
-    entries.push(Entry::Slider {
-        icon: Icon::Glyph(GLYPH_OPACITY),
-        label: "Opacidad de los menús".into(),
-        value: styles.menu_opacity() as f32 / 100.0,
-        command: CMD_MENU_OPACITY,
-    });
-    entries.push(Entry::Separator);
-    entries.push(Entry::Item {
-        icon: Icon::check(autostart),
-        label: "Iniciar con Windows".into(),
-        command: CMD_AUTOSTART,
-    });
-    match (&updates.available, updates.busy) {
-        (_, true) => entries.push(Entry::Header("Descargando la actualización…".into())),
-        (Some(version), false) => entries.push(Entry::Item {
-            icon: Icon::Glyph(GLYPH_DOWNLOAD),
-            label: format!("Actualizar a v{version}"),
-            command: CMD_UPDATE,
-        }),
-        (None, false) if updates.checking => {
-            entries.push(Entry::Header("Buscando actualizaciones…".into()))
-        }
-        // La búsqueda sola no se puede apagar: esto solo mira ya, sin esperar.
-        (None, false) => entries.push(Entry::Item {
-            icon: Icon::Glyph(GLYPH_REFRESH),
-            label: "Buscar actualizaciones".into(),
-            command: CMD_UPDATE_CHECK,
-        }),
-    }
-    entries.push(Entry::Separator);
-    entries.push(Entry::Item {
-        icon: Icon::Glyph(GLYPH_EXIT),
-        label: "Salir de GlassBar".into(),
-        command: CMD_EXIT,
-    });
-    AppMenu::new(entries)
+        Entry::Item {
+            icon: Icon::Glyph('\u{E7E8}'),
+            label: "Salir de GlassBar".into(),
+            command: CMD_EXIT,
+        },
+    ])
 }
 
 /// Lo que hay bajo el cursor en un menú con submenú.

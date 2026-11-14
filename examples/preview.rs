@@ -36,6 +36,8 @@ mod keyboard;
 mod launcher;
 #[path = "../src/pins.rs"]
 mod pins;
+#[path = "../src/settings.rs"]
+mod settings;
 #[path = "../src/spring.rs"]
 mod spring;
 #[path = "../src/status.rs"]
@@ -161,30 +163,22 @@ fn main() {
         println!("Menú de {id}: target/appmenu-preview.bmp");
         return;
     }
-    // Menú de GlassBar con el submenú de la segunda situación abierto, en
-    // target/glassbar-menu-preview.bmp.
-    if arguments_of("--glassbar-menu").is_some() {
-        let mut styles = style::Styles::load();
-        if !styles.watches_screen() {
-            styles.set_appearance(style::State::VisibleWindow, style::Appearance::Blur);
-        }
-        // Con una versión nueva, para ver su opción.
-        let updates = appmenu::Updates {
-            checking: false,
+    // Ventana de configuración en target/settings-preview.bmp.
+    if arguments_of("--settings").is_some() {
+        let styles = style::Styles::load();
+        let updates = settings::Updates {
             available: Some("9.9.9".into()),
-            busy: false,
+            ..Default::default()
         };
-        let root = appmenu::glassbar(&styles, autostart::is_enabled(), &updates);
-        let mut menu = appmenu::Cascade::new(root, false);
-        menu.key(0x28);
-        menu.key(0x28);
-        menu.key(0x27);
-        menu.key(0x28);
-        let (w, h) = menu.size();
-        let mut image = Pixmap::new((w * scale).ceil() as u32, (h * scale).ceil() as u32).unwrap();
-        menu.draw(&mut image, scale);
-        std::fs::write("target/glassbar-menu-preview.bmp", bmp_entry(&image)).unwrap();
-        println!("Menú de GlassBar: target/glassbar-menu-preview.bmp");
+        let model = settings::SettingsState::new(styles, autostart::is_enabled(), updates);
+        let mut image = Pixmap::new(
+            (settings::WIDTH * scale).ceil() as u32,
+            (settings::height() * scale).ceil() as u32,
+        )
+        .unwrap();
+        model.draw(&mut image, scale);
+        std::fs::write("target/settings-preview.bmp", bmp_entry(&image)).unwrap();
+        println!("Configuración: target/settings-preview.bmp");
         return;
     }
     // Última versión publicada; con `--download`, también descarga su instalador y
@@ -258,6 +252,10 @@ fn main() {
                 a.icon.is_some()
             );
         }
+    }
+    // `--clear`: con la apariencia Transparente (solo los iconos).
+    if std::env::args().any(|a| a == "--clear") {
+        state.appearance = style::Appearance::Clear;
     }
     let (w, h) = state.window_size(scale);
     let mut pixmap = Pixmap::new(w, h).expect("pixmap failed");
