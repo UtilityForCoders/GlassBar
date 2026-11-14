@@ -21,8 +21,9 @@ use windows::core::{
 };
 use windows::Win32::Foundation::HWND;
 use windows::Win32::Storage::EnhancedStorage::{
-    PKEY_AppUserModel_ID, PKEY_AppUserModel_IsDestListSeparator, PKEY_Link_TargetParsingPath,
-    PKEY_Title,
+    PKEY_AppUserModel_ID, PKEY_AppUserModel_IsDestListSeparator, PKEY_AppUserModel_RelaunchCommand,
+    PKEY_AppUserModel_RelaunchDisplayNameResource, PKEY_AppUserModel_RelaunchIconResource,
+    PKEY_Link_TargetParsingPath, PKEY_Title,
 };
 use windows::Win32::System::Com::StructuredStorage::{
     PropVariantToBoolean, PropVariantToStringAlloc,
@@ -293,7 +294,7 @@ unsafe fn link_item(link: &IShellLinkW) -> Option<JumpItem> {
 
 /// Resuelve los textos guardados como recurso ("@shell32.dll,-123" o
 /// "@{Paquete?ms-resource://…}"); los demás quedan igual.
-fn indirect(text: &str) -> String {
+pub fn indirect(text: &str) -> String {
     if !text.starts_with('@') {
         return text.to_string();
     }
@@ -471,6 +472,39 @@ fn window_app_id(window: isize) -> Option<String> {
     })
 }
 
+/// Lo que una ventana declara de sí misma para la barra: su AppUserModelID y, si
+/// las tiene, cómo volver a abrirla, su nombre y su icono. Las apps web instaladas
+/// desde el navegador (PWA) lo declaran todo, porque comparten proceso con él.
+#[derive(Clone, Debug, Default, PartialEq, Eq)]
+pub struct WindowApp {
+    pub id: String,
+    /// Orden completa para volver a abrirla (`PKEY_AppUserModel_RelaunchCommand`).
+    pub relaunch: Option<String>,
+    /// Nombre para mostrar, ya resuelto si era un recurso ("@…").
+    pub name: Option<String>,
+    /// Recurso de icono, "ruta,índice" (`PKEY_AppUserModel_RelaunchIconResource`).
+    pub icon: Option<String>,
+}
+
+/// Las propiedades de la ventana que la barra usa para agruparla y anclarla.
+pub fn window_app(window: isize) -> Option<WindowApp> {
+    with_com(|| unsafe {
+        let store: IPropertyStore = SHGetPropertyStoreForWindow(HWND(window as *mut _)).ok()?;
+        let text = |key| {
+            let value = store.GetValue(key).ok()?;
+            let text = take(PropVariantToStringAlloc(&value).ok()?);
+            let text = text.trim();
+            (!text.is_empty()).then(|| text.to_string())
+        };
+        Some(WindowApp {
+            id: text(&PKEY_AppUserModel_ID)?,
+            relaunch: text(&PKEY_AppUserModel_RelaunchCommand),
+            name: text(&PKEY_AppUserModel_RelaunchDisplayNameResource).map(|n| indirect(&n)),
+            icon: text(&PKEY_AppUserModel_RelaunchIconResource),
+        })
+    })
+}
+
 /// El que guarda un acceso directo (.lnk) en sus propiedades.
 fn item_app_id(path: &str) -> Option<String> {
     unsafe {
@@ -481,28 +515,52 @@ fn item_app_id(path: &str) -> Option<String> {
     }
 }
 
-/// Ejecutable (en minúsculas) → AppUserModelID de las apps del menú Inicio. Leerlo
-/// tarda: se prepara en segundo plano al arrancar con `warm_up`.
+/// Las apps del menú Inicio (AppsFolder): sus AppUserModelID y, de las que abren un
+/// ejecutable, ejecutable (en minúsculas) → AppUserModelID.
+#[derive(Default)]
+struct AppsFolder {
+    by_exe: HashMap<String, String>,
+    /// Todos los AppUserModelID, en minúsculas.
+    ids: std::collections::HashSet<String>,
+}
+
+/// Lo que tiene el menú Inicio. Leerlo tarda: se prepara en segundo plano al
+/// arrancar con `warm_up`.
+static APPS_FOLDER: OnceLock<AppsFolder> = OnceLock::new();
+
+fn apps_folder() -> &'static AppsFolder {
+    APPS_FOLDER.get_or_init(|| with_com(read_apps_folder))
+}
+
 fn apps_folder_ids() -> &'static HashMap<String, String> {
-    static IDS: OnceLock<HashMap<String, String>> = OnceLock::new();
-    IDS.get_or_init(|| with_com(read_apps_folder))
+    &apps_folder().by_exe
+}
+
+/// Sin esperar a que se lea el menú Inicio (`None` mientras tanto): si tiene una
+/// app con el AppUserModelID `id`, y el AppUserModelID de la app que abre `exe`.
+pub fn apps_folder_lookup(id: &str, exe: &str) -> Option<(bool, Option<String>)> {
+    let folder = APPS_FOLDER.get()?;
+    Some((
+        folder.ids.contains(&id.to_lowercase()),
+        folder.by_exe.get(&exe.to_lowercase()).cloned(),
+    ))
 }
 
 /// Prepara en otro hilo lo que tarda en leerse, para que el primer clic derecho
 /// no espere.
 pub fn warm_up() {
     std::thread::spawn(|| {
-        apps_folder_ids();
+        apps_folder();
     });
 }
 
-fn read_apps_folder() -> HashMap<String, String> {
+fn read_apps_folder() -> AppsFolder {
     unsafe {
-        let result = (|| -> windows::core::Result<HashMap<String, String>> {
+        let result = (|| -> windows::core::Result<AppsFolder> {
             let folder: IShellItem =
                 SHGetKnownFolderItem(&FOLDERID_AppsFolder, KF_FLAG_DEFAULT, None)?;
             let items: IEnumShellItems = folder.BindToHandler(None, &BHID_EnumItems)?;
-            let mut ids = HashMap::new();
+            let mut apps = AppsFolder::default();
             loop {
                 let mut batch = [None];
                 let mut fetched = 0;
@@ -513,18 +571,22 @@ fn read_apps_folder() -> HashMap<String, String> {
                 let Some(item) = batch[0].take().and_then(|i| i.cast::<IShellItem2>().ok()) else {
                     continue;
                 };
-                let (Ok(id), Ok(target)) = (
-                    item.GetString(&PKEY_AppUserModel_ID),
-                    item.GetString(&PKEY_Link_TargetParsingPath),
-                ) else {
+                let Ok(id) = item.GetString(&PKEY_AppUserModel_ID) else {
                     continue;
                 };
-                let (id, target) = (take(id), take(target));
-                if !id.is_empty() && !target.is_empty() {
-                    ids.entry(target.to_lowercase()).or_insert(id);
+                let id = take(id);
+                if id.is_empty() {
+                    continue;
+                }
+                apps.ids.insert(id.to_lowercase());
+                if let Ok(target) = item.GetString(&PKEY_Link_TargetParsingPath) {
+                    let target = take(target);
+                    if !target.is_empty() {
+                        apps.by_exe.entry(target.to_lowercase()).or_insert(id);
+                    }
                 }
             }
-            Ok(ids)
+            Ok(apps)
         })();
         result.unwrap_or_default()
     }

@@ -21,7 +21,7 @@ Como en la barra de Windows, **Mayús+clic** o el **clic central** sobre una app
 
 La franja fina del extremo derecho del dock, después del reloj, es **Mostrar escritorio**: un clic minimiza todas las ventanas y otro las devuelve, igual que Win+D.
 
-Las apps de Microsoft Store se anclan por su identificador de aplicación. El clic derecho en un hueco del dock no abre nada: los ajustes están en la configuración (ver Configuración). La selección se conserva en `%LOCALAPPDATA%\GlassBar\apps.json`. Los accesos directos mantienen su icono, argumentos y directorio de trabajo. No se descargan ni recrean logos. Los archivos que ya no existen muestran el icono genérico de Windows.
+Las apps de Microsoft Store se anclan por su identificador de aplicación. Las apps web instaladas desde el navegador (PWA, como WhatsApp Web instalada desde Chrome o Edge) salen aparte del navegador, como en la barra de Windows. Llevan su propio icono y nombre. GlassBar las distingue por el identificador de aplicación que declara su ventana (`Chrome._crx_…`), porque comparten proceso con el navegador. Al anclarlas se abren por su entrada del menú Inicio, así que se abre la app y no el navegador. Las ventanas de otro perfil del navegador siguen con él. El clic derecho en un hueco del dock no abre nada: los ajustes están en la configuración (ver Configuración). La selección se conserva en `%LOCALAPPDATA%\GlassBar\apps.json`. Los accesos directos mantienen su icono, argumentos y directorio de trabajo. No se descargan ni recrean logos. Los archivos que ya no existen muestran el icono genérico de Windows.
 
 ## Lanzador propio
 
