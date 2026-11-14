@@ -70,7 +70,7 @@ fn main() {
         let mut menu = launcher::LauncherState::new(&pinned);
         let opened = started.elapsed();
         let started = std::time::Instant::now();
-        menu.preload_icons();
+        menu.preload_icons(scale);
         let preloaded = started.elapsed();
         let arguments: Vec<String> = std::env::args().collect();
         if let Some(index) = arguments.iter().position(|a| a == "--search") {

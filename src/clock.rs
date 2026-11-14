@@ -7,7 +7,7 @@ use windows::Win32::System::SystemInformation::GetLocalTime;
 fn font_file(name: &str) -> Option<Font> {
     let windows = std::env::var_os("WINDIR").unwrap_or_else(|| "C:\\Windows".into());
     let path = std::path::PathBuf::from(windows).join("Fonts").join(name);
-    Font::from_bytes(std::fs::read(path).ok()?)
+    Font::from_file(&path)
 }
 
 fn system_font() -> &'static Font {
@@ -319,6 +319,19 @@ pub fn draw_text_semibold(
         y,
         opacity,
     );
+}
+
+/// Como `draw_text_on_baseline`, en Segoe UI Semibold.
+pub fn draw_text_semibold_on_baseline(
+    target: &mut Pixmap,
+    text: &str,
+    x: f32,
+    baseline: f32,
+    size: f32,
+    opacity: f32,
+) {
+    let (image, top) = rasterize_line(semibold_font(), text, size);
+    blit_text(target, image, x, baseline - top as f32, opacity);
 }
 
 fn blit_text(target: &mut Pixmap, image: Pixmap, x: f32, y: f32, opacity: f32) {
