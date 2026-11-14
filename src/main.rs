@@ -1344,9 +1344,14 @@ fn prepare_launcher(
 ) -> std::sync::mpsc::Receiver<launcher::LauncherState> {
     let (sender, receiver) = std::sync::mpsc::channel();
     let pinned = pinned.to_vec();
+    // La escala del monitor del dock: hasta abrir el lanzador por primera vez, los
+    // iconos esperan ya reducidos (si al final se dibujan más pequeños, se vuelven a
+    // reducir al dibujarlos).
+    let (_, dpi) = monitors::get_info(monitors::dock());
+    let scale = dpi.max(0.3);
     std::thread::spawn(move || {
         let mut model = launcher::LauncherState::new(&pinned);
-        model.preload_icons();
+        model.preload_icons(scale);
         let _ = sender.send(model);
     });
     receiver
