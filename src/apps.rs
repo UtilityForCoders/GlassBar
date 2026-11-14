@@ -20,6 +20,7 @@ use windows::Win32::UI::WindowsAndMessaging::{
     SW_RESTORE, SW_SHOWNORMAL, WS_EX_APPWINDOW, WS_EX_NOACTIVATE, WS_EX_TOOLWINDOW,
 };
 
+use crate::jumplist::WindowApp;
 use crate::spring::Spring;
 
 #[derive(Clone, serde::Serialize, serde::Deserialize)]
@@ -31,6 +32,9 @@ pub struct AppEntry {
 pub struct AppItem {
     pub entry: AppEntry,
     process_name: String,
+    /// Con qué se agrupan las ventanas abiertas sin anclar: el ejecutable o, si la
+    /// ventana es una app aparte (una app web), su AppUserModelID.
+    key: String,
     pub icon: Option<Pixmap>,
     /// Icono ya reducido al tamaño en pantalla.
     scaled: RefCell<Option<Pixmap>>,
@@ -52,14 +56,26 @@ pub struct AppItem {
 
 impl AppItem {
     pub fn new(entry: AppEntry) -> Self {
-        let icon = crate::icons::load(&entry.command);
+        // Una orden con argumentos (la que declara la ventana de una app web) toma el
+        // icono de su programa y no se reconoce por él: ese programa es el navegador.
+        let (program, args) = split_command_line(&entry.command);
+        let icon = crate::icons::load(&entry.command).or_else(|| {
+            args.is_some()
+                .then(|| crate::icons::load(&program))
+                .flatten()
+        });
         let process_path =
             crate::pins::shortcut_target(&entry.command).unwrap_or_else(|| entry.command.clone());
-        let process_name = std::path::Path::new(&process_path)
-            .file_name()
-            .map(|s| s.to_string_lossy().into_owned())
-            .unwrap_or_default();
+        let process_name = if args.is_some() {
+            String::new()
+        } else {
+            std::path::Path::new(&process_path)
+                .file_name()
+                .map(|s| s.to_string_lossy().into_owned())
+                .unwrap_or_default()
+        };
         Self {
+            key: entry.command.clone(),
             entry,
             process_name,
             icon,
@@ -75,15 +91,31 @@ impl AppItem {
         }
     }
 
-    /// Programa abierto sin anclar; las apps de Store toman icono y nombre de su paquete.
+    /// Programa abierto sin anclar; las apps de Store toman icono y nombre de su
+    /// paquete, y las apps web los de su entrada del menú Inicio o los que declara su
+    /// ventana.
     fn open(window: &OpenWindow) -> Self {
-        let shell_path = window
-            .app_id
-            .as_ref()
-            .map(|id| format!("shell:AppsFolder\\{id}"));
-        let name = shell_path
+        let shell_path = match &window.web {
+            Some(web) => {
+                let apps_folder = format!("shell:AppsFolder\\{}", web.id);
+                let registered = crate::jumplist::apps_folder_lookup(&web.id, &window.exe)
+                    .is_some_and(|(registered, _)| registered)
+                    || crate::icons::display_name(&apps_folder).is_some();
+                relaunch_command(web, registered)
+            }
+            None => window
+                .app_id
+                .as_ref()
+                .map(|id| format!("shell:AppsFolder\\{id}")),
+        };
+        let from_apps_folder = shell_path
             .as_deref()
+            .filter(|p| p.starts_with("shell:AppsFolder\\"));
+        let web = window.web.as_ref();
+        let name = from_apps_folder
             .and_then(crate::icons::display_name)
+            .or_else(|| web.and_then(|w| w.name.clone()))
+            .or_else(|| web.and_then(|_| window_title(window.hwnd)))
             .or_else(|| file_description(&window.exe))
             .unwrap_or_else(|| {
                 std::path::Path::new(&window.exe)
@@ -91,16 +123,23 @@ impl AppItem {
                     .map(|s| s.to_string_lossy().into_owned())
                     .unwrap_or_default()
             });
-        let icon = shell_path
-            .as_deref()
+        let icon = from_apps_folder
             .and_then(crate::icons::load)
+            .or_else(|| {
+                let (path, index) = icon_resource(web?.icon.as_deref()?);
+                crate::icons::load_resource(&path, index)
+            })
+            .or_else(|| web.and_then(|_| window_icon(window.hwnd)))
             .or_else(|| crate::icons::load(&window.exe));
+        // Una app web se abre por su entrada o su orden; sin ninguna, por su programa.
+        let command = match web {
+            Some(_) => shell_path.clone().unwrap_or_else(|| window.exe.clone()),
+            None => window.exe.clone(),
+        };
         Self {
-            entry: AppEntry {
-                name,
-                command: window.exe.clone(),
-            },
+            entry: AppEntry { name, command },
             process_name: file_name(&window.exe).to_string(),
+            key: window.group_key().to_string(),
             icon,
             scaled: RefCell::new(None),
             is_running: true,
@@ -206,6 +245,13 @@ pub fn focus_window(hwnd: isize) -> bool {
 }
 
 pub fn launch_entry(entry: &AppEntry) -> bool {
+    // La orden que declara la ventana de una app web lleva argumentos
+    // ("chrome_proxy.exe --app-id=…"): se separan, salvo que sea un archivo.
+    if !std::path::Path::new(&entry.command).exists() {
+        if let (program, Some(args)) = split_command_line(&entry.command) {
+            return shell_execute("open", &program, Some(&args));
+        }
+    }
     let command: Vec<u16> = OsStr::new(&entry.command)
         .encode_wide()
         .chain(Some(0))
@@ -364,20 +410,136 @@ pub fn default_apps() -> Vec<AppItem> {
 pub struct OpenWindow {
     pub hwnd: isize,
     pub exe: String,
-    /// AppUserModelID de las apps empaquetadas (Store).
+    /// AppUserModelID de las apps empaquetadas (Store) o de las apps web.
     pub app_id: Option<String>,
+    /// La ventana es una app aparte del programa que la abre: una app web instalada
+    /// desde el navegador (PWA), que comparte proceso con él. Se agrupa por su
+    /// AppUserModelID, no por el ejecutable, como en la barra de Windows.
+    pub web: Option<WindowApp>,
 }
 
 impl OpenWindow {
+    /// Con qué se agrupa entre los programas abiertos sin anclar.
+    fn group_key(&self) -> &str {
+        match (&self.web, &self.app_id) {
+            (Some(_), Some(id)) => id,
+            _ => &self.exe,
+        }
+    }
+
     fn belongs_to(&self, app: &AppItem) -> bool {
+        let by_id = self.app_id.as_ref().is_some_and(|id| {
+            app.entry
+                .command
+                .strip_prefix("shell:AppsFolder\\")
+                .is_some_and(|c| c.eq_ignore_ascii_case(id))
+        });
+        // Una app web no es del navegador anclado: solo de su propia entrada.
+        if let Some(web) = &self.web {
+            return by_id
+                || web
+                    .relaunch
+                    .as_ref()
+                    .is_some_and(|r| r.eq_ignore_ascii_case(&app.entry.command));
+        }
         (!app.process_name.is_empty()
             && file_name(&self.exe).eq_ignore_ascii_case(&app.process_name))
-            || self.app_id.as_ref().is_some_and(|id| {
-                app.entry
-                    .command
-                    .strip_prefix("shell:AppsFolder\\")
-                    .is_some_and(|c| c.eq_ignore_ascii_case(id))
-            })
+            || by_id
+    }
+}
+
+/// Si la ventana que declara el AppUserModelID `window_id` es una app aparte del
+/// programa que la abre, cuyo AppUserModelID es `exe_id` (si el menú Inicio lo
+/// tiene). Lo es si el menú Inicio la tiene como app propia (`registered`), como las
+/// apps web que instalan Chrome y Edge, o si su identificador es el de una app web
+/// de Chromium ("Chrome._crx_…", "MSEdge._crx_…"). Las ventanas de un perfil del
+/// navegador ("Chrome.UserData.Profile1") y las que repiten el de su programa siguen
+/// con él.
+pub fn is_own_app(window_id: &str, exe_id: Option<&str>, registered: bool) -> bool {
+    if exe_id.is_some_and(|e| e.eq_ignore_ascii_case(window_id)) {
+        return false;
+    }
+    (registered && exe_id.is_some()) || window_id.to_ascii_lowercase().contains("._crx_")
+}
+
+/// Cómo volver a abrir una app web: por su entrada del menú Inicio si la tiene (así
+/// se abre la app y no el navegador, y conserva icono y nombre) o con la orden que
+/// declara su ventana. Sin ninguna de las dos, `None`: se abre su programa.
+pub fn relaunch_command(app: &WindowApp, in_apps_folder: bool) -> Option<String> {
+    if in_apps_folder {
+        return Some(format!("shell:AppsFolder\\{}", app.id));
+    }
+    app.relaunch.clone()
+}
+
+/// Separa una orden en programa y argumentos: `"C:\a b\x.exe" --y` o
+/// `C:\a\x.exe --y`. Sin argumentos, el segundo es `None`.
+pub fn split_command_line(command: &str) -> (String, Option<String>) {
+    let command = command.trim();
+    let (program, rest) = if let Some(quoted) = command.strip_prefix('"') {
+        match quoted.find('"') {
+            Some(end) => (&quoted[..end], &quoted[end + 1..]),
+            None => (quoted, ""),
+        }
+    } else {
+        match command.to_ascii_lowercase().find(".exe ") {
+            Some(at) => command.split_at(at + 4),
+            None => (command, ""),
+        }
+    };
+    let rest = rest.trim();
+    (
+        program.to_string(),
+        (!rest.is_empty()).then(|| rest.to_string()),
+    )
+}
+
+/// Separa un recurso de icono "ruta,índice"; sin índice, el del archivo (-1).
+fn icon_resource(resource: &str) -> (String, i32) {
+    let resource = resource.trim().trim_start_matches('@');
+    match resource.rsplit_once(',') {
+        Some((path, index)) if index.trim().parse::<i32>().is_ok() => (
+            path.trim().trim_matches('"').to_string(),
+            index.trim().parse().unwrap_or(0),
+        ),
+        _ => (resource.trim_matches('"').to_string(), -1),
+    }
+}
+
+/// Título de la ventana.
+fn window_title(hwnd: isize) -> Option<String> {
+    use windows::Win32::UI::WindowsAndMessaging::GetWindowTextW;
+    let mut text = [0u16; 512];
+    let len = unsafe { GetWindowTextW(HWND(hwnd as *mut _), &mut text) } as usize;
+    let title = String::from_utf16_lossy(&text[..len]).trim().to_string();
+    (!title.is_empty()).then_some(title)
+}
+
+/// El icono que muestra la ventana (el de su barra de título).
+fn window_icon(hwnd: isize) -> Option<Pixmap> {
+    use windows::Win32::Foundation::WPARAM;
+    use windows::Win32::UI::WindowsAndMessaging::{
+        GetClassLongPtrW, SendMessageTimeoutW, GCLP_HICON, HICON, ICON_BIG, SMTO_ABORTIFHUNG,
+        WM_GETICON,
+    };
+    let hwnd = HWND(hwnd as *mut _);
+    unsafe {
+        let mut result = 0usize;
+        let _ = SendMessageTimeoutW(
+            hwnd,
+            WM_GETICON,
+            WPARAM(ICON_BIG as usize),
+            LPARAM(0),
+            SMTO_ABORTIFHUNG,
+            200,
+            Some(&mut result),
+        );
+        if result == 0 {
+            result = GetClassLongPtrW(hwnd, GCLP_HICON);
+        }
+        (result != 0)
+            .then(|| crate::icons::from_hicon(HICON(result as *mut _), 128))
+            .flatten()
     }
 }
 
@@ -438,7 +600,11 @@ fn file_name(path: &str) -> &str {
 /// Marca los programas anclados con ventana abierta y mantiene en `open` los demás,
 /// en orden estable. Devuelve `true` si cambió la lista de programas abiertos.
 pub fn update_running_apps(pinned: &mut [AppItem], open: &mut Vec<AppItem>) -> bool {
-    let windows = open_windows();
+    assign_windows(&open_windows(), pinned, open)
+}
+
+/// `update_running_apps` con las ventanas `windows` ya leídas.
+fn assign_windows(windows: &[OpenWindow], pinned: &mut [AppItem], open: &mut Vec<AppItem>) -> bool {
     let mut claimed = vec![false; windows.len()];
     for app in pinned.iter_mut() {
         app.window = None;
@@ -459,11 +625,11 @@ pub fn update_running_apps(pinned: &mut [AppItem], open: &mut Vec<AppItem>) -> b
         .map(|(w, _)| w)
         .collect();
 
-    let before: Vec<String> = open.iter().map(|a| a.entry.command.clone()).collect();
+    let before: Vec<String> = open.iter().map(|a| a.key.clone()).collect();
     open.retain_mut(|a| {
         a.windows = unclaimed
             .iter()
-            .filter(|w| w.exe.eq_ignore_ascii_case(&a.entry.command))
+            .filter(|w| w.group_key().eq_ignore_ascii_case(&a.key))
             .map(|w| w.hwnd)
             .collect();
         a.window = a.windows.first().copied();
@@ -472,7 +638,7 @@ pub fn update_running_apps(pinned: &mut [AppItem], open: &mut Vec<AppItem>) -> b
     for w in unclaimed {
         if open
             .iter()
-            .any(|a| a.entry.command.eq_ignore_ascii_case(&w.exe))
+            .any(|a| a.key.eq_ignore_ascii_case(w.group_key()))
         {
             continue;
         }
@@ -482,7 +648,7 @@ pub fn update_running_apps(pinned: &mut [AppItem], open: &mut Vec<AppItem>) -> b
         || before
             .iter()
             .zip(open.iter())
-            .any(|(b, a)| !b.eq_ignore_ascii_case(&a.entry.command))
+            .any(|(b, a)| !b.eq_ignore_ascii_case(&a.key))
 }
 
 /// Ventanas que la barra nativa mostraría, de la más reciente a la más antigua.
@@ -500,10 +666,21 @@ pub fn open_windows() -> Vec<OpenWindow> {
 unsafe extern "system" fn collect_window(hwnd: HWND, lparam: LPARAM) -> BOOL {
     let list = &mut *(lparam.0 as *mut Vec<OpenWindow>);
     if let Some((exe, app_id)) = taskbar_window_process(hwnd) {
+        let hwnd = hwnd.0 as isize;
+        // Las apps web comparten proceso con el navegador: solo su ventana dice cuál es.
+        let web = match app_id {
+            None => crate::jumplist::window_app(hwnd).filter(|web| {
+                let (registered, exe_id) =
+                    crate::jumplist::apps_folder_lookup(&web.id, &exe).unwrap_or_default();
+                is_own_app(&web.id, exe_id.as_deref(), registered)
+            }),
+            Some(_) => None,
+        };
         list.push(OpenWindow {
-            hwnd: hwnd.0 as isize,
+            hwnd,
             exe,
-            app_id,
+            app_id: web.as_ref().map(|w| w.id.clone()).or(app_id),
+            web,
         });
     }
     true.into()
@@ -914,6 +1091,7 @@ mod tests {
             hwnd: 0,
             exe: r"C:\Program Files\WindowsApps\WhatsApp_1.0_x64\WhatsApp.Root.exe".into(),
             app_id: Some("5319275A.WhatsAppDesktop_cv1g1gvanyjgm!App".into()),
+            web: None,
         };
         let entry = AppItem::open(&store).pin_entry();
         assert_eq!(
@@ -927,9 +1105,175 @@ mod tests {
             hwnd: 0,
             exe: r"C:\Program Files\Google\Chrome\Application\chrome.exe".into(),
             app_id: None,
+            web: None,
         };
         let entry = AppItem::open(&desktop).pin_entry();
         assert_eq!(entry.command, desktop.exe);
         assert!(desktop.belongs_to(&AppItem::new(entry)));
+    }
+
+    const CHROME: &str = r"C:\Program Files\Google\Chrome\Application\chrome.exe";
+
+    /// Ventana de una app web de Chrome que el menú Inicio no tiene (así no depende
+    /// de lo instalado en el equipo): se reabre con la orden que declara.
+    fn web_window(hwnd: isize, id: &str) -> OpenWindow {
+        OpenWindow {
+            hwnd,
+            exe: CHROME.into(),
+            app_id: Some(id.into()),
+            web: Some(WindowApp {
+                id: id.into(),
+                relaunch: Some(format!(
+                    r#""C:\Program Files\Google\Chrome\Application\chrome_proxy.exe" --app-id={id}"#
+                )),
+                name: Some("WhatsApp Web".into()),
+                icon: None,
+            }),
+        }
+    }
+
+    fn chrome_window(hwnd: isize) -> OpenWindow {
+        OpenWindow {
+            hwnd,
+            exe: CHROME.into(),
+            app_id: None,
+            web: None,
+        }
+    }
+
+    #[test]
+    fn web_apps_are_apps_of_their_own_but_browser_profiles_are_not() {
+        // WhatsApp Web instalada desde Chrome: el menú Inicio la tiene aparte.
+        let pwa = "Chrome._crx_hnpfjaidbinmjnm.UserData.Profile1";
+        assert!(is_own_app(pwa, Some("Chrome"), true));
+        // Aunque aún no se haya leído el menú Inicio, su identificador lo dice.
+        assert!(is_own_app(pwa, None, false));
+        assert!(is_own_app("MSEdge._crx_abcdef", Some("MSEdge"), false));
+        // Una ventana de otro perfil de Chrome sigue siendo Chrome.
+        assert!(!is_own_app(
+            "Chrome.UserData.Profile1",
+            Some("Chrome"),
+            false
+        ));
+        // Programas que declaran el mismo identificador que su entrada (VS Code).
+        let code = "Microsoft.VisualStudioCode";
+        assert!(!is_own_app(code, Some(code), true));
+        // Programas cuyo ejecutable no está en el menú Inicio (Slack abre Update.exe).
+        assert!(!is_own_app("com.squirrel.slack.slack", None, true));
+    }
+
+    #[test]
+    fn web_apps_reopen_from_the_start_menu_or_their_own_command() {
+        let mut app = WindowApp {
+            id: "Chrome._crx_hnpf.UserData.Profile1".into(),
+            relaunch: Some(r#"chrome_proxy.exe --app-id=hnpf"#.into()),
+            ..Default::default()
+        };
+        assert_eq!(
+            relaunch_command(&app, true).as_deref(),
+            Some(r"shell:AppsFolder\Chrome._crx_hnpf.UserData.Profile1")
+        );
+        assert_eq!(
+            relaunch_command(&app, false).as_deref(),
+            Some("chrome_proxy.exe --app-id=hnpf")
+        );
+        app.relaunch = None;
+        assert_eq!(relaunch_command(&app, false), None);
+    }
+
+    #[test]
+    fn splits_commands_into_program_and_arguments() {
+        assert_eq!(
+            split_command_line(
+                r#""C:\Program Files\Google\Chrome\Application\chrome_proxy.exe" --profile-directory="Profile 1" --app-id=x"#
+            ),
+            (
+                r"C:\Program Files\Google\Chrome\Application\chrome_proxy.exe".to_string(),
+                Some(r#"--profile-directory="Profile 1" --app-id=x"#.to_string())
+            )
+        );
+        assert_eq!(
+            split_command_line(r"C:\Apps\x.EXE --y"),
+            (r"C:\Apps\x.EXE".to_string(), Some("--y".to_string()))
+        );
+        assert_eq!(
+            split_command_line(r"C:\Program Files\App\app.exe"),
+            (r"C:\Program Files\App\app.exe".to_string(), None)
+        );
+        assert_eq!(
+            split_command_line(r"shell:AppsFolder\Chrome._crx_x"),
+            (r"shell:AppsFolder\Chrome._crx_x".to_string(), None)
+        );
+    }
+
+    #[test]
+    fn reads_icon_resources() {
+        assert_eq!(
+            icon_resource(r"C:\Users\a\Web Applications\WhatsApp Web.ico,0"),
+            (
+                r"C:\Users\a\Web Applications\WhatsApp Web.ico".to_string(),
+                0
+            )
+        );
+        assert_eq!(
+            icon_resource(r#""C:\a\b.dll",-12"#),
+            (r"C:\a\b.dll".to_string(), -12)
+        );
+        assert_eq!(
+            icon_resource(r"C:\a\b.ico"),
+            (r"C:\a\b.ico".to_string(), -1)
+        );
+    }
+
+    #[test]
+    fn web_apps_group_apart_from_the_browser() {
+        let id = "Chrome._crx_glassbartest";
+        let windows = [
+            web_window(1, id),
+            chrome_window(2),
+            web_window(3, id),
+            chrome_window(4),
+        ];
+        // Sin anclar: Chrome y la app web salen aparte; en la pasada siguiente, cada
+        // una con todas sus ventanas.
+        let mut open = Vec::new();
+        assert!(assign_windows(&windows, &mut [], &mut open));
+        assert!(!assign_windows(&windows, &mut [], &mut open));
+        assert_eq!(open.len(), 2);
+        assert_eq!(open[0].windows, vec![1, 3]);
+        assert_eq!(open[0].entry.name, "WhatsApp Web");
+        assert_eq!(open[1].windows, vec![2, 4]);
+
+        // Con Chrome anclado, sus ventanas van a él, pero no las de la app web.
+        let mut pinned = vec![AppItem::new(AppEntry {
+            name: "Chrome".into(),
+            command: CHROME.into(),
+        })];
+        let mut open = Vec::new();
+        assign_windows(&windows, &mut pinned, &mut open);
+        assign_windows(&windows, &mut pinned, &mut open);
+        assert_eq!(pinned[0].windows, vec![2, 4]);
+        assert_eq!(open.len(), 1);
+        assert_eq!(open[0].windows, vec![1, 3]);
+
+        // Anclar la app web: se reabre con su orden (no con Chrome) y la versión
+        // anclada se queda con sus ventanas.
+        let entry = open[0].pin_entry();
+        assert!(entry.command.contains("chrome_proxy.exe"));
+        assert!(entry.command.contains(id));
+        pinned.push(AppItem::new(entry));
+        let mut open = Vec::new();
+        assign_windows(&windows, &mut pinned, &mut open);
+        assert_eq!(pinned[0].windows, vec![2, 4]);
+        assert_eq!(pinned[1].windows, vec![1, 3]);
+        assert!(open.is_empty());
+
+        // Anclada por su entrada del menú Inicio, también.
+        let pinned_start = AppItem::new(AppEntry {
+            name: "WhatsApp Web".into(),
+            command: format!(r"shell:AppsFolder\{id}"),
+        });
+        assert!(windows[0].belongs_to(&pinned_start));
+        assert!(!windows[1].belongs_to(&pinned_start));
     }
 }
