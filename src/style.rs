@@ -42,7 +42,7 @@ impl State {
             State::TaskView => "Vista de tareas abierta",
         }
     }
-    /// Icono de Segoe Fluent Icons para el menú.
+    /// Icono de Segoe Fluent Icons para la configuración.
     pub fn glyph(self) -> char {
         match self {
             State::Desktop => '\u{E7F4}',
@@ -123,6 +123,12 @@ pub struct Styles {
     /// En tanto por ciento. Los ajustes guardados antes de existir no la tienen.
     #[serde(default = "default_menu_opacity")]
     menu_opacity: u8,
+    /// El dock no se esconde y Windows le reserva su sitio (ver `appbar`).
+    #[serde(default)]
+    always_visible: bool,
+    /// Controles arriba y el dock solo con apps, como macOS (ver `topbar`).
+    #[serde(default)]
+    top_bar: bool,
 }
 
 fn default_menu_opacity() -> u8 {
@@ -137,6 +143,8 @@ impl Default for Styles {
         Self {
             looks,
             menu_opacity: default_menu_opacity(),
+            always_visible: false,
+            top_bar: false,
         }
     }
 }
@@ -148,6 +156,20 @@ impl Styles {
     }
     pub fn set_menu_opacity(&mut self, percent: u8) {
         self.menu_opacity = percent.clamp(crate::glass::MIN_MENU_OPACITY, 100);
+    }
+    /// El dock se queda siempre a la vista en vez de esconderse.
+    pub fn always_visible(&self) -> bool {
+        self.always_visible
+    }
+    pub fn set_always_visible(&mut self, on: bool) {
+        self.always_visible = on;
+    }
+    /// Barra superior con los controles; el dock, solo con las apps.
+    pub fn top_bar(&self) -> bool {
+        self.top_bar
+    }
+    pub fn set_top_bar(&mut self, on: bool) {
+        self.top_bar = on;
     }
     pub fn look(&self, state: State) -> Look {
         let index = state as usize;

@@ -70,6 +70,24 @@ impl TrayPanel {
             PAD + (index / COLUMNS) as f32 * CELL,
         )
     }
+    /// Centro de la celda `index`.
+    pub fn center(&self, index: usize) -> (f32, f32) {
+        let (x, y) = self.cell(index);
+        (x + CELL / 2.0, y + CELL / 2.0)
+    }
+    /// Flechas arriba y abajo: el icono siguiente (o el anterior), dando la vuelta.
+    pub fn move_focus(&mut self, delta: isize) {
+        let count = self.icons.len() as isize;
+        if count == 0 {
+            return;
+        }
+        let next = match self.hovered {
+            Some(index) => (index as isize + delta).rem_euclid(count),
+            None if delta > 0 => 0,
+            None => count - 1,
+        };
+        self.hovered = Some(next as usize);
+    }
     pub fn hit_test(&self, x: f32, y: f32) -> Option<usize> {
         if x < PAD || y < PAD {
             return None;
