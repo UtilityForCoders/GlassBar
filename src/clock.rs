@@ -321,6 +321,19 @@ pub fn draw_text_semibold(
     );
 }
 
+/// Como `draw_text_on_baseline`, en Segoe UI Semibold.
+pub fn draw_text_semibold_on_baseline(
+    target: &mut Pixmap,
+    text: &str,
+    x: f32,
+    baseline: f32,
+    size: f32,
+    opacity: f32,
+) {
+    let (image, top) = rasterize_line(semibold_font(), text, size);
+    blit_text(target, image, x, baseline - top as f32, opacity);
+}
+
 fn blit_text(target: &mut Pixmap, image: Pixmap, x: f32, y: f32, opacity: f32) {
     if image.width() <= 2 {
         return;

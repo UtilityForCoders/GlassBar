@@ -194,11 +194,13 @@ impl TopBar {
         let room = (self.width - CENTER_FREE) / 2.0 - name_left;
         if room > 40.0 && !self.app.is_empty() {
             let name = crate::clock::fit_text(&self.app, size, s(room));
-            crate::clock::draw_text_semibold(
+            // Sobre la misma línea base que la hora: con `draw_text` la `y` es el
+            // borde de arriba de las letras, no el de la línea, y quedaba alto.
+            crate::clock::draw_text_semibold_on_baseline(
                 pixmap,
                 &name,
                 s(name_left),
-                cy - (ascent + descent) / 2.0,
+                baseline,
                 size,
                 1.0,
             );
