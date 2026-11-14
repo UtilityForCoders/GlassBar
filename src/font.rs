@@ -1,6 +1,7 @@
-//! Fuentes TrueType leídas bajo demanda: se guarda el archivo tal cual y cada letra
-//! se dibuja la primera vez que hace falta. Así una fuente ocupa lo que su archivo
-//! (1–3 MB) y no las decenas de MB de tener todas sus letras ya preparadas.
+//! Fuentes TrueType leídas bajo demanda: el archivo se proyecta en memoria tal cual
+//! y cada letra se dibuja la primera vez que hace falta. Así una fuente no ocupa
+//! memoria propia (sus páginas se comparten con el resto del sistema), y no las
+//! decenas de MB de tener todas sus letras ya preparadas.
 //!
 //! El antialias calcula el área exacta que cubre la letra en cada píxel, el mismo
 //! método de `font-rs` y `fontdue`, así que el texto se ve igual que antes.
@@ -30,9 +31,12 @@ pub struct Font {
 }
 
 impl Font {
-    /// Las fuentes viven mientras la app, así que el archivo se queda en memoria.
-    pub fn from_bytes(bytes: Vec<u8>) -> Option<Self> {
-        let bytes: &'static [u8] = Box::leak(bytes.into_boxed_slice());
+    /// La fuente del archivo `path`, proyectado en memoria en lugar de leído: sus
+    /// páginas se comparten con los demás programas que usan la misma fuente y no
+    /// cuentan como memoria propia de GlassBar. Las fuentes viven mientras la app,
+    /// así que la proyección no se cierra nunca.
+    pub fn from_file(path: &std::path::Path) -> Option<Self> {
+        let bytes = map_file(path)?;
         Some(Self {
             face: Face::parse(bytes, 0).ok()?,
         })
@@ -105,6 +109,50 @@ impl Font {
             }
         }
         (metrics, raster.coverage())
+    }
+}
+
+/// Proyecta el archivo `path` en memoria, solo lectura, para toda la vida de la app.
+fn map_file(path: &std::path::Path) -> Option<&'static [u8]> {
+    use std::os::windows::ffi::OsStrExt;
+    use windows::core::PCWSTR;
+    use windows::Win32::Foundation::{CloseHandle, GENERIC_READ};
+    use windows::Win32::Storage::FileSystem::{
+        CreateFileW, GetFileSizeEx, FILE_ATTRIBUTE_NORMAL, FILE_SHARE_DELETE, FILE_SHARE_READ,
+        OPEN_EXISTING,
+    };
+    use windows::Win32::System::Memory::{
+        CreateFileMappingW, MapViewOfFile, FILE_MAP_READ, PAGE_READONLY,
+    };
+    let wide: Vec<u16> = path.as_os_str().encode_wide().chain(Some(0)).collect();
+    unsafe {
+        let file = CreateFileW(
+            PCWSTR(wide.as_ptr()),
+            GENERIC_READ.0,
+            FILE_SHARE_READ | FILE_SHARE_DELETE,
+            None,
+            OPEN_EXISTING,
+            FILE_ATTRIBUTE_NORMAL,
+            None,
+        )
+        .ok()?;
+        let mut size = 0i64;
+        let mapping = GetFileSizeEx(file, &mut size)
+            .ok()
+            .filter(|_| size > 0)
+            .and_then(|_| CreateFileMappingW(file, None, PAGE_READONLY, 0, 0, None).ok());
+        // La proyección mantiene el archivo abierto por su cuenta.
+        let _ = CloseHandle(file);
+        let mapping = mapping?;
+        let view = MapViewOfFile(mapping, FILE_MAP_READ, 0, 0, 0);
+        let _ = CloseHandle(mapping);
+        if view.Value.is_null() {
+            return None;
+        }
+        Some(std::slice::from_raw_parts(
+            view.Value as *const u8,
+            size as usize,
+        ))
     }
 }
 

@@ -378,6 +378,11 @@ impl LauncherState {
         }
         open
     }
+    /// Suelta las capas que se reutilizan entre fotogramas; con el lanzador oculto
+    /// solo ocupan memoria, y el siguiente dibujo las vuelve a crear.
+    pub fn release_layers(&mut self) {
+        self.view_layer = None;
+    }
     /// Desde ahora los iconos que falten se cargan en segundo plano.
     pub fn load_icons_with(&mut self, loader: IconLoader) {
         self.loader = Some(loader);
@@ -405,7 +410,9 @@ impl LauncherState {
     }
     /// Carga de antemano los iconos de la vista inicial (anclados, recientes y más
     /// usadas), que es lo que más tarda la primera vez que se abre el lanzador.
-    pub fn preload_icons(&mut self) {
+    /// Se guardan ya reducidos al tamaño en que se dibujan a `scale`.
+    pub fn preload_icons(&mut self, scale: f32) {
+        let side = (ICON * scale).round().max(1.0) as u32;
         let entries: Vec<String> = self
             .pinned
             .iter()
@@ -415,9 +422,9 @@ impl LauncherState {
             .map(|e| e.command.clone())
             .collect();
         for command in entries {
-            self.icons
-                .entry(command.clone())
-                .or_insert_with(|| crate::icons::load(&command));
+            self.icons.entry(command.clone()).or_insert_with(|| {
+                crate::icons::load(&command).map(|icon| crate::apps::downscale(&icon, side))
+            });
         }
     }
     fn filtered(&self) -> Vec<usize> {

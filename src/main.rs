@@ -144,17 +144,73 @@ fn with_app<R>(f: impl FnOnce(&mut App) -> R) -> Option<R> {
     })
 }
 
+/// Imagen de una ventana por capas, de `width` × `height` píxeles. Sus búferes se
+/// pueden soltar (`release`) mientras la ventana está oculta: se vuelven a crear
+/// al dibujarla otra vez.
 struct Surface {
+    width: u32,
+    height: u32,
+    buffers: Option<Buffers>,
+}
+
+/// Lo que ocupa memoria de una superficie: el DIB que se envía a Windows y la
+/// imagen de tiny-skia donde se dibuja.
+struct Buffers {
     dc: HDC,
     bitmap: HBITMAP,
     old: HGDIOBJ,
     bits: *mut u8,
-    width: u32,
-    height: u32,
     pixmap: Pixmap,
 }
 
 impl Surface {
+    fn new(width: u32, height: u32) -> Result<Self> {
+        Ok(Self {
+            width,
+            height,
+            buffers: Some(Buffers::new(width, height)?),
+        })
+    }
+
+    /// La imagen donde se dibuja; la crea si se había soltado. `None` solo si
+    /// Windows no da memoria para el DIB.
+    fn pixmap(&mut self) -> Option<&mut Pixmap> {
+        if self.buffers.is_none() {
+            self.buffers = Buffers::new(self.width, self.height).ok();
+        }
+        self.buffers.as_mut().map(|b| &mut b.pixmap)
+    }
+
+    /// El DC con el DIB para `UpdateLayeredWindow` (nulo si está soltado).
+    fn dc(&self) -> HDC {
+        self.buffers.as_ref().map(|b| b.dc).unwrap_or_default()
+    }
+
+    /// Suelta los búferes; la ventana tiene que estar oculta.
+    fn release(&mut self) {
+        self.buffers = None;
+    }
+
+    /// Convierte RGBA premultiplicado de tiny-skia a BGRA premultiplicado de Windows DIB.
+    fn copy_to_dib(&mut self) {
+        let len = (self.width * self.height * 4) as usize;
+        let Some(buffers) = &mut self.buffers else {
+            return;
+        };
+        let dst = unsafe { std::slice::from_raw_parts_mut(buffers.bits, len) };
+        for (d, s) in dst
+            .chunks_exact_mut(4)
+            .zip(buffers.pixmap.data().chunks_exact(4))
+        {
+            d[0] = s[2]; // B
+            d[1] = s[1]; // G
+            d[2] = s[0]; // R
+            d[3] = s[3]; // A
+        }
+    }
+}
+
+impl Buffers {
     fn new(width: u32, height: u32) -> Result<Self> {
         unsafe {
             let dc = CreateCompatibleDC(None);
@@ -186,30 +242,13 @@ impl Surface {
                 bitmap,
                 old,
                 bits: bits.cast(),
-                width,
-                height,
                 pixmap,
             })
         }
     }
-
-    /// Convierte RGBA premultiplicado de tiny-skia a BGRA premultiplicado de Windows DIB.
-    fn copy_to_dib(&mut self) {
-        let len = (self.width * self.height * 4) as usize;
-        let dst = unsafe { std::slice::from_raw_parts_mut(self.bits, len) };
-        for (d, s) in dst
-            .chunks_exact_mut(4)
-            .zip(self.pixmap.data().chunks_exact(4))
-        {
-            d[0] = s[2]; // B
-            d[1] = s[1]; // G
-            d[2] = s[0]; // R
-            d[3] = s[3]; // A
-        }
-    }
 }
 
-impl Drop for Surface {
+impl Drop for Buffers {
     fn drop(&mut self) {
         unsafe {
             SelectObject(self.dc, self.old);
@@ -266,9 +305,12 @@ impl Tooltip {
             return;
         };
         let (w, h) = (width as f32, height as f32);
-        surface.pixmap.fill(tiny_skia::Color::TRANSPARENT);
+        let Some(pixmap) = surface.pixmap() else {
+            return;
+        };
+        pixmap.fill(tiny_skia::Color::TRANSPARENT);
         apps::fill_rounded(
-            &mut surface.pixmap,
+            pixmap,
             glass::panel(),
             0.5,
             0.5,
@@ -277,7 +319,7 @@ impl Tooltip {
             7.0 * scale,
         );
         apps::stroke_rounded(
-            &mut surface.pixmap,
+            pixmap,
             [255, 255, 255, 40],
             0.5,
             0.5,
@@ -287,7 +329,7 @@ impl Tooltip {
             1.0,
         );
         clock::draw_text(
-            &mut surface.pixmap,
+            pixmap,
             &text,
             11.0 * scale,
             h / 2.0 - size * 0.38,
@@ -315,7 +357,7 @@ impl Tooltip {
                 None,
                 Some(&pos),
                 Some(&size),
-                Some(surface.dc),
+                Some(surface.dc()),
                 Some(&POINT { x: 0, y: 0 }),
                 COLORREF(0),
                 Some(&blend),
@@ -352,6 +394,8 @@ impl Tooltip {
                 backdrop.hide();
             }
             self.visible = false;
+            // Windows guarda su propia copia de lo enviado: oculta no hace falta.
+            self.surface = None;
         }
     }
 }
@@ -445,7 +489,9 @@ impl LauncherWindow {
         self.pos = pos;
     }
     fn render(&mut self) {
-        self.model.draw(&mut self.surface.pixmap, self.scale);
+        if let Some(pixmap) = self.surface.pixmap() {
+            self.model.draw(pixmap, self.scale);
+        }
         self.surface.copy_to_dib();
         self.present();
     }
@@ -460,17 +506,21 @@ impl LauncherWindow {
     }
     fn present(&mut self) {
         let animating = self.visible && self.model.animating();
-        present_popup(
+        let shapes = [panel_shape(&self.surface, self.scale, 12.0)];
+        let hidden = present_popup(
             self.hwnd,
-            &self.surface,
+            &mut self.surface,
             self.pos,
             self.scale,
             &self.transition,
             self.visible,
             animating,
             self.backdrop.as_ref(),
-            &[panel_shape(&self.surface, self.scale, 12.0)],
+            &shapes,
         );
+        if hidden {
+            self.model.release_layers();
+        }
     }
     fn show(&mut self) {
         self.visible = true;
@@ -503,11 +553,12 @@ impl Drop for LauncherWindow {
 
 /// Pone en pantalla un panel emergente (lanzador o panel rápido) ya dibujado, con la
 /// opacidad y la posición de su transición. Mientras algo se mueve, un temporizador
-/// pide el siguiente fotograma; al terminar de cerrarse, oculta la ventana.
+/// pide el siguiente fotograma; al terminar de cerrarse, oculta la ventana y suelta
+/// los búferes de `surface` (devuelve `true`).
 #[allow(clippy::too_many_arguments)]
 fn present_popup(
     hwnd: HWND,
-    surface: &Surface,
+    surface: &mut Surface,
     pos: POINT,
     scale: f32,
     transition: &launcher::Transition,
@@ -515,7 +566,7 @@ fn present_popup(
     animating: bool,
     backdrop: Option<&style::Backdrop>,
     shapes: &[style::Shape],
-) {
+) -> bool {
     let now = Instant::now();
     let shown = transition.shown(now);
     let running = transition.running(now);
@@ -530,7 +581,8 @@ fn present_popup(
             if let Some(backdrop) = backdrop {
                 backdrop.hide();
             }
-            return;
+            surface.release();
+            return true;
         }
     }
     let pos = POINT {
@@ -555,13 +607,14 @@ fn present_popup(
                 cx: surface.width as i32,
                 cy: surface.height as i32,
             }),
-            Some(surface.dc),
+            Some(surface.dc()),
             Some(&POINT { x: 0, y: 0 }),
             COLORREF(0),
             Some(&blend),
             ULW_ALPHA,
         );
     }
+    false
 }
 
 /// Rectángulo en pantalla de una superficie con su esquina en `pos`.
@@ -710,21 +763,24 @@ impl QuickWindow {
         };
     }
     fn render(&mut self) {
-        self.model.draw(&mut self.surface.pixmap, self.scale);
+        if let Some(pixmap) = self.surface.pixmap() {
+            self.model.draw(pixmap, self.scale);
+        }
         self.surface.copy_to_dib();
         self.present();
     }
     fn present(&mut self) {
+        let shapes = [panel_shape(&self.surface, self.scale, 12.0)];
         present_popup(
             self.hwnd,
-            &self.surface,
+            &mut self.surface,
             self.pos,
             self.scale,
             &self.transition,
             self.visible,
             false,
             self.backdrop.as_ref(),
-            &[panel_shape(&self.surface, self.scale, 12.0)],
+            &shapes,
         );
     }
     /// Cambia entre la vista principal y la de redes. La de redes es más alta: el
@@ -1344,9 +1400,14 @@ fn prepare_launcher(
 ) -> std::sync::mpsc::Receiver<launcher::LauncherState> {
     let (sender, receiver) = std::sync::mpsc::channel();
     let pinned = pinned.to_vec();
+    // La escala del monitor del dock: hasta abrir el lanzador por primera vez, los
+    // iconos esperan ya reducidos (si al final se dibujan más pequeños, se vuelven a
+    // reducir al dibujarlos).
+    let (_, dpi) = monitors::get_info(monitors::dock());
+    let scale = dpi.max(0.3);
     std::thread::spawn(move || {
         let mut model = launcher::LauncherState::new(&pinned);
-        model.preload_icons();
+        model.preload_icons(scale);
         let _ = sender.send(model);
     });
     receiver
@@ -3230,7 +3291,7 @@ impl App {
                 None,
                 Some(&self.pos),
                 Some(&size),
-                Some(self.surface.dc),
+                Some(self.surface.dc()),
                 Some(&src),
                 COLORREF(0),
                 Some(&blend),
@@ -3268,7 +3329,9 @@ impl App {
 
     /// Redibuja el dock en la superficie y lo envía al compositor
     fn render(&mut self) {
-        self.bar.draw(&mut self.surface.pixmap, self.scale);
+        if let Some(pixmap) = self.surface.pixmap() {
+            self.bar.draw(pixmap, self.scale);
+        }
         self.surface.copy_to_dib();
         self.update_position();
     }
@@ -3970,13 +4033,16 @@ impl LanguageWindow {
     }
     fn render(&mut self) {
         if let Some(surface) = &mut self.surface {
-            self.model.draw(&mut surface.pixmap, self.scale);
+            if let Some(pixmap) = surface.pixmap() {
+                self.model.draw(pixmap, self.scale);
+            }
             surface.copy_to_dib();
         }
         self.present();
     }
     fn present(&mut self) {
-        if let Some(surface) = &self.surface {
+        if let Some(surface) = &mut self.surface {
+            let shapes = [panel_shape(surface, self.scale, 12.0)];
             present_popup(
                 self.hwnd,
                 surface,
@@ -3986,7 +4052,7 @@ impl LanguageWindow {
                 self.visible,
                 false,
                 self.backdrop.as_ref(),
-                &[panel_shape(surface, self.scale, 12.0)],
+                &shapes,
             );
         }
     }
@@ -4191,13 +4257,16 @@ impl CalendarWindow {
     }
     fn render(&mut self) {
         if let Some(surface) = &mut self.surface {
-            self.model.draw(&mut surface.pixmap, self.scale);
+            if let Some(pixmap) = surface.pixmap() {
+                self.model.draw(pixmap, self.scale);
+            }
             surface.copy_to_dib();
         }
         self.present();
     }
     fn present(&mut self) {
-        if let Some(surface) = &self.surface {
+        if let Some(surface) = &mut self.surface {
+            let shapes = [panel_shape(surface, self.scale, 12.0)];
             present_popup(
                 self.hwnd,
                 surface,
@@ -4207,7 +4276,7 @@ impl CalendarWindow {
                 self.visible,
                 false,
                 self.backdrop.as_ref(),
-                &[panel_shape(surface, self.scale, 12.0)],
+                &shapes,
             );
         }
     }
@@ -4498,13 +4567,16 @@ impl TrayWindow {
     }
     fn render(&mut self) {
         if let Some(surface) = &mut self.surface {
-            self.model.draw(&mut surface.pixmap, self.scale);
+            if let Some(pixmap) = surface.pixmap() {
+                self.model.draw(pixmap, self.scale);
+            }
             surface.copy_to_dib();
         }
         self.present();
     }
     fn present(&mut self) {
-        if let Some(surface) = &self.surface {
+        if let Some(surface) = &mut self.surface {
+            let shapes = [panel_shape(surface, self.scale, 10.0)];
             present_popup(
                 self.hwnd,
                 surface,
@@ -4514,7 +4586,7 @@ impl TrayWindow {
                 self.visible,
                 false,
                 self.backdrop.as_ref(),
-                &[panel_shape(surface, self.scale, 10.0)],
+                &shapes,
             );
         }
     }
@@ -4839,13 +4911,15 @@ impl AppMenuWindow {
     }
     fn render(&mut self) {
         if let Some(surface) = &mut self.surface {
-            self.model.draw(&mut surface.pixmap, self.scale);
+            if let Some(pixmap) = surface.pixmap() {
+                self.model.draw(pixmap, self.scale);
+            }
             surface.copy_to_dib();
         }
         self.present();
     }
     fn present(&mut self) {
-        if let Some(surface) = &self.surface {
+        if let Some(surface) = &mut self.surface {
             present_popup(
                 self.hwnd,
                 surface,
@@ -5540,8 +5614,11 @@ impl PreviewWindow {
         let Some(surface) = &mut self.surface else {
             return;
         };
+        let Some(pixmap) = surface.pixmap() else {
+            return;
+        };
         preview::draw(
-            &mut surface.pixmap,
+            pixmap,
             &self.layout,
             &self.titles,
             self.hovered,
@@ -5564,7 +5641,7 @@ impl PreviewWindow {
                     cx: surface.width as i32,
                     cy: surface.height as i32,
                 }),
-                Some(surface.dc),
+                Some(surface.dc()),
                 Some(&POINT { x: 0, y: 0 }),
                 COLORREF(0),
                 Some(&blend),
@@ -5605,6 +5682,7 @@ impl PreviewWindow {
         self.target = None;
         self.sources.clear();
         self.titles.clear();
+        self.surface = None;
     }
 
     /// El cursor (en pantalla) está sobre el panel.
@@ -5902,7 +5980,9 @@ impl TopBarWindow {
         let Some(surface) = &mut self.surface else {
             return;
         };
-        self.model.draw(&mut surface.pixmap, self.scale);
+        if let Some(pixmap) = surface.pixmap() {
+            self.model.draw(pixmap, self.scale);
+        }
         surface.copy_to_dib();
         let size = SIZE {
             cx: surface.width as i32,
@@ -5924,7 +6004,7 @@ impl TopBarWindow {
                 None,
                 Some(&pos),
                 Some(&size),
-                Some(surface.dc),
+                Some(surface.dc()),
                 Some(&POINT { x: 0, y: 0 }),
                 COLORREF(0),
                 Some(&blend),
@@ -6109,13 +6189,16 @@ impl SettingsWindow {
     }
     fn render(&mut self) {
         if let Some(surface) = &mut self.surface {
-            self.model.draw(&mut surface.pixmap, self.scale);
+            if let Some(pixmap) = surface.pixmap() {
+                self.model.draw(pixmap, self.scale);
+            }
             surface.copy_to_dib();
         }
         self.present();
     }
     fn present(&mut self) {
-        if let Some(surface) = &self.surface {
+        if let Some(surface) = &mut self.surface {
+            let shapes = [panel_shape(surface, self.scale, 12.0)];
             present_popup(
                 self.hwnd,
                 surface,
@@ -6125,7 +6208,7 @@ impl SettingsWindow {
                 self.visible,
                 false,
                 self.backdrop.as_ref(),
-                &[panel_shape(surface, self.scale, 12.0)],
+                &shapes,
             );
         }
     }
