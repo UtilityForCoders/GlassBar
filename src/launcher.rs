@@ -378,6 +378,11 @@ impl LauncherState {
         }
         open
     }
+    /// Suelta las capas que se reutilizan entre fotogramas; con el lanzador oculto
+    /// solo ocupan memoria, y el siguiente dibujo las vuelve a crear.
+    pub fn release_layers(&mut self) {
+        self.view_layer = None;
+    }
     /// Desde ahora los iconos que falten se cargan en segundo plano.
     pub fn load_icons_with(&mut self, loader: IconLoader) {
         self.loader = Some(loader);
