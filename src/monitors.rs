@@ -79,6 +79,19 @@ pub fn get_info(monitor: HMONITOR) -> (RECT, f32) {
     (info.rcMonitor, scale)
 }
 
+/// Área de trabajo de `monitor`: sin las barras que reservan sitio (la superior
+/// de GlassBar, la de Windows si no se oculta).
+pub fn work_area(monitor: HMONITOR) -> RECT {
+    let mut info = MONITORINFO {
+        cbSize: std::mem::size_of::<MONITORINFO>() as u32,
+        ..Default::default()
+    };
+    unsafe {
+        let _ = GetMonitorInfoW(monitor, &mut info);
+    }
+    info.rcWork
+}
+
 /// Monitor en el que está el dock ahora (0 hasta que se elige uno).
 static DOCK: std::sync::atomic::AtomicIsize = std::sync::atomic::AtomicIsize::new(0);
 

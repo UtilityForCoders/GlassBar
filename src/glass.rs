@@ -65,15 +65,17 @@ pub fn draw_dock(
         stroke_rounded(pixmap, stroke, x, y, w, h, DOCK_RADIUS * scale, scale);
     }
 }
-pub fn draw_hover(pixmap: &mut Pixmap, cx: f32, cy: f32, scale: f32) {
+
+/// Línea vertical fina que separa las partes del dock.
+pub fn draw_divider(pixmap: &mut Pixmap, cx: f32, cy: f32, height: f32, scale: f32) {
     fill_rounded(
         pixmap,
-        [255, 255, 255, 17],
-        cx - 19.0 * scale,
-        cy - 19.0 * scale,
-        38.0 * scale,
-        38.0 * scale,
-        10.0 * scale,
+        [255, 255, 255, 34],
+        cx - 0.5 * scale,
+        cy - height * scale / 2.0,
+        scale,
+        height * scale,
+        0.5 * scale,
     );
 }
 /// Naranja con el que Windows 11 marca las apps que piden atención.
