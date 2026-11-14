@@ -67,6 +67,54 @@ impl AppBar {
             data.lParam = LPARAM(0);
             SHAppBarMessage(ABM_SETPOS, &mut data);
         }
+        ensure_work_area(monitor, data.rc, top);
+    }
+}
+
+/// El área de trabajo que hace falta para que `strip` quede fuera, o `None` si
+/// `work` ya la deja fuera.
+pub fn missing_reservation(work: RECT, strip: RECT, top: bool) -> Option<RECT> {
+    if top {
+        (work.top < strip.bottom).then_some(RECT {
+            top: strip.bottom,
+            ..work
+        })
+    } else {
+        (work.bottom > strip.top).then_some(RECT {
+            bottom: strip.top,
+            ..work
+        })
+    }
+}
+
+/// Explorer acepta la franja pero a veces no recalcula el área de trabajo hasta
+/// que cambia otra barra (pasa tras reiniciar GlassBar con la barra nativa oculta):
+/// las ventanas se maximizarían por debajo de la barra. Si no la recalculó, se pone
+/// a mano; Windows recoloca entonces las ventanas maximizadas.
+fn ensure_work_area(monitor: RECT, strip: RECT, top: bool) {
+    use windows::Win32::Graphics::Gdi::{
+        GetMonitorInfoW, MonitorFromRect, MONITORINFO, MONITOR_DEFAULTTONEAREST,
+    };
+    use windows::Win32::UI::WindowsAndMessaging::{
+        SystemParametersInfoW, SPIF_SENDCHANGE, SPI_SETWORKAREA,
+    };
+    unsafe {
+        let handle = MonitorFromRect(&monitor, MONITOR_DEFAULTTONEAREST);
+        let mut info = MONITORINFO {
+            cbSize: std::mem::size_of::<MONITORINFO>() as u32,
+            ..Default::default()
+        };
+        if !GetMonitorInfoW(handle, &mut info).as_bool() {
+            return;
+        }
+        if let Some(mut work) = missing_reservation(info.rcWork, strip, top) {
+            let _ = SystemParametersInfoW(
+                SPI_SETWORKAREA,
+                0,
+                Some(&mut work as *mut RECT as *mut _),
+                SPIF_SENDCHANGE,
+            );
+        }
     }
 }
 
@@ -98,5 +146,23 @@ mod tests {
         );
         let rc = strip(monitor, 28, true);
         assert_eq!((rc.left, rc.top, rc.right, rc.bottom), (-1920, 0, 0, 28));
+    }
+
+    #[test]
+    fn the_work_area_leaves_the_strip_out() {
+        let rect = |left, top, right, bottom| RECT {
+            left,
+            top,
+            right,
+            bottom,
+        };
+        let monitor = rect(0, 0, 1920, 1080);
+        let top = strip(monitor, 28, true);
+        let fixed = missing_reservation(monitor, top, true).unwrap();
+        assert_eq!((fixed.top, fixed.bottom), (28, 1080));
+        assert!(missing_reservation(fixed, top, true).is_none());
+        let bottom = strip(monitor, 70, false);
+        let fixed = missing_reservation(rect(0, 28, 1920, 1080), bottom, false).unwrap();
+        assert_eq!((fixed.top, fixed.bottom), (28, 1010));
     }
 }
