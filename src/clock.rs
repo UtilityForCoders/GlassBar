@@ -7,7 +7,7 @@ use windows::Win32::System::SystemInformation::GetLocalTime;
 fn font_file(name: &str) -> Option<Font> {
     let windows = std::env::var_os("WINDIR").unwrap_or_else(|| "C:\\Windows".into());
     let path = std::path::PathBuf::from(windows).join("Fonts").join(name);
-    Font::from_bytes(std::fs::read(path).ok()?)
+    Font::from_file(&path)
 }
 
 fn system_font() -> &'static Font {
