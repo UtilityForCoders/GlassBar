@@ -184,6 +184,64 @@ pub fn recent() -> Vec<Launch> {
         .take(8)
         .collect()
 }
+/// Carpeta donde Windows deja un acceso directo a cada archivo abierto
+/// (`shell:recent`).
+pub fn recent_folder() -> Option<PathBuf> {
+    let folder = PathBuf::from(std::env::var_os("APPDATA")?)
+        .join("Microsoft")
+        .join("Windows")
+        .join("Recent");
+    folder.is_dir().then_some(folder)
+}
+
+/// Archivos abiertos hace poco según Windows, del más nuevo al más viejo, con la
+/// hora (segundos Unix). La orden es el acceso directo, que abre el archivo.
+pub fn recent_files() -> Vec<(AppEntry, u64)> {
+    let Some(entries) = recent_folder().and_then(|f| std::fs::read_dir(f).ok()) else {
+        return Vec::new();
+    };
+    let mut files: Vec<(AppEntry, u64)> = entries
+        .flatten()
+        .filter_map(|item| {
+            let path = item.path();
+            let name = path.file_name()?.to_str()?;
+            let shown = recent_file_name(name)?;
+            let at = item
+                .metadata()
+                .ok()?
+                .modified()
+                .ok()?
+                .duration_since(std::time::UNIX_EPOCH)
+                .ok()?
+                .as_secs();
+            Some((
+                AppEntry {
+                    name: shown.to_string(),
+                    command: path.to_string_lossy().into_owned(),
+                },
+                at,
+            ))
+        })
+        .collect();
+    files.sort_by_key(|(_, at)| std::cmp::Reverse(*at));
+    files.truncate(8);
+    files
+}
+
+/// Nombre que se muestra de un acceso directo de Recientes ("foto.jpg.lnk" →
+/// "foto.jpg"). Los de carpetas no llevan extensión ("Descargas.lnk") y se dejan
+/// fuera, como en el Inicio.
+fn recent_file_name(link: &str) -> Option<&str> {
+    let stem = link
+        .strip_suffix(".lnk")
+        .or_else(|| link.strip_suffix(".LNK"))?;
+    let (_, extension) = stem.rsplit_once('.')?;
+    let valid = (1..=5).contains(&extension.len())
+        && extension.chars().all(|c| c.is_ascii_alphanumeric())
+        && !extension.chars().all(|c| c.is_ascii_digit());
+    valid.then_some(stem)
+}
+
 pub fn record(entry: &AppEntry) -> std::io::Result<()> {
     let mut entries = recent();
     let now = std::time::SystemTime::now()
@@ -211,6 +269,17 @@ fn promote(entries: &mut Vec<Launch>, entry: &AppEntry, at: u64) {
 #[cfg(test)]
 mod tests {
     use super::*;
+    #[test]
+    fn recent_shortcuts_keep_files_and_skip_folders() {
+        assert_eq!(recent_file_name("foto.jpeg.lnk"), Some("foto.jpeg"));
+        assert_eq!(
+            recent_file_name("Grabación 2026-11-14 115734.mp4.lnk"),
+            Some("Grabación 2026-11-14 115734.mp4")
+        );
+        assert_eq!(recent_file_name("Descargas.lnk"), None);
+        assert_eq!(recent_file_name("v0.6.1.lnk"), None);
+        assert_eq!(recent_file_name("notas.txt"), None);
+    }
     #[test]
     fn search_handles_accents_word_order_and_ranks_exact_names() {
         let apps = vec![

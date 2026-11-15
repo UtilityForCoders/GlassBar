@@ -20,6 +20,8 @@ mod autostart;
 mod bar;
 #[path = "../src/catalog.rs"]
 mod catalog;
+#[path = "../src/categories.rs"]
+mod categories;
 #[path = "../src/clock.rs"]
 mod clock;
 #[path = "../src/font.rs"]

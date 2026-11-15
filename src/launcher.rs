@@ -1,8 +1,9 @@
 //! Lanzador propio al estilo del Inicio de Windows 11: búsqueda, anclados,
-//! recientes y más usadas en una vista con desplazamiento. El resto del
-//! catálogo solo aparece al buscar.
+//! recientes (apps y archivos) y todas las apps por categorías, en cuadrícula o
+//! en lista, en una vista con desplazamiento.
 use crate::apps::{fill_rounded, stroke_rounded, AppEntry};
 use crate::catalog::Launch;
+use crate::categories::Category;
 use crate::clock::{
     draw_icon, draw_text, draw_text_on_baseline, draw_text_semibold, fit_text, line_metrics,
     text_width,
@@ -33,13 +34,27 @@ const TILE_W: f32 = CONTENT_W / COLS as f32;
 const TILE_H: f32 = 88.0;
 const HEADER_H: f32 = 32.0;
 const SECTION_GAP: f32 = 14.0;
-/// Línea final que recuerda que el resto del catálogo está en la búsqueda.
-const HINT_H: f32 = 36.0;
+/// Margen al final de la vista desplazable.
+const BOTTOM_PAD: f32 = 16.0;
 const ROW_H: f32 = 52.0;
 const ICON: f32 = 32.0;
 const MAX_PINNED: usize = COLS * 3;
-const MAX_RECENT: usize = 6;
-const MAX_FREQUENT: usize = COLS * 2;
+/// Recientes: dos filas de tres, apps y archivos mezclados, como en Windows 11.
+const RECENT_COLS: usize = 3;
+const MAX_RECENT: usize = RECENT_COLS * 2;
+/// Carpetas de la vista por categorías: cuatro por fila, con una rejilla de 2x2
+/// iconos y el nombre debajo.
+const FOLDER_COLS: usize = 4;
+const FOLDER_W: f32 = CONTENT_W / FOLDER_COLS as f32;
+const FOLDER_BOX: f32 = 112.0;
+const FOLDER_H: f32 = FOLDER_BOX + 44.0;
+/// Iconos pequeños del cuarto hueco de una carpeta con más de cuatro apps.
+const MINI_ICON: f32 = 14.0;
+/// Filas de la vista de lista.
+const LINE_H: f32 = 40.0;
+const LINE_ICON: f32 = 24.0;
+/// Texto de los enlaces de las cabeceras ("Mostrar todo", "Visualización").
+const LINK_FONT: f32 = 12.5;
 /// El catálogo completo (lento de leer) se reutiliza entre aperturas durante este tiempo.
 const CATALOG_TTL: Duration = Duration::from_secs(120);
 /// Fondo casi opaco, como el Inicio de Windows en modo oscuro.
@@ -77,6 +92,11 @@ const GLYPH_ADMIN: char = '\u{E7EF}';
 const GLYPH_FOLDER: char = '\u{E838}';
 const GLYPH_UNINSTALL: char = '\u{E74D}';
 const GLYPH_CHEVRON_DOWN: char = '\u{E70D}';
+const GLYPH_CHEVRON_RIGHT: char = '\u{E76C}';
+const GLYPH_BACK: char = '\u{E72B}';
+const GLYPH_CHECK: char = '\u{E73E}';
+/// Opciones del menú de "Visualización": `CMD_VIEW` más la posición en `View::ALL`.
+const CMD_VIEW: u32 = 100;
 /// Apertura y cierre del panel: el cierre es algo más corto, como en Windows 11.
 const OPEN_ANIM: Duration = Duration::from_millis(240);
 const CLOSE_ANIM: Duration = Duration::from_millis(160);
@@ -87,8 +107,15 @@ pub const PANEL_RISE: f32 = 36.0;
 pub enum Hit {
     Pinned(usize),
     Recent(usize),
-    Frequent(usize),
     App(usize),
+    /// "Mostrar todo" de Recientes: abre la carpeta de recientes de Windows.
+    ShowAllRecent,
+    /// "Visualización: …" de Todo: el menú para elegir la vista.
+    ViewPicker,
+    /// Carpeta `n` de la vista por categorías.
+    Category(usize),
+    /// Vuelta de una categoría abierta a "Todo".
+    CategoryBack,
     Power,
     PowerOption(Power),
     /// Clic fuera del menú abierto (energía o contextual): solo lo cierra.
@@ -103,6 +130,9 @@ pub enum Hit {
 }
 pub enum Action {
     Launch(AppEntry),
+    /// Un archivo reciente (o la carpeta de recientes): se abre sin pasar al
+    /// historial de apps de GlassBar.
+    OpenFile(AppEntry),
     Power(Power),
     RunAsAdmin(AppEntry),
     OpenLocation(AppEntry),
@@ -120,13 +150,48 @@ impl Action {
     }
 }
 
-/// Menú contextual de una app, dibujado dentro del panel. `x` e `y` son su esquina
-/// superior izquierda en coordenadas del panel.
+/// Menú flotante dibujado dentro del panel: el contextual de una app (`entry`) o,
+/// sin app, el de "Visualización". `x` e `y` son su esquina superior izquierda en
+/// coordenadas del panel.
 struct Context {
     menu: crate::appmenu::AppMenu,
     x: f32,
     y: f32,
-    entry: AppEntry,
+    entry: Option<AppEntry>,
+}
+
+/// Cómo se muestra la sección "Todo", como el selector del Inicio de Windows 11.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum View {
+    Category,
+    Grid,
+    List,
+}
+impl View {
+    const ALL: [View; 3] = [View::Category, View::Grid, View::List];
+    fn label(self) -> &'static str {
+        match self {
+            View::Category => "Categoría",
+            View::Grid => "Cuadrícula",
+            View::List => "Lista",
+        }
+    }
+    fn key(self) -> &'static str {
+        match self {
+            View::Category => "categoria",
+            View::Grid => "cuadricula",
+            View::List => "lista",
+        }
+    }
+}
+
+/// Elemento de Recientes: una app o un archivo, con cuándo se abrió (segundos
+/// Unix; 0 si no se sabe).
+#[derive(Clone)]
+pub struct RecentItem {
+    pub entry: AppEntry,
+    pub at: u64,
+    pub file: bool,
 }
 
 /// Opciones del menú de `entry`, como el clic derecho del Inicio de Windows 11.
@@ -220,6 +285,21 @@ impl Power {
     }
 }
 
+/// Forma con que se dibuja un elemento de la vista.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum Shape {
+    /// Icono con el nombre debajo (Anclado, cuadrícula).
+    Tile,
+    /// Icono, nombre y una línea de detalle (Recientes, resultados).
+    Row,
+    /// Icono pequeño y nombre en una línea (vista de lista).
+    Line,
+    /// Carpeta de una categoría.
+    Folder,
+    /// Enlace de texto de una cabecera.
+    Link,
+}
+
 /// Elemento pulsable; coordenadas de contenido (x desde `PAD`, y sin desplazamiento).
 #[derive(Clone, Copy, Debug)]
 struct Slot {
@@ -228,7 +308,7 @@ struct Slot {
     y: f32,
     w: f32,
     h: f32,
-    row: bool,
+    shape: Shape,
 }
 impl Slot {
     fn contains(&self, x: f32, y: f32) -> bool {
@@ -246,9 +326,14 @@ struct Layout {
 
 pub struct LauncherState {
     pub apps: Vec<AppEntry>,
-    pub recent: Vec<AppEntry>,
-    pub frequent: Vec<AppEntry>,
+    pub recent: Vec<RecentItem>,
     pub pinned: Vec<AppEntry>,
+    /// Catálogo por categorías y en orden alfabético, para la sección "Todo".
+    categories: Vec<Category>,
+    alphabetical: Vec<usize>,
+    pub view: View,
+    /// Categoría abierta y el desplazamiento que había antes, para volver a él.
+    open_category: Option<(usize, f32)>,
     pub query: TextField,
     pub scroll: f32,
     pub hovered: Option<Hit>,
@@ -289,8 +374,11 @@ impl LauncherState {
         let mut state = Self {
             apps: crate::catalog::installed(pinned),
             recent: Vec::new(),
-            frequent: Vec::new(),
             pinned: Vec::new(),
+            categories: Vec::new(),
+            alphabetical: Vec::new(),
+            view: load_view(),
+            open_category: None,
             query: TextField::default(),
             scroll: 0.0,
             hovered: None,
@@ -315,7 +403,7 @@ impl LauncherState {
         state.refresh(pinned);
         state
     }
-    /// Prepara una nueva apertura: anclados, recientes y más usadas al día, sin
+    /// Prepara una nueva apertura: anclados, recientes y categorías al día, sin
     /// volver a leer el catálogo ni los iconos si es reciente.
     pub fn refresh(&mut self, pinned: &[AppEntry]) {
         if self.loaded.elapsed() > CATALOG_TTL {
@@ -324,20 +412,29 @@ impl LauncherState {
             self.search_cache.replace(None);
         }
         self.pinned = pinned.to_vec();
-        let (recent, frequent) = rank(
+        let usage = crate::usage::load();
+        self.recent = rank(
             &self.apps,
-            &crate::usage::load(),
+            &usage,
             &crate::catalog::recent(),
-            pinned,
+            crate::catalog::recent_files(),
         );
-        self.recent = recent;
-        self.frequent = frequent;
+        self.regroup(&usage);
+        self.open_category = None;
         self.query.clear();
         self.caret_on = true;
         self.power_menu = false;
         self.context = None;
         self.jumps.clear();
         self.reset_results();
+    }
+    /// Agrupa el catálogo para "Todo": por categorías (las más usadas delante) y
+    /// por orden alfabético.
+    fn regroup(&mut self, usage: &HashMap<String, Usage>) {
+        self.categories = crate::categories::group(&self.apps, |entry| {
+            usage_of(usage, entry).map_or(0, |u| ((u.runs as u64) << 32) | u.focus_ms as u64)
+        });
+        self.alphabetical = crate::categories::alphabetical(&self.apps);
     }
     /// Pone al día los anclados (tras anclar o desanclar desde el propio lanzador).
     pub fn set_pinned(&mut self, pinned: &[AppEntry]) {
@@ -408,8 +505,8 @@ impl LauncherState {
             }
         }
     }
-    /// Carga de antemano los iconos de la vista inicial (anclados, recientes y más
-    /// usadas), que es lo que más tarda la primera vez que se abre el lanzador.
+    /// Carga de antemano los iconos de la vista inicial (anclados y recientes), que
+    /// es lo que más tarda la primera vez que se abre el lanzador.
     /// Se guardan ya reducidos al tamaño en que se dibujan a `scale`.
     pub fn preload_icons(&mut self, scale: f32) {
         let side = (ICON * scale).round().max(1.0) as u32;
@@ -417,8 +514,7 @@ impl LauncherState {
             .pinned
             .iter()
             .take(MAX_PINNED)
-            .chain(self.recent.iter().take(MAX_RECENT))
-            .chain(self.frequent.iter().take(MAX_FREQUENT))
+            .chain(self.recent.iter().take(MAX_RECENT).map(|r| &r.entry))
             .map(|e| e.command.clone())
             .collect();
         for command in entries {
@@ -455,7 +551,7 @@ impl LauncherState {
                     y: y + (i / COLS) as f32 * TILE_H,
                     w: TILE_W,
                     h: TILE_H,
-                    row: false,
+                    shape: Shape::Tile,
                 });
                 count += 1;
             }
@@ -488,7 +584,7 @@ impl LauncherState {
                     y,
                     w: LIST_W,
                     h: ROW_H - 4.0,
-                    row: true,
+                    shape: Shape::Row,
                 });
                 y += ROW_H;
             }
@@ -496,6 +592,44 @@ impl LauncherState {
                 headers,
                 slots,
                 height: y,
+            };
+        }
+        // Enlace de texto alineado a la derecha de la cabecera que empieza en `y`.
+        let link = |slots: &mut Vec<Slot>, hit: Hit, y: f32| {
+            let w = text_width(&self.link_label(hit), LINK_FONT) + 40.0;
+            slots.push(Slot {
+                hit,
+                x: CONTENT_W - w,
+                y: y + 2.0,
+                w,
+                h: HEADER_H - 6.0,
+                shape: Shape::Link,
+            });
+        };
+        if let Some(category) = self
+            .open_category
+            .and_then(|(index, _)| self.categories.get(index))
+        {
+            // Categoría abierta: su nombre con la flecha para volver, y sus apps.
+            let w = text_width(category.kind.label(), 14.0) + 52.0;
+            slots.push(Slot {
+                hit: Hit::CategoryBack,
+                x: 0.0,
+                y,
+                w,
+                h: HEADER_H,
+                shape: Shape::Link,
+            });
+            y += HEADER_H + 8.0;
+            y += tiles(
+                &mut slots,
+                y,
+                &mut category.apps.iter().map(|&i| Hit::App(i)),
+            );
+            return Layout {
+                headers,
+                slots,
+                height: y + BOTTOM_PAD,
             };
         }
         if !self.pinned.is_empty() {
@@ -506,30 +640,88 @@ impl LauncherState {
         }
         if !self.recent.is_empty() {
             headers.push(("Recientes".to_string(), y));
+            link(&mut slots, Hit::ShowAllRecent, y);
             y += HEADER_H;
             let count = self.recent.len().min(MAX_RECENT);
+            let w = CONTENT_W / RECENT_COLS as f32;
             for i in 0..count {
                 slots.push(Slot {
                     hit: Hit::Recent(i),
-                    x: (i % 2) as f32 * CONTENT_W / 2.0,
-                    y: y + (i / 2) as f32 * ROW_H,
-                    w: CONTENT_W / 2.0 - 4.0,
+                    x: (i % RECENT_COLS) as f32 * w,
+                    y: y + (i / RECENT_COLS) as f32 * ROW_H,
+                    w: w - 4.0,
                     h: ROW_H - 4.0,
-                    row: true,
+                    shape: Shape::Row,
                 });
             }
-            y += count.div_ceil(2) as f32 * ROW_H + SECTION_GAP;
+            y += count.div_ceil(RECENT_COLS) as f32 * ROW_H + SECTION_GAP;
         }
-        if !self.frequent.is_empty() {
-            headers.push(("Más usadas".to_string(), y));
-            y += HEADER_H;
-            let count = self.frequent.len().min(MAX_FREQUENT);
-            y += tiles(&mut slots, y, &mut (0..count).map(Hit::Frequent)) + SECTION_GAP;
+        headers.push(("Todo".to_string(), y));
+        link(&mut slots, Hit::ViewPicker, y);
+        y += HEADER_H + 4.0;
+        match self.view {
+            View::Category => {
+                for (i, _) in self.categories.iter().enumerate() {
+                    slots.push(Slot {
+                        hit: Hit::Category(i),
+                        x: (i % FOLDER_COLS) as f32 * FOLDER_W,
+                        y: y + (i / FOLDER_COLS) as f32 * FOLDER_H,
+                        w: FOLDER_W,
+                        h: FOLDER_H,
+                        shape: Shape::Folder,
+                    });
+                }
+                y += self.categories.len().div_ceil(FOLDER_COLS) as f32 * FOLDER_H;
+            }
+            View::Grid => {
+                y += tiles(
+                    &mut slots,
+                    y,
+                    &mut self.alphabetical.iter().map(|&i| Hit::App(i)),
+                );
+            }
+            View::List => {
+                // Como la lista de Windows: una letra encima de las apps que empiezan por ella.
+                let mut letter = String::new();
+                for &index in &self.alphabetical {
+                    let initial = crate::categories::initial(&self.apps[index].name);
+                    if initial != letter {
+                        if !letter.is_empty() {
+                            y += 6.0;
+                        }
+                        headers.push((initial.clone(), y));
+                        y += HEADER_H;
+                        letter = initial;
+                    }
+                    slots.push(Slot {
+                        hit: Hit::App(index),
+                        x: 0.0,
+                        y,
+                        w: CONTENT_W,
+                        h: LINE_H - 2.0,
+                        shape: Shape::Line,
+                    });
+                    y += LINE_H;
+                }
+            }
         }
         Layout {
             headers,
             slots,
-            height: y + HINT_H,
+            height: y + BOTTOM_PAD,
+        }
+    }
+    /// Texto de un enlace de cabecera.
+    fn link_label(&self, hit: Hit) -> String {
+        match hit {
+            Hit::ShowAllRecent => "Mostrar todo".into(),
+            Hit::ViewPicker => format!("Visualización: {}", self.view.label()),
+            Hit::CategoryBack => self
+                .open_category
+                .and_then(|(index, _)| self.categories.get(index))
+                .map(|c| c.kind.label().to_string())
+                .unwrap_or_default(),
+            _ => String::new(),
         }
     }
     fn max_scroll(&self) -> f32 {
@@ -690,8 +882,7 @@ impl LauncherState {
     fn entry(&self, hit: Hit) -> Option<&AppEntry> {
         match hit {
             Hit::Pinned(i) => self.pinned.get(i),
-            Hit::Recent(i) => self.recent.get(i),
-            Hit::Frequent(i) => self.frequent.get(i),
+            Hit::Recent(i) => self.recent.get(i).map(|r| &r.entry),
             Hit::App(i) => self.apps.get(i),
             _ => None,
         }
@@ -703,7 +894,16 @@ impl LauncherState {
             let Hit::Context(index) = hit else {
                 return None;
             };
-            return context_action(context.menu.command(index)?, context.entry);
+            let command = context.menu.command(index)?;
+            return match context.entry {
+                Some(entry) => context_action(command, entry),
+                None => {
+                    if let Some(&view) = View::ALL.get(command.wrapping_sub(CMD_VIEW) as usize) {
+                        self.set_view(view);
+                    }
+                    None
+                }
+            };
         }
         if self.power_menu {
             // Con el menú abierto, cualquier clic lo cierra; solo sus opciones actúan.
@@ -716,8 +916,34 @@ impl LauncherState {
             return None;
         }
         match hit {
-            Hit::Pinned(_) | Hit::Recent(_) | Hit::Frequent(_) | Hit::App(_) => {
-                return self.entry(hit).cloned().map(Action::Launch)
+            Hit::Recent(i) => {
+                let item = self.recent.get(i)?;
+                let entry = item.entry.clone();
+                return Some(if item.file {
+                    Action::OpenFile(entry)
+                } else {
+                    Action::Launch(entry)
+                });
+            }
+            Hit::Pinned(_) | Hit::App(_) => return self.entry(hit).cloned().map(Action::Launch),
+            Hit::ShowAllRecent => {
+                let folder = crate::catalog::recent_folder()?;
+                return Some(Action::OpenFile(AppEntry {
+                    name: "Recientes".into(),
+                    command: folder.to_string_lossy().into_owned(),
+                }));
+            }
+            Hit::ViewPicker => self.open_view_menu(),
+            Hit::Category(index) => {
+                if index < self.categories.len() {
+                    self.open_category = Some((index, self.scroll));
+                    self.scroll = 0.0;
+                    self.selection = None;
+                    self.hovered = None;
+                }
+            }
+            Hit::CategoryBack => {
+                self.close_category();
             }
             Hit::ClearSearch => {
                 self.query.clear();
@@ -754,8 +980,14 @@ impl LauncherState {
         }
     }
     /// Abre el menú contextual de la app de `hit` con su esquina en (`x`, `y`), sin
-    /// salirse del panel. Devuelve si había una app ahí.
+    /// salirse del panel. Devuelve si había una app ahí (los archivos recientes no
+    /// tienen menú de app).
     pub fn open_context(&mut self, hit: Hit, x: f32, y: f32) -> bool {
+        if let Hit::Recent(i) = hit {
+            if self.recent.get(i).is_some_and(|r| r.file) {
+                return false;
+            }
+        }
         let entry = match hit {
             Hit::DetailOpen | Hit::DetailOptions => self.detail_entry(),
             _ => self.entry(hit),
@@ -770,6 +1002,17 @@ impl LauncherState {
             .or_insert_with(|| admin_allowed(&entry.command));
         let menu =
             crate::appmenu::AppMenu::new(context_entries(&entry, self.is_pinned(&entry), admin));
+        self.show_menu(menu, x, y, Some(entry));
+        true
+    }
+    /// Muestra `menu` con su esquina en (`x`, `y`), sin salirse del panel.
+    fn show_menu(
+        &mut self,
+        menu: crate::appmenu::AppMenu,
+        x: f32,
+        y: f32,
+        entry: Option<AppEntry>,
+    ) {
         let (w, h) = menu.size();
         let x = x.min(WIDTH - 8.0 - w).max(8.0);
         // Debajo del cursor si cabe; si no, encima, como los menús de Windows.
@@ -782,7 +1025,60 @@ impl LauncherState {
         self.context = Some(Context { menu, x, y, entry });
         self.menu_opened = animations_enabled().then(Instant::now);
         self.hovered = None;
+    }
+    /// Menú de "Visualización", bajo su enlace y alineado con su borde derecho, con
+    /// la vista actual marcada.
+    fn open_view_menu(&mut self) {
+        use crate::appmenu::{Entry, Icon};
+        let entries = View::ALL
+            .iter()
+            .enumerate()
+            .map(|(i, view)| Entry::Item {
+                icon: Icon::Glyph(if *view == self.view { GLYPH_CHECK } else { ' ' }),
+                label: view.label().into(),
+                command: CMD_VIEW + i as u32,
+            })
+            .collect();
+        let mut menu = crate::appmenu::AppMenu::new(entries);
+        menu.hovered = View::ALL.iter().position(|v| *v == self.view);
+        let Some(slot) = self
+            .layout()
+            .slots
+            .into_iter()
+            .find(|s| s.hit == Hit::ViewPicker)
+        else {
+            return;
+        };
+        let (w, _) = menu.size();
+        let x = PAD + slot.x + slot.w - w;
+        let y = VIEW_TOP + slot.y - self.scroll + slot.h + 4.0;
+        self.show_menu(menu, x, y, None);
+    }
+    /// Cambia la vista de "Todo" y la recuerda para la próxima vez.
+    pub fn set_view(&mut self, view: View) {
+        if self.view != view {
+            self.view = view;
+            save_view(view);
+        }
+        self.open_category = None;
+        self.selection = Some(Hit::ViewPicker);
+        self.hovered = None;
+        self.scroll = self.scroll.clamp(0.0, self.max_scroll());
+    }
+    /// Vuelve de una categoría abierta a "Todo", donde estaba, con su carpeta elegida.
+    fn close_category(&mut self) -> bool {
+        let Some((index, scroll)) = self.open_category.take() else {
+            return false;
+        };
+        self.scroll = scroll.clamp(0.0, self.max_scroll());
+        self.selection = Some(Hit::Category(index));
+        self.hovered = None;
         true
+    }
+    /// Escape: cierra el menú flotante o la categoría abierta. Devuelve si había
+    /// algo que cerrar (si no, Escape cierra el lanzador).
+    pub fn back(&mut self) -> bool {
+        self.close_overlay() || (!self.searching() && self.close_category())
     }
     /// Tecla de menú (o Mayús+F10): el menú de la app elegida, con su primera
     /// opción resaltada. Al buscar, el del resultado del detalle bajo "Opciones".
@@ -1150,21 +1446,6 @@ impl LauncherState {
                 );
             }
         }
-        if !self.searching() && visible(layout.height - HINT_H, HINT_H) {
-            let hint = format!(
-                "Escribe para buscar entre las {} aplicaciones.",
-                self.apps.len()
-            );
-            self.text(
-                &mut view,
-                &hint,
-                PAD + 8.0,
-                top(layout.height - HINT_H) + 8.0,
-                12.5,
-                scale,
-                0.5,
-            );
-        }
         if layout.slots.is_empty() && self.searching() {
             self.text(
                 &mut view,
@@ -1178,13 +1459,28 @@ impl LauncherState {
         }
         // Al buscar, el resultado del detalle queda marcado, como en Windows.
         let detail = self.detail_hit();
+        let now = unix_now();
         for slot in layout.slots.iter().filter(|s| visible(s.y, s.h)) {
+            let (x, y) = (PAD + slot.x, top(slot.y));
+            let chosen = self.selection == Some(slot.hit) || detail == Some(slot.hit);
+            let lit = chosen || self.hovered == Some(slot.hit);
+            match slot.shape {
+                Shape::Link => {
+                    self.draw_link(&mut view, slot, x, y, lit, scale);
+                    continue;
+                }
+                Shape::Folder => {
+                    if let Hit::Category(index) = slot.hit {
+                        self.draw_folder(&mut view, index, slot, x, y, lit, chosen, scale);
+                    }
+                    continue;
+                }
+                _ => {}
+            }
             let Some(entry) = self.entry(slot.hit).cloned() else {
                 continue;
             };
-            let (x, y) = (PAD + slot.x, top(slot.y));
-            let chosen = self.selection == Some(slot.hit) || detail == Some(slot.hit);
-            if chosen || self.hovered == Some(slot.hit) {
+            if lit {
                 fill_rounded(
                     &mut view,
                     [255, 255, 255, if chosen { 26 } else { 18 }],
@@ -1206,32 +1502,61 @@ impl LauncherState {
                     1.5 * scale,
                 );
             }
-            if slot.row {
-                self.icon(
-                    &mut view,
-                    &entry,
-                    x + 12.0,
-                    y + (slot.h - ICON) / 2.0,
-                    scale,
-                );
-                let name = fit_text(&entry.name, 13.0 * scale, (slot.w - 70.0) * scale);
-                let subtitle = match slot.hit {
-                    Hit::Recent(_) => "Abierta recientemente",
-                    _ => "Aplicación",
-                };
-                self.text(&mut view, &name, x + 56.0, y + 8.0, 13.0, scale, 0.95);
-                self.text(&mut view, subtitle, x + 56.0, y + 27.0, 11.5, scale, 0.55);
-            } else {
-                self.icon(
-                    &mut view,
-                    &entry,
-                    x + (slot.w - ICON) / 2.0,
-                    y + 14.0,
-                    scale,
-                );
-                let label = fit_text(&entry.name, 12.0 * scale, (slot.w - 8.0) * scale);
-                let label_x = x + (slot.w - text_width(&label, 12.0 * scale) / scale) / 2.0;
-                self.text(&mut view, &label, label_x, y + 56.0, 12.0, scale, 0.9);
+            match slot.shape {
+                Shape::Row => {
+                    self.icon(
+                        &mut view,
+                        &entry,
+                        x + 12.0,
+                        y + (slot.h - ICON) / 2.0,
+                        ICON,
+                        scale,
+                    );
+                    let name = fit_text(&entry.name, 13.0 * scale, (slot.w - 64.0) * scale);
+                    let subtitle = match slot.hit {
+                        Hit::Recent(i) => match self.recent.get(i) {
+                            Some(item) if item.at > 0 => describe_time(now, item.at, local_moment),
+                            _ => "Abierta recientemente".into(),
+                        },
+                        _ => "Aplicación".into(),
+                    };
+                    let subtitle = fit_text(&subtitle, 11.5 * scale, (slot.w - 64.0) * scale);
+                    self.text(&mut view, &name, x + 56.0, y + 8.0, 13.0, scale, 0.95);
+                    self.text(&mut view, &subtitle, x + 56.0, y + 27.0, 11.5, scale, 0.55);
+                }
+                Shape::Line => {
+                    self.icon(
+                        &mut view,
+                        &entry,
+                        x + 14.0,
+                        y + (slot.h - LINE_ICON) / 2.0,
+                        LINE_ICON,
+                        scale,
+                    );
+                    let name = fit_text(&entry.name, 13.0 * scale, (slot.w - 64.0) * scale);
+                    self.text(
+                        &mut view,
+                        &name,
+                        x + 50.0,
+                        y + slot.h / 2.0 - 9.0,
+                        13.0,
+                        scale,
+                        0.95,
+                    );
+                }
+                _ => {
+                    self.icon(
+                        &mut view,
+                        &entry,
+                        x + (slot.w - ICON) / 2.0,
+                        y + 14.0,
+                        ICON,
+                        scale,
+                    );
+                    let label = fit_text(&entry.name, 12.0 * scale, (slot.w - 8.0) * scale);
+                    let label_x = x + (slot.w - text_width(&label, 12.0 * scale) / scale) / 2.0;
+                    self.text(&mut view, &label, label_x, y + 56.0, 12.0, scale, 0.9);
+                }
             }
         }
         let max = (layout.height - VIEW_H).max(0.0);
@@ -1265,6 +1590,138 @@ impl LauncherState {
             None,
         );
         self.view_layer = Some(view);
+    }
+
+    /// Enlace de una cabecera: "Mostrar todo ›" y "Visualización: … ⌄" a la derecha;
+    /// la vuelta de una categoría abierta, con la flecha y su nombre, a la izquierda.
+    fn draw_link(&self, image: &mut Pixmap, slot: &Slot, x: f32, y: f32, lit: bool, scale: f32) {
+        let s = |v: f32| v * scale;
+        if lit {
+            fill_rounded(
+                image,
+                [
+                    255,
+                    255,
+                    255,
+                    if self.selection == Some(slot.hit) {
+                        26
+                    } else {
+                        18
+                    },
+                ],
+                s(x),
+                s(y),
+                s(slot.w),
+                s(slot.h),
+                s(5.0),
+            );
+        }
+        let label = self.link_label(slot.hit);
+        let cy = y + slot.h / 2.0;
+        if slot.hit == Hit::CategoryBack {
+            draw_icon(image, GLYPH_BACK, s(x + 18.0), s(cy), s(13.0), 0.9);
+            draw_text_semibold(image, &label, s(x + 38.0), s(cy - 10.0), s(14.0), 0.95);
+            return;
+        }
+        let glyph = if slot.hit == Hit::ShowAllRecent {
+            GLYPH_CHEVRON_RIGHT
+        } else {
+            GLYPH_CHEVRON_DOWN
+        };
+        self.text(image, &label, x + 12.0, cy - 9.0, LINK_FONT, scale, 0.85);
+        draw_icon(image, glyph, s(x + slot.w - 16.0), s(cy), s(9.0), 0.8);
+    }
+
+    /// Carpeta de una categoría, como en el Inicio de Windows 11: un recuadro con
+    /// sus apps más usadas en una rejilla de 2x2 (si hay más de cuatro, el último
+    /// hueco lleva otras cuatro en pequeño) y el nombre debajo.
+    #[allow(clippy::too_many_arguments)]
+    fn draw_folder(
+        &mut self,
+        image: &mut Pixmap,
+        index: usize,
+        slot: &Slot,
+        x: f32,
+        y: f32,
+        lit: bool,
+        chosen: bool,
+        scale: f32,
+    ) {
+        let Some(category) = self.categories.get(index).cloned() else {
+            return;
+        };
+        let s = |v: f32| v * scale;
+        let (bx, by) = (x + (slot.w - FOLDER_BOX) / 2.0, y + 4.0);
+        let fill = match (lit, chosen) {
+            (_, true) => 30,
+            (true, _) => 22,
+            _ => 12,
+        };
+        fill_rounded(
+            image,
+            [255, 255, 255, fill],
+            s(bx),
+            s(by),
+            s(FOLDER_BOX),
+            s(FOLDER_BOX),
+            s(8.0),
+        );
+        stroke_rounded(
+            image,
+            [255, 255, 255, 20],
+            s(bx),
+            s(by),
+            s(FOLDER_BOX),
+            s(FOLDER_BOX),
+            s(8.0),
+            scale * 0.75,
+        );
+        let cell = FOLDER_BOX / 2.0;
+        let apps: Vec<AppEntry> = category
+            .apps
+            .iter()
+            .filter_map(|&i| self.apps.get(i).cloned())
+            .collect();
+        let big = if apps.len() > 4 { 3 } else { apps.len() };
+        for (n, entry) in apps.iter().take(big).enumerate() {
+            let (cx, cy) = (bx + (n % 2) as f32 * cell, by + (n / 2) as f32 * cell);
+            self.icon(
+                image,
+                entry,
+                cx + (cell - ICON) / 2.0,
+                cy + (cell - ICON) / 2.0,
+                ICON,
+                scale,
+            );
+        }
+        if apps.len() > 4 {
+            // Cuarto hueco: hasta cuatro apps más en una rejilla pequeña.
+            let (cx, cy) = (bx + cell, by + cell);
+            let gap = 4.0;
+            let span = MINI_ICON * 2.0 + gap;
+            let (ox, oy) = (cx + (cell - span) / 2.0, cy + (cell - span) / 2.0);
+            for (n, entry) in apps.iter().skip(3).take(4).enumerate() {
+                self.icon(
+                    image,
+                    entry,
+                    ox + (n % 2) as f32 * (MINI_ICON + gap),
+                    oy + (n / 2) as f32 * (MINI_ICON + gap),
+                    MINI_ICON,
+                    scale,
+                );
+            }
+        }
+        let label = fit_text(category.kind.label(), s(12.0), s(slot.w - 8.0));
+        let label_x = x + (slot.w - text_width(&label, s(12.0)) / scale) / 2.0;
+        self.text(
+            image,
+            &label,
+            label_x,
+            by + FOLDER_BOX + 10.0,
+            12.0,
+            scale,
+            0.9,
+        );
     }
 
     fn draw_footer(&self, image: &mut Pixmap, scale: f32) {
@@ -1650,7 +2107,17 @@ impl LauncherState {
         draw_text(image, value, x * scale, y * scale, size * scale, opacity);
     }
 
-    fn icon(&mut self, image: &mut Pixmap, entry: &AppEntry, x: f32, y: f32, scale: f32) {
+    /// Icono de `entry` con su esquina en (`x`, `y`) y `side` píxeles lógicos de lado.
+    /// Se guarda reducido al tamaño `ICON`; los más pequeños se reducen al dibujar.
+    fn icon(
+        &mut self,
+        image: &mut Pixmap,
+        entry: &AppEntry,
+        x: f32,
+        y: f32,
+        side: f32,
+        scale: f32,
+    ) {
         let size = (ICON * scale).round().max(1.0) as u32;
         if !self.icons.contains_key(&entry.command) {
             // Cargar un icono tarda decenas de ms: con hilo de carga se pide y se
@@ -1671,7 +2138,7 @@ impl LauncherState {
             *icon = icon.as_ref().map(|i| crate::apps::downscale(i, size));
         }
         if let Some(icon) = icon {
-            let side = size as f32;
+            let side = (side * scale).round().max(1.0);
             let transform =
                 Transform::from_scale(side / icon.width() as f32, side / icon.height() as f32)
                     .post_translate((x * scale).round(), (y * scale).round());
@@ -1741,63 +2208,194 @@ impl IconLoader {
     }
 }
 
-/// Recientes y más usadas a partir del uso que registra Windows y del historial de
-/// GlassBar. Solo entran apps del catálogo (accesos directos o apps instaladas),
-/// así no aparecen procesos sueltos ni desinstaladores.
+/// Uso que registra Windows de una app del catálogo, si lo hay.
+fn usage_of(usage: &HashMap<String, Usage>, entry: &AppEntry) -> Option<Usage> {
+    let name = entry.command.strip_prefix("shell:AppsFolder\\")?;
+    usage.get(&name.to_lowercase()).copied()
+}
+
+/// Recientes a partir del uso que registra Windows, del historial de GlassBar y de
+/// los archivos recientes de Windows (`files`, con su hora). Solo entran apps del
+/// catálogo (accesos directos o apps instaladas), así no aparecen procesos sueltos
+/// ni desinstaladores.
 fn rank(
     apps: &[AppEntry],
     usage: &HashMap<String, Usage>,
     history: &[Launch],
-    pinned: &[AppEntry],
-) -> (Vec<AppEntry>, Vec<AppEntry>) {
-    let usage_of = |entry: &AppEntry| {
-        let name = entry.command.strip_prefix("shell:AppsFolder\\")?;
-        usage.get(&name.to_lowercase()).copied()
-    };
-    let used: Vec<(&AppEntry, Usage)> = apps
+    files: Vec<(AppEntry, u64)>,
+) -> Vec<RecentItem> {
+    // La apertura más reciente según Windows o GlassBar. Sin tiempo en primer
+    // plano son aperturas del sistema (p. ej. la barra de juegos), no del usuario.
+    let mut recent: Vec<RecentItem> = apps
         .iter()
-        .filter_map(|e| Some((e, usage_of(e)?)))
-        .collect();
-
-    // Recientes: la apertura más reciente según Windows o GlassBar. Sin tiempo en
-    // primer plano son aperturas del sistema (p. ej. la barra de juegos), no del usuario.
-    let mut recent: Vec<(AppEntry, u64)> = used
-        .iter()
+        .filter_map(|e| Some((e, usage_of(usage, e)?)))
         .filter(|(_, u)| u.last > 0 && u.focus_ms > 0)
-        .map(|(e, u)| ((*e).clone(), u.last))
+        .map(|(e, u)| RecentItem {
+            entry: e.clone(),
+            at: u.last,
+            file: false,
+        })
         .collect();
     for launch in history {
         match recent
             .iter_mut()
-            .find(|(e, _)| e.command.eq_ignore_ascii_case(&launch.entry.command))
+            .find(|r| r.entry.command.eq_ignore_ascii_case(&launch.entry.command))
         {
-            Some((_, at)) => *at = (*at).max(launch.at),
-            None => recent.push((launch.entry.clone(), launch.at)),
+            Some(item) => item.at = item.at.max(launch.at),
+            None => recent.push(RecentItem {
+                entry: launch.entry.clone(),
+                at: launch.at,
+                file: false,
+            }),
         }
     }
+    recent.extend(files.into_iter().map(|(entry, at)| RecentItem {
+        entry,
+        at,
+        file: true,
+    }));
     // Los historiales antiguos (sin hora) conservan su orden, detrás de los fechados.
-    recent.sort_by_key(|entry| std::cmp::Reverse(entry.1));
+    recent.sort_by_key(|item| std::cmp::Reverse(item.at));
     recent.truncate(MAX_RECENT);
-    let recent: Vec<AppEntry> = recent.into_iter().map(|(e, _)| e).collect();
+    recent
+}
 
-    // Más usadas: veces abiertas y, a igualdad, tiempo en primer plano.
-    let shown = |e: &AppEntry| {
-        pinned
-            .iter()
-            .chain(&recent)
-            .any(|p| p.command.eq_ignore_ascii_case(&e.command))
+/// Segundos Unix de ahora.
+fn unix_now() -> u64 {
+    std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map_or(0, |d| d.as_secs())
+}
+
+/// Fecha y hora locales de un instante.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+struct Moment {
+    year: i64,
+    month: u32,
+    day: u32,
+    hour: u32,
+    minute: u32,
+}
+
+/// Fecha civil (año, mes, día) del día `days` contado desde el 1-1-1970.
+fn civil_from_days(days: i64) -> (i64, u32, u32) {
+    // Algoritmo de Howard Hinnant para el calendario gregoriano.
+    let z = days + 719_468;
+    let era = z.div_euclid(146_097);
+    let doe = z.rem_euclid(146_097);
+    let yoe = (doe - doe / 1460 + doe / 36_524 - doe / 146_096) / 365;
+    let doy = doe - (365 * yoe + yoe / 4 - yoe / 100);
+    let mp = (5 * doy + 2) / 153;
+    let day = (doy - (153 * mp + 2) / 5 + 1) as u32;
+    let month = if mp < 10 { mp + 3 } else { mp - 9 } as u32;
+    let year = yoe + era * 400 + i64::from(month <= 2);
+    (year, month, day)
+}
+
+/// `Moment` de `unix` desplazado `offset` segundos (la zona horaria local).
+fn moment(unix: i64, offset: i64) -> Moment {
+    let local = unix + offset;
+    let (year, month, day) = civil_from_days(local.div_euclid(86_400));
+    let seconds = local.rem_euclid(86_400);
+    Moment {
+        year,
+        month,
+        day,
+        hour: (seconds / 3600) as u32,
+        minute: (seconds % 3600 / 60) as u32,
+    }
+}
+
+/// Hora local de `unix`, con la diferencia actual entre la hora local y la UTC.
+fn local_moment(unix: u64) -> Moment {
+    use windows::Win32::System::SystemInformation::{GetLocalTime, GetSystemTime};
+    let seconds = |t: windows::Win32::Foundation::SYSTEMTIME| {
+        let (y, m, d) = (t.wYear as i64, t.wMonth as i64, t.wDay as i64);
+        // Días desde el 1-1-1970 de esa fecha (inverso de `civil_from_days`).
+        let y = if m <= 2 { y - 1 } else { y };
+        let era = y.div_euclid(400);
+        let yoe = y.rem_euclid(400);
+        let doy = (153 * (if m > 2 { m - 3 } else { m + 9 }) + 2) / 5 + d - 1;
+        let doe = yoe * 365 + yoe / 4 - yoe / 100 + doy;
+        let days = era * 146_097 + doe - 719_468;
+        days * 86_400 + t.wHour as i64 * 3600 + t.wMinute as i64 * 60
     };
-    let mut frequent: Vec<(&AppEntry, Usage)> = used
+    let (local, utc) = unsafe { (GetLocalTime(), GetSystemTime()) };
+    // Redondeada al cuarto de hora: las zonas horarias van de 15 en 15 minutos.
+    let offset = ((seconds(local) - seconds(utc)) as f64 / 900.0).round() as i64 * 900;
+    moment(unix as i64, offset)
+}
+
+/// Cuándo se abrió algo, como lo dice el Inicio de Windows 11: "Hace 5 min",
+/// "Hace 13 h", "Ayer a las 11:58 a. m.", "3 de nov." o, de otro año, "3/11/2025".
+fn describe_time(now: u64, at: u64, local: impl Fn(u64) -> Moment) -> String {
+    let ago = now.saturating_sub(at);
+    if ago < 60 {
+        return "Hace un momento".into();
+    }
+    if ago < 3600 {
+        return format!("Hace {} min", ago / 60);
+    }
+    if ago < 86_400 {
+        return format!("Hace {} h", ago / 3600);
+    }
+    let then = local(at);
+    let today = local(now);
+    let yesterday = local(now.saturating_sub(86_400));
+    if (then.year, then.month, then.day) == (yesterday.year, yesterday.month, yesterday.day) {
+        let hour = match then.hour % 12 {
+            0 => 12,
+            h => h,
+        };
+        let half = if then.hour < 12 { "a. m." } else { "p. m." };
+        return format!("Ayer a las {hour}:{:02} {half}", then.minute);
+    }
+    const MONTHS: [&str; 12] = [
+        "ene.", "feb.", "mar.", "abr.", "may.", "jun.", "jul.", "ago.", "sept.", "oct.", "nov.",
+        "dic.",
+    ];
+    if then.year == today.year {
+        format!(
+            "{} de {}",
+            then.day,
+            MONTHS[(then.month as usize).clamp(1, 12) - 1]
+        )
+    } else {
+        format!("{}/{}/{}", then.day, then.month, then.year)
+    }
+}
+
+/// Archivo donde se recuerda la vista elegida para "Todo".
+fn view_path() -> Option<std::path::PathBuf> {
+    Some(
+        std::path::PathBuf::from(std::env::var_os("LOCALAPPDATA")?)
+            .join("GlassBar")
+            .join("start-view.txt"),
+    )
+}
+/// Vista de "Todo" guardada; por categorías si no hay ninguna, como Windows.
+fn load_view() -> View {
+    if cfg!(test) {
+        return View::Category;
+    }
+    let saved = view_path()
+        .and_then(|path| std::fs::read_to_string(path).ok())
+        .unwrap_or_default();
+    View::ALL
         .into_iter()
-        .filter(|(e, u)| u.runs > 0 && u.focus_ms > 0 && !shown(e))
-        .collect();
-    frequent.sort_by_key(|(_, usage)| std::cmp::Reverse((usage.runs, usage.focus_ms)));
-    let frequent = frequent
-        .into_iter()
-        .take(MAX_FREQUENT)
-        .map(|(e, _)| e.clone())
-        .collect();
-    (recent, frequent)
+        .find(|v| v.key() == saved.trim())
+        .unwrap_or(View::Category)
+}
+fn save_view(view: View) {
+    if cfg!(test) {
+        return;
+    }
+    if let Some(path) = view_path() {
+        if let Some(folder) = path.parent() {
+            let _ = std::fs::create_dir_all(folder);
+        }
+        let _ = std::fs::write(path, view.key());
+    }
 }
 
 /// Dibuja `icon` con su esquina en (`x`, `y`) y `side` píxeles de lado.
@@ -1976,13 +2574,16 @@ mod tests {
         }
     }
     fn state() -> LauncherState {
-        LauncherState {
+        let mut state = LauncherState {
             apps: (0..25)
                 .map(|i| entry(&format!("Editor {i:02}"), &format!("{i}.exe")))
                 .collect(),
             recent: vec![],
-            frequent: vec![],
             pinned: vec![],
+            categories: vec![],
+            alphabetical: vec![],
+            view: View::Category,
+            open_category: None,
             query: TextField::default(),
             scroll: 0.0,
             hovered: None,
@@ -2003,6 +2604,15 @@ mod tests {
             detail_icons: HashMap::new(),
             jumps: HashMap::new(),
             admin: HashMap::new(),
+        };
+        state.regroup(&HashMap::new());
+        state
+    }
+    fn recent_app(name: &str, command: &str) -> RecentItem {
+        RecentItem {
+            entry: entry(name, command),
+            at: 0,
+            file: false,
         }
     }
     fn many(prefix: &str, count: usize) -> Vec<AppEntry> {
@@ -2023,19 +2633,27 @@ mod tests {
     }
 
     #[test]
-    fn browse_view_shows_pinned_recent_and_frequent_but_not_the_whole_catalog() {
+    fn browse_view_shows_pinned_recent_and_everything_by_category() {
         let mut menu = state();
         menu.pinned = vec![entry("Explorador", "explorer.exe")];
-        menu.recent = vec![entry("Spotify", "spotify.exe")];
-        menu.frequent = vec![entry("Chrome", "chrome.exe")];
+        menu.recent = vec![recent_app("Spotify", "spotify.exe")];
         let layout = menu.layout();
         let titles: Vec<_> = layout.headers.iter().map(|(t, _)| t.as_str()).collect();
-        assert_eq!(titles, ["Anclado", "Recientes", "Más usadas"]);
+        assert_eq!(titles, ["Anclado", "Recientes", "Todo"]);
         let hits: Vec<_> = layout.slots.iter().map(|s| s.hit).collect();
-        assert_eq!(hits, [Hit::Pinned(0), Hit::Recent(0), Hit::Frequent(0)]);
+        assert_eq!(
+            hits,
+            [
+                Hit::Pinned(0),
+                Hit::ShowAllRecent,
+                Hit::Recent(0),
+                Hit::ViewPicker,
+                Hit::Category(0)
+            ]
+        );
         let (x, y) = point_of(&menu, Hit::Recent(0));
         assert_eq!(menu.hit_test(x, y), Some(Hit::Recent(0)));
-        // El catálogo completo solo aparece al buscar.
+        // Al buscar solo quedan los resultados.
         menu.insert_text("editor 24");
         assert!(menu
             .layout()
@@ -2068,27 +2686,154 @@ mod tests {
             // Usada pero fuera del catálogo: se ignora.
             ("c:\\tools\\helper.exe".to_string(), at(99, 99, 999)),
         ]);
-        let names = |list: &[AppEntry]| list.iter().map(|e| e.name.clone()).collect::<Vec<_>>();
+        let names = |list: &[RecentItem]| {
+            list.iter()
+                .map(|r| (r.entry.name.clone(), r.file))
+                .collect::<Vec<_>>()
+        };
 
-        // Recientes por hora; la apertura desde GlassBar (400) adelanta a Notas.
+        // Por hora, apps y archivos mezclados; la apertura desde GlassBar (400)
+        // adelanta a Notas y la barra de juegos (sin primer plano) no entra.
         let history = vec![Launch {
             entry: entry("Notas", "shell:AppsFolder\\Notes!App"),
             at: 400,
         }];
-        let (recent, frequent) = rank(&apps, &usage, &history, &[]);
-        assert_eq!(names(&recent), ["Notas", "Google Chrome", "Warp"]);
-        // Lo que ya está en recientes no se repite en más usadas.
-        assert!(frequent.is_empty());
+        let files = vec![(entry("foto.jpg", "C:\\Recent\\foto.jpg.lnk"), 250)];
+        let recent = rank(&apps, &usage, &history, files);
+        assert_eq!(
+            names(&recent),
+            [
+                ("Notas".to_string(), false),
+                ("Google Chrome".to_string(), false),
+                ("foto.jpg".to_string(), true),
+                ("Warp".to_string(), false)
+            ]
+        );
+        assert_eq!(recent[0].at, 400);
 
-        // Sin fechas: más usadas por veces abiertas, sin los anclados ni la barra de juegos.
+        // Sin fechas de Windows no hay recientes de apps.
         let undated: HashMap<_, _> = usage
             .into_iter()
             .map(|(k, u)| (k, Usage { last: 0, ..u }))
             .collect();
-        let pinned = [entry("Warp", "shell:AppsFolder\\dev.warp.Warp")];
-        let (recent, frequent) = rank(&apps, &undated, &[], &pinned);
-        assert!(recent.is_empty());
-        assert_eq!(names(&frequent), ["Google Chrome", "Notas"]);
+        assert!(rank(&apps, &undated, &[], vec![]).is_empty());
+    }
+
+    #[test]
+    fn recent_files_open_without_the_app_menu() {
+        let mut menu = state();
+        menu.recent = vec![RecentItem {
+            entry: entry("foto.jpg", "C:\\Recent\\foto.jpg.lnk"),
+            at: 100,
+            file: true,
+        }];
+        assert!(matches!(
+            menu.activate(Hit::Recent(0)),
+            Some(Action::OpenFile(e)) if e.name == "foto.jpg"
+        ));
+        let (x, y) = point_of(&menu, Hit::Recent(0));
+        assert!(!menu.open_context(Hit::Recent(0), x, y));
+        assert!(!menu.overlay_open());
+    }
+
+    #[test]
+    fn a_category_opens_with_its_apps_and_escape_goes_back() {
+        let mut menu = state();
+        menu.recent = many("Reciente", 6)
+            .into_iter()
+            .map(|e| RecentItem {
+                entry: e,
+                at: 0,
+                file: false,
+            })
+            .collect();
+        menu.pinned = many("Anclada", 18);
+        menu.scroll_by(10_000.0);
+        let before = menu.scroll;
+        assert!(before > 0.0);
+        let (x, y) = point_of(&menu, Hit::Category(0));
+        let hit = menu.hit_test(x, y).unwrap();
+        assert_eq!(hit, Hit::Category(0));
+        assert!(menu.activate(hit).is_none());
+        let hits: Vec<_> = menu.layout().slots.iter().map(|s| s.hit).collect();
+        assert_eq!(hits[0], Hit::CategoryBack);
+        assert_eq!(hits.len(), 1 + 25);
+        assert!(hits[1..].iter().all(|h| matches!(h, Hit::App(_))));
+        assert_eq!(menu.scroll, 0.0);
+        assert_eq!(menu.link_label(Hit::CategoryBack), "Otros");
+        // Escape vuelve a "Todo" donde estaba; otra vez ya no hay nada que cerrar.
+        assert!(menu.back());
+        assert_eq!(menu.scroll, before);
+        assert_eq!(menu.selection, Some(Hit::Category(0)));
+        assert!(!menu.back());
+    }
+
+    #[test]
+    fn the_view_picker_switches_to_grid_and_list() {
+        let mut menu = state();
+        assert_eq!(menu.link_label(Hit::ViewPicker), "Visualización: Categoría");
+        assert!(menu.activate(Hit::ViewPicker).is_none());
+        assert!(menu.overlay_open());
+        let context = menu.context.as_ref().unwrap();
+        assert!(context.entry.is_none());
+        // La vista actual sale resaltada.
+        assert_eq!(context.menu.hovered, Some(0));
+        let (cx, cy) = (context.x, context.y);
+        let (_, h) = context.menu.size();
+        // Tercera opción: Lista.
+        let hit = menu.hit_test(cx + 20.0, cy + h - 20.0).unwrap();
+        assert!(menu.activate(hit).is_none());
+        assert_eq!(menu.view, View::List);
+        assert!(!menu.overlay_open());
+        let layout = menu.layout();
+        let titles: Vec<_> = layout.headers.iter().map(|(t, _)| t.as_str()).collect();
+        assert_eq!(titles, ["Todo", "E"]);
+        let lines: Vec<_> = layout
+            .slots
+            .iter()
+            .filter(|s| s.shape == Shape::Line)
+            .map(|s| s.hit)
+            .collect();
+        assert_eq!(lines.len(), 25);
+        assert_eq!(lines[0], Hit::App(0));
+
+        menu.set_view(View::Grid);
+        let tiles = menu
+            .layout()
+            .slots
+            .iter()
+            .filter(|s| s.shape == Shape::Tile)
+            .count();
+        assert_eq!(tiles, 25);
+    }
+
+    #[test]
+    fn recent_times_read_like_windows() {
+        let utc = |unix: u64| moment(unix as i64, 0);
+        // 15-11-2026 12:00 UTC.
+        let now = 1_794_744_000;
+        assert_eq!(
+            utc(now),
+            Moment {
+                year: 2026,
+                month: 11,
+                day: 15,
+                hour: 12,
+                minute: 0
+            }
+        );
+        assert_eq!(describe_time(now, now - 30, utc), "Hace un momento");
+        assert_eq!(describe_time(now, now - 5 * 60, utc), "Hace 5 min");
+        assert_eq!(describe_time(now, now - 13 * 3600, utc), "Hace 13 h");
+        // Ayer a las 11:58, hace más de un día.
+        assert_eq!(
+            describe_time(now, now - 86_400 - 120, utc),
+            "Ayer a las 11:58 a. m."
+        );
+        assert_eq!(describe_time(now, now - 12 * 86_400, utc), "3 de nov.");
+        assert_eq!(describe_time(now, now - 400 * 86_400, utc), "11/10/2025");
+        // Con zona horaria: 12:00 UTC son las 7:00 en UTC-5.
+        assert_eq!(moment(now as i64, -5 * 3600).hour, 7);
     }
 
     #[test]
@@ -2112,20 +2857,23 @@ mod tests {
     fn arrows_move_through_sections_and_scroll_into_view() {
         let mut menu = state();
         menu.pinned = many("Anclada", 8);
-        menu.frequent = many("Usada", 12);
+        menu.view = View::Grid;
         menu.move_selection(0, 1);
         assert_eq!(menu.selection, Some(Hit::Pinned(0)));
         menu.move_selection(0, 1);
         assert_eq!(menu.selection, Some(Hit::Pinned(COLS)));
         menu.move_selection(1, 0);
         assert_eq!(menu.selection, Some(Hit::Pinned(COLS + 1)));
-        // Bajar desde la última fila de anclados pasa a "Más usadas", misma columna.
+        // Bajar desde la última fila de anclados pasa por "Visualización" y luego a
+        // la cuadrícula de "Todo", hasta su última app.
         menu.move_selection(0, 1);
-        assert_eq!(menu.selection, Some(Hit::Frequent(1)));
+        assert_eq!(menu.selection, Some(Hit::ViewPicker));
+        menu.move_selection(0, 1);
+        assert_eq!(menu.selection, Some(Hit::App(COLS - 1)));
         for _ in 0..10 {
             menu.move_selection(0, 1);
         }
-        assert_eq!(menu.selection, Some(Hit::Frequent(COLS + 1)));
+        assert_eq!(menu.selection, Some(Hit::App(24)));
         let (_, y) = point_of(&menu, menu.selection.unwrap());
         assert!((VIEW_TOP..VIEW_TOP + VIEW_H).contains(&y));
         assert_eq!(menu.first_match(), menu.selection);

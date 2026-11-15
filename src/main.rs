@@ -16,6 +16,7 @@ mod bar;
 mod bluetooth;
 mod calendar;
 mod catalog;
+mod categories;
 mod clock;
 mod font;
 mod frames;
@@ -1585,7 +1586,7 @@ unsafe extern "system" fn launcher_wndproc(
                     let menu_open = menu.model.overlay_open();
                     match wparam.0 {
                         0x1B => {
-                            if menu.model.close_overlay() {
+                            if menu.model.back() {
                                 menu.render();
                             } else {
                                 menu.hide();
@@ -1703,6 +1704,9 @@ unsafe extern "system" fn launcher_wndproc(
                 if apps::launch_entry_as_admin(&entry) {
                     let _ = catalog::record(&entry);
                 }
+            }
+            launcher::Action::OpenFile(entry) => {
+                apps::launch_entry(&entry);
             }
             launcher::Action::OpenLocation(entry) => {
                 apps::open_entry_location(&entry);
