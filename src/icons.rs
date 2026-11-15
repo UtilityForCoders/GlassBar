@@ -202,25 +202,6 @@ unsafe fn bitmap_image(bitmap: HBITMAP) -> Option<Pixmap> {
     Some(image)
 }
 
-#[cfg(test)]
-mod tests {
-    #[test]
-    fn shell_icons_have_visible_and_transparent_pixels() {
-        let path = format!("{}\\explorer.exe", std::env::var("WINDIR").unwrap());
-        let icon = super::load(&path).expect("icono del Explorador");
-        assert!(
-            icon.width() >= 128 && icon.height() >= 128,
-            "iconos de alta resolución"
-        );
-        assert!(icon.pixels().iter().any(|p| p.alpha() > 0));
-        assert!(icon.pixels().iter().any(|p| p.alpha() == 0));
-        assert!(icon
-            .pixels()
-            .iter()
-            .all(|p| p.red() <= p.alpha() && p.green() <= p.alpha() && p.blue() <= p.alpha()));
-    }
-}
-
 /// Imagen de un icono de Windows a `side` píxeles (p. ej. el de la bandeja de otro
 /// programa).
 pub fn from_hicon(
@@ -294,4 +275,23 @@ unsafe fn rasterize_at(
     let _ = DeleteObject(bitmap.into());
     let _ = DeleteDC(dc);
     result
+}
+
+#[cfg(test)]
+mod tests {
+    #[test]
+    fn shell_icons_have_visible_and_transparent_pixels() {
+        let path = format!("{}\\explorer.exe", std::env::var("WINDIR").unwrap());
+        let icon = super::load(&path).expect("icono del Explorador");
+        assert!(
+            icon.width() >= 128 && icon.height() >= 128,
+            "iconos de alta resolución"
+        );
+        assert!(icon.pixels().iter().any(|p| p.alpha() > 0));
+        assert!(icon.pixels().iter().any(|p| p.alpha() == 0));
+        assert!(icon
+            .pixels()
+            .iter()
+            .all(|p| p.red() <= p.alpha() && p.green() <= p.alpha() && p.blue() <= p.alpha()));
+    }
 }

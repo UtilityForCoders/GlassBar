@@ -808,7 +808,7 @@ unsafe extern "system" fn backdrop_wndproc(
 }
 
 /// Tinte del acrílico (AABBGGRR): el gris oscuro del cristal del dock.
-const ACRYLIC_TINT: u32 = 0xB0_25_20_1e;
+const ACRYLIC_TINT: u32 = 0xB0_25_20_1E;
 
 /// `SetWindowCompositionAttribute`, sin documentar pero estable desde Windows 10:
 /// es lo que usan la barra de Windows y TranslucentTB. `color` es AABBGGRR.

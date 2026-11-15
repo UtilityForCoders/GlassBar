@@ -284,7 +284,7 @@ fn bmp_entry(pixmap: &Pixmap) -> Vec<u8> {
     // BMP Header (14 bytes)
     out.extend_from_slice(b"BM");
     let file_size = 14 + 40 + (w * h * 4);
-    out.extend_from_slice(&(file_size as u32).to_le_bytes());
+    out.extend_from_slice(&file_size.to_le_bytes());
     out.extend_from_slice(&0u32.to_le_bytes());
     out.extend_from_slice(&54u32.to_le_bytes()); // offset to pixel data
 

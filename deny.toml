@@ -1,0 +1,10 @@
+# Configuración de cargo-deny (job `dependencias` del CI): avisos de RustSec sobre las
+# dependencias de Cargo.lock. Una vulnerabilidad conocida hace fallar el CI.
+
+[advisories]
+ignore = [
+    # `ttf-parser` (lectura de fuentes TrueType) quedó sin mantenimiento. No es una
+    # vulnerabilidad: GlassBar solo lee con él las fuentes instaladas en Windows. Queda
+    # pendiente cambiarlo por una alternativa mantenida; al hacerlo, quitar esta línea.
+    { id = "RUSTSEC-2026-0192", reason = "sin mantenimiento, sin vulnerabilidad; pendiente de sustituir" },
+]

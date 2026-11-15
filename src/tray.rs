@@ -26,7 +26,7 @@ impl Tray {
         let icon = unsafe {
             let instance = GetModuleHandleW(None).unwrap_or_default();
             // Carga el ícono incrustado en el recurso 1 (ver app.rc)
-            LoadIconW(Some(instance.into()), PCWSTR(1 as *const u16))
+            LoadIconW(Some(instance.into()), PCWSTR(std::ptr::dangling::<u16>()))
                 .or_else(|_| LoadIconW(None, IDI_APPLICATION))
                 .unwrap_or_default()
         };

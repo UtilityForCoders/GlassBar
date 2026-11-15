@@ -757,7 +757,7 @@ unsafe fn battery() -> Option<Battery> {
     // BatteryLifeTime: segundos restantes, o u32::MAX si Windows no los sabe
     // (enchufada, o recién desenchufada mientras lo calcula).
     let remaining = (power.ACLineStatus != 1 && power.BatteryLifeTime != u32::MAX)
-        .then(|| power.BatteryLifeTime / 60);
+        .then_some(power.BatteryLifeTime / 60);
     Some(Battery {
         percent: power.BatteryLifePercent,
         plugged: power.ACLineStatus == 1,
