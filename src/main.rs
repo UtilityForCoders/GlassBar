@@ -130,6 +130,13 @@ const TIMER_CARET: usize = 8;
 const TICK_MS: u32 = 1000;
 /// Verificación de proximidad del cursor al borde inferior para auto-hide inmediato (60 ms).
 const EDGE_MS: u32 = 40;
+/// Sondeo del borde con el puntero quieto y nada abierto ni en movimiento: sin nadie moviendo
+/// el ratón no hay borde que detectar, y 25 despertares por segundo impiden que el procesador
+/// descanse (se nota en la batería). Se hace todo lo mismo, cinco veces por segundo, y al
+/// primer movimiento vuelve el ritmo normal.
+const EDGE_IDLE_MS: u32 = 200;
+/// Cuánto debe llevar quieto el puntero para pasar al sondeo lento.
+const EDGE_IDLE_AFTER: Duration = Duration::from_secs(2);
 /// Tiempo con el cursor quieto sobre un icono antes de mostrar su nombre.
 const TIP_MS: u32 = 600;
 
@@ -1783,6 +1790,11 @@ struct App {
     scene_read: Instant,
     /// Última vez que se miró si la bandeja propia sigue delante de la de Explorer.
     tray_checked: Instant,
+    /// Última posición del puntero vista por `TIMER_EDGE` y cuándo cambió por última vez.
+    edge_cursor: POINT,
+    edge_moved: Instant,
+    /// `TIMER_EDGE` va al ritmo lento (`EDGE_IDLE_MS`).
+    edge_slow: bool,
     /// Ventana con el desenfoque de Windows que va debajo del dock con las
     /// apariencias Desenfoque y Acrílico.
     backdrop: Option<style::Backdrop>,
@@ -1923,6 +1935,9 @@ impl App {
             styles,
             scene_read: Instant::now(),
             tray_checked: Instant::now(),
+            edge_cursor: POINT::default(),
+            edge_moved: Instant::now(),
+            edge_slow: false,
             backdrop: style::Backdrop::new(),
             backdrop_at: std::cell::Cell::new(None),
             new_release: None,
@@ -3903,6 +3918,28 @@ unsafe extern "system" fn wndproc(hwnd: HWND, msg: u32, wparam: WPARAM, lparam: 
                     }
                     if app.visibility.active() {
                         app.start_animating();
+                    }
+                    if pt.x != app.edge_cursor.x || pt.y != app.edge_cursor.y {
+                        app.edge_cursor = pt;
+                        app.edge_moved = Instant::now();
+                    }
+                    let slow = edge_can_idle(
+                        app.edge_moved.elapsed(),
+                        app.animating
+                            || app.visibility.active()
+                            || app.busy()
+                            || app.keyboard_nav.is_some()
+                            || app.bar.pressed.is_some()
+                            || app.preview.as_ref().is_some_and(|p| p.visible),
+                    );
+                    if slow != app.edge_slow {
+                        app.edge_slow = slow;
+                        let _ = SetTimer(
+                            Some(app.hwnd),
+                            TIMER_EDGE,
+                            if slow { EDGE_IDLE_MS } else { EDGE_MS },
+                            None,
+                        );
                     }
                 });
             }
@@ -6413,6 +6450,12 @@ fn handle_menu_command(app: &mut App, cmd: u32) {
     }
 }
 
+/// El sondeo del borde puede ir lento: el puntero lleva un rato quieto y no hay nada abierto,
+/// pulsado ni en movimiento que dependa de él.
+fn edge_can_idle(still_for: Duration, in_use: bool) -> bool {
+    !in_use && still_for >= EDGE_IDLE_AFTER
+}
+
 fn cursor_at_edge(cursor: POINT, left: i32, right: i32, bottom: i32, scale: f32) -> bool {
     cursor.x >= left
         && cursor.x < right
@@ -6423,6 +6466,12 @@ fn cursor_at_edge(cursor: POINT, left: i32, right: i32, bottom: i32, scale: f32)
 #[cfg(test)]
 mod autohide_tests {
     use super::*;
+    #[test]
+    fn edge_polling_slows_only_when_the_pointer_rests_and_nothing_is_open() {
+        assert!(edge_can_idle(Duration::from_secs(3), false));
+        assert!(!edge_can_idle(Duration::from_millis(500), false));
+        assert!(!edge_can_idle(Duration::from_secs(3), true));
+    }
     #[test]
     fn edge_activation_stays_on_its_monitor_and_scales_with_dpi() {
         assert!(cursor_at_edge(
