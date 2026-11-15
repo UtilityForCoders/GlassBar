@@ -220,7 +220,7 @@ impl CalendarState {
             return None;
         }
         let top = Self::grid_top();
-        if y >= top && y < top + CELL_H * WEEKS as f32 && x >= PAD && x < WIDTH - PAD {
+        if y >= top && y < top + CELL_H * WEEKS as f32 && (PAD..WIDTH - PAD).contains(&x) {
             let row = ((y - top) / CELL_H) as usize;
             let column = (((x - PAD) / CELL_W) as usize).min(6);
             return Some(Hit::Day(row * 7 + column));

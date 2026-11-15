@@ -53,7 +53,9 @@ fn text_at(bytes: &[u8], at: usize, chars: usize) -> String {
         return String::new();
     };
     let wide: Vec<u16> = raw
-        .chunks_exact(2)
+        .as_chunks::<2>()
+        .0
+        .iter()
         .map(|c| u16::from_le_bytes([c[0], c[1]]))
         .take_while(|&c| c != 0)
         .collect();
@@ -1006,7 +1008,6 @@ mod tests {
                 top,
                 right,
                 bottom,
-                ..Default::default()
             },
             floating,
         };

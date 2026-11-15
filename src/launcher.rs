@@ -950,9 +950,7 @@ impl LauncherState {
             return None;
         }
         if self.searching() && x >= DETAIL_X - 6.0 {
-            if self.detail_entry().is_none() {
-                return None;
-            }
+            self.detail_entry()?;
             let (ox, oy, ow, oh) = Self::detail_open_rect();
             if within(ox, oy, ow, oh) {
                 return Some(Hit::DetailOpen);
@@ -1778,7 +1776,7 @@ fn rank(
         }
     }
     // Los historiales antiguos (sin hora) conservan su orden, detrás de los fechados.
-    recent.sort_by(|a, b| b.1.cmp(&a.1));
+    recent.sort_by_key(|entry| std::cmp::Reverse(entry.1));
     recent.truncate(MAX_RECENT);
     let recent: Vec<AppEntry> = recent.into_iter().map(|(e, _)| e).collect();
 
@@ -1793,7 +1791,7 @@ fn rank(
         .into_iter()
         .filter(|(e, u)| u.runs > 0 && u.focus_ms > 0 && !shown(e))
         .collect();
-    frequent.sort_by(|(_, a), (_, b)| (b.runs, b.focus_ms).cmp(&(a.runs, a.focus_ms)));
+    frequent.sort_by_key(|(_, usage)| std::cmp::Reverse((usage.runs, usage.focus_ms)));
     let frequent = frequent
         .into_iter()
         .take(MAX_FREQUENT)

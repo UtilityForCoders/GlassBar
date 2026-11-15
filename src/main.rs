@@ -4441,10 +4441,8 @@ unsafe extern "system" fn calendar_wndproc(
                     0x21 | 0x26 => panel.shift(-1),
                     0x22 | 0x28 => panel.shift(1),
                     0x25 | 0x27 => app.step_menu(if wparam.0 == 0x25 { -1 } else { 1 }),
-                    0x24 => {
-                        if panel.model.go_today() {
-                            panel.render();
-                        }
+                    0x24 if panel.model.go_today() => {
+                        panel.render();
                     }
                     _ => {}
                 }

@@ -46,7 +46,7 @@ pub fn variant_code(text: &str) -> String {
         return "INTL".into();
     }
     let words: Vec<&str> = text
-        .split(|c: char| c == ' ' || c == '-' || c == '(' || c == ')')
+        .split([' ', '-', '(', ')'])
         .filter(|w| !w.is_empty())
         .collect();
     match words.as_slice() {
@@ -202,9 +202,11 @@ fn read_layout(hkl: isize) -> Layout {
     let device = ((hkl as usize >> 16) & 0xffff) as u16;
     let mut buffer = [0u16; 85];
     let len = unsafe { LCIDToLocaleName(language_id, Some(&mut buffer), 0) };
-    let locale = (len > 1)
-        .then(|| String::from_utf16_lossy(&buffer[..len as usize - 1]))
-        .unwrap_or_default();
+    let locale = if len > 1 {
+        String::from_utf16_lossy(&buffer[..len as usize - 1])
+    } else {
+        Default::default()
+    };
     let language = language_code(
         &locale_info(&locale, LOCALE_SNATIVELANGUAGENAME).unwrap_or_default(),
         &locale_info(&locale, LOCALE_SISO639LANGNAME2).unwrap_or_default(),

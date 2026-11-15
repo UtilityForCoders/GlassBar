@@ -104,6 +104,25 @@ fn save_to(apps: &[AppItem], path: &std::path::Path) -> std::io::Result<()> {
     std::fs::rename(pending, path)
 }
 
+/// Acepta solo programas y accesos directos existentes.
+pub fn from_drop(path: String) -> Option<AppItem> {
+    let file = std::path::Path::new(&path);
+    if !file.is_file()
+        || !file.extension().is_some_and(|e| {
+            ["exe", "lnk", "url"]
+                .iter()
+                .any(|allowed| e.eq_ignore_ascii_case(allowed))
+        })
+    {
+        return None;
+    }
+    let name = file.file_stem()?.to_string_lossy().into_owned();
+    Some(AppItem::new(AppEntry {
+        name,
+        command: path,
+    }))
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -132,23 +151,4 @@ mod tests {
         assert!(entries.is_empty());
         std::fs::remove_file(path).unwrap();
     }
-}
-
-/// Acepta solo programas y accesos directos existentes.
-pub fn from_drop(path: String) -> Option<AppItem> {
-    let file = std::path::Path::new(&path);
-    if !file.is_file()
-        || !file.extension().is_some_and(|e| {
-            ["exe", "lnk", "url"]
-                .iter()
-                .any(|allowed| e.eq_ignore_ascii_case(allowed))
-        })
-    {
-        return None;
-    }
-    let name = file.file_stem()?.to_string_lossy().into_owned();
-    Some(AppItem::new(AppEntry {
-        name,
-        command: path,
-    }))
 }
