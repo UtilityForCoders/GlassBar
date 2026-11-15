@@ -33,17 +33,36 @@ jobs:
       - name: Verificar formato
         run: cargo fmt --check
 
+      - name: Clippy
+        run: cargo clippy --locked --all-targets -- -D warnings
+
       - name: Ejecutar pruebas
         run: cargo test --locked --bin glassbar
 
       - name: Compilar la app
         run: cargo build --locked --release
 
+      # Arranca el dock, lo deja en reposo y falla si se cae o si gasta más de lo
+      # presupuestado. Los límites van holgados (ver el script): en un equipo normal
+      # GlassBar en reposo gasta menos del 1 % de un núcleo, 11 hilos y unos 32 MB.
+      - name: Arranque y consumo en reposo
+        run: ./scripts/comprobar-app.ps1 -Exe target/release/glassbar.exe -MaxCpu 8 -MaxHilos 40 -MaxMemoriaMB 120 -MaxExeKB 2600
+
       - name: Subir el .exe
         uses: actions/upload-artifact@v7
         with:
           name: glassbar-exe
           path: target/release/glassbar.exe
+
+  # Vulnerabilidades conocidas (RustSec) en las dependencias de Cargo.lock.
+  dependencias:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v7
+
+      - uses: EmbarkStudios/cargo-deny-action@v2
+        with:
+          command: check advisories
 
   # Lo que entra en main se publica como versión: tiene que traer una versión nueva
   # en Cargo.toml (y Cargo.lock al día, que lo comprueba `--locked`).
