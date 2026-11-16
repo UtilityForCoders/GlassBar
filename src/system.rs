@@ -82,6 +82,8 @@ enum Command {
     DefaultOutput(String),
     /// Salida de una aplicación (sus procesos); `None` vuelve a la predeterminada.
     AppOutput(Vec<u32>, Option<String>),
+    /// Volumen de una aplicación (sus procesos), de 0 a 1.
+    AppVolume(Vec<u32>, f32),
     /// Dispositivos Bluetooth recién leídos por su hilo (ver `bluetooth_reader`).
     Devices(Vec<Device>),
 }
@@ -150,6 +152,9 @@ impl Backend {
     }
     pub fn set_app_output(&self, pids: Vec<u32>, id: Option<String>) {
         let _ = self.sender.send(Command::AppOutput(pids, id));
+    }
+    pub fn set_app_volume(&self, pids: Vec<u32>, level: f32) {
+        let _ = self.sender.send(Command::AppVolume(pids, level));
     }
 }
 
@@ -277,6 +282,8 @@ fn run(
                         .map(|e| format!("No se pudo cambiar la salida de la app ({e})"));
                     reread = true;
                 }
+                // Sin releer: el panel ya lo muestra, y al arrastrar llegan muchas.
+                Command::AppVolume(pids, level) => crate::audio::set_app_volume(pids, *level),
                 Command::BluetoothAudio(address, connected) => {
                     crate::bluetooth::set_audio_connected(*address, *connected);
                     (rereads, reread_at) = (2, Instant::now() + SETTLE);
