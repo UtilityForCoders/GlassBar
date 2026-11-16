@@ -644,7 +644,8 @@ impl BarState {
                 opacity * 0.95,
             );
         }
-        self.clock.draw(pixmap, self.clock_center(scale), cy, scale);
+        self.clock
+            .draw(pixmap, self.clock_center(scale), cy, scale, CLOCK_W * scale);
         // Mostrar escritorio: una línea fina en el extremo, resaltada al pasar por ella.
         let desktop_x = self.show_desktop_center(scale);
         if self.hovered == Some(HoverTarget::ShowDesktop) {

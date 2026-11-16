@@ -26,6 +26,9 @@ const PICKER_H: f32 = 28.0;
 const SLIDER_W: f32 = 150.0;
 /// Botón de las actualizaciones.
 const BUTTON_W: f32 = 150.0;
+/// Botones de la copia de la configuración, uno junto al otro.
+const BACKUP_W: f32 = 72.0;
+const BACKUP_GAP: f32 = 6.0;
 const TEXT: f32 = 13.0;
 
 /// Interruptores de la sección del dock.
@@ -33,6 +36,7 @@ const TEXT: f32 = 13.0;
 pub enum Switch {
     AutoHide,
     TopBar,
+    ClockSeconds,
     Autostart,
 }
 
@@ -45,8 +49,13 @@ pub enum Hit {
     Enabled(State),
     /// Cambiar la apariencia de una situación a la anterior (`false`) o la siguiente.
     Appearance(State, bool),
+    /// Tamaño del dock: el anterior (`false`) o el siguiente.
+    DockSize(bool),
     Opacity,
     Update,
+    /// Guardar la configuración en un archivo, o sustituirla por la de uno.
+    Export,
+    Import,
     Exit,
 }
 
@@ -73,9 +82,12 @@ pub struct SettingsState {
 enum Line {
     Section(&'static str),
     Switch(Switch),
+    DockSize,
     Look(State),
     Opacity,
     Update,
+    /// Copia de la configuración: "Exportar" e "Importar".
+    Backup,
     Exit,
 }
 
@@ -83,7 +95,9 @@ fn lines() -> Vec<Line> {
     let mut lines = vec![
         Line::Section("Dock"),
         Line::Switch(Switch::AutoHide),
+        Line::DockSize,
         Line::Switch(Switch::TopBar),
+        Line::Switch(Switch::ClockSeconds),
         Line::Switch(Switch::Autostart),
         Line::Section("Apariencia según lo que hay en pantalla"),
     ];
@@ -91,6 +105,7 @@ fn lines() -> Vec<Line> {
     lines.push(Line::Opacity);
     lines.push(Line::Section("GlassBar"));
     lines.push(Line::Update);
+    lines.push(Line::Backup);
     lines.push(Line::Exit);
     lines
 }
@@ -123,6 +138,7 @@ fn switch_label(switch: Switch) -> &'static str {
     match switch {
         Switch::AutoHide => "Ocultar el dock automáticamente",
         Switch::TopBar => "Controles en una barra superior",
+        Switch::ClockSeconds => "Mostrar los segundos en el reloj",
         Switch::Autostart => "Iniciar con Windows",
     }
 }
@@ -130,6 +146,15 @@ fn switch_label(switch: Switch) -> &'static str {
 /// Borde izquierdo de los controles alineados a la derecha.
 fn right_edge() -> f32 {
     WIDTH - PAD
+}
+
+/// Borde izquierdo de "Exportar" y de "Importar".
+fn backup_buttons() -> [(Hit, f32); 2] {
+    let right = right_edge();
+    [
+        (Hit::Export, right - BACKUP_W * 2.0 - BACKUP_GAP),
+        (Hit::Import, right - BACKUP_W),
+    ]
 }
 
 impl SettingsState {
@@ -147,6 +172,7 @@ impl SettingsState {
         match switch {
             Switch::AutoHide => !self.styles.always_visible(),
             Switch::TopBar => self.styles.top_bar(),
+            Switch::ClockSeconds => self.styles.clock_seconds(),
             Switch::Autostart => self.autostart,
         }
     }
@@ -175,6 +201,12 @@ impl SettingsState {
                 }
                 None
             }
+            Line::DockSize => {
+                let picker = right - PICKER_W;
+                (picker..right)
+                    .contains(&x)
+                    .then_some(Hit::DockSize(x >= picker + PICKER_W / 2.0))
+            }
             Line::Opacity => {
                 let left = right - SLIDER_W - 44.0;
                 ((left - 6.0..right).contains(&x)).then_some(Hit::Opacity)
@@ -184,6 +216,10 @@ impl SettingsState {
                 let inside = (right - BUTTON_W..right).contains(&x);
                 (inside && !busy).then_some(Hit::Update)
             }
+            Line::Backup => backup_buttons()
+                .into_iter()
+                .find(|(_, left)| (*left..*left + BACKUP_W).contains(&x))
+                .map(|(hit, _)| hit),
             Line::Exit => {
                 let _ = top;
                 Some(Hit::Exit)
@@ -205,10 +241,14 @@ impl SettingsState {
     /// La orden del menú que corresponde a pulsar `hit`, si la tiene. Cerrar y la
     /// barra de la opacidad los atiende la ventana.
     pub fn command(&self, hit: Hit) -> Option<u32> {
-        use crate::appmenu::{CMD_AUTOHIDE, CMD_AUTOSTART, CMD_EXIT, CMD_TOP_BAR, CMD_UPDATE};
+        use crate::appmenu::{
+            CMD_AUTOHIDE, CMD_AUTOSTART, CMD_CLOCK_SECONDS, CMD_EXIT, CMD_EXPORT, CMD_IMPORT,
+            CMD_TOP_BAR, CMD_UPDATE,
+        };
         Some(match hit {
             Hit::Switch(Switch::AutoHide) => CMD_AUTOHIDE,
             Hit::Switch(Switch::TopBar) => CMD_TOP_BAR,
+            Hit::Switch(Switch::ClockSeconds) => CMD_CLOCK_SECONDS,
             Hit::Switch(Switch::Autostart) => CMD_AUTOSTART,
             Hit::Enabled(state) => Choice::Toggle(state).command(),
             Hit::Appearance(state, next) => {
@@ -222,8 +262,12 @@ impl SettingsState {
                 };
                 Choice::Set(state, all[to]).command()
             }
+            Hit::DockSize(true) => crate::appmenu::CMD_DOCK_BIGGER,
+            Hit::DockSize(false) => crate::appmenu::CMD_DOCK_SMALLER,
             Hit::Update if self.updates.available.is_some() => CMD_UPDATE,
             Hit::Update => crate::appmenu::CMD_UPDATE_CHECK,
+            Hit::Export => CMD_EXPORT,
+            Hit::Import => CMD_IMPORT,
             Hit::Exit => CMD_EXIT,
             Hit::Close | Hit::Opacity => return None,
         })
@@ -326,12 +370,34 @@ impl SettingsState {
                         let x = picker - 12.0 - SWITCH_W;
                         draw_switch(image, x, cy, look.enabled, true, scale);
                     }
-                    self.draw_picker(
+                    let hovered =
+                        matches!(self.hovered, Some(Hit::Appearance(st, _)) if st == state);
+                    draw_picker(
                         image,
-                        state,
-                        look.appearance,
+                        look.appearance.name(),
+                        hovered,
                         look.enabled,
                         picker,
+                        cy,
+                        scale,
+                    );
+                }
+                Line::DockSize => {
+                    draw_text_on_baseline(
+                        image,
+                        "Tamaño del dock",
+                        s(PAD + 2.0),
+                        baseline,
+                        size,
+                        0.95,
+                    );
+                    let hovered = matches!(self.hovered, Some(Hit::DockSize(_)));
+                    draw_picker(
+                        image,
+                        self.styles.dock_size_name(),
+                        hovered,
+                        true,
+                        right - PICKER_W,
                         cy,
                         scale,
                     );
@@ -383,6 +449,35 @@ impl SettingsState {
                     let opacity = if enabled { 0.95 } else { 0.5 };
                     draw_text_on_baseline(image, &label, tx, baseline, size, opacity);
                 }
+                Line::Backup => {
+                    draw_text_on_baseline(
+                        image,
+                        "Copia de la configuración",
+                        s(PAD + 2.0),
+                        baseline,
+                        size,
+                        0.95,
+                    );
+                    for (hit, left) in backup_buttons() {
+                        let alpha = if row_hover(hit) { 34 } else { 18 };
+                        fill_rounded(
+                            image,
+                            [255, 255, 255, alpha],
+                            s(left),
+                            s(cy - PICKER_H / 2.0),
+                            s(BACKUP_W),
+                            s(PICKER_H),
+                            s(6.0),
+                        );
+                        let label = if hit == Hit::Export {
+                            "Exportar"
+                        } else {
+                            "Importar"
+                        };
+                        let tx = s(left + BACKUP_W / 2.0) - text_width(label, size) / 2.0;
+                        draw_text_on_baseline(image, label, tx, baseline, size, 0.95);
+                    }
+                }
                 Line::Exit => {
                     if row_hover(Hit::Exit) {
                         self.row_highlight(image, top, scale);
@@ -419,20 +514,20 @@ impl SettingsState {
             6.0 * scale,
         );
     }
+}
 
-    #[allow(clippy::too_many_arguments)]
-    fn draw_picker(
-        &self,
-        image: &mut Pixmap,
-        state: State,
-        appearance: Appearance,
-        enabled: bool,
-        left: f32,
-        cy: f32,
-        scale: f32,
-    ) {
+/// Selector "‹ nombre ›" de la configuración.
+fn draw_picker(
+    image: &mut Pixmap,
+    name: &str,
+    hovered: bool,
+    enabled: bool,
+    left: f32,
+    cy: f32,
+    scale: f32,
+) {
+    {
         let s = |v: f32| v * scale;
-        let hovered = matches!(self.hovered, Some(Hit::Appearance(st, _)) if st == state);
         fill_rounded(
             image,
             [255, 255, 255, if hovered { 30 } else { 16 }],
@@ -446,7 +541,6 @@ impl SettingsState {
         let size = s(TEXT);
         let (ascent, descent) = line_metrics(size);
         let baseline = s(cy) + (ascent - descent) / 2.0;
-        let name = appearance.name();
         let tx = s(left + PICKER_W / 2.0) - text_width(name, size) / 2.0;
         draw_text_on_baseline(image, name, tx, baseline, size, opacity);
         for (glyph, x) in [

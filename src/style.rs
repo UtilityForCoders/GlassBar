@@ -129,6 +129,24 @@ pub struct Styles {
     /// Controles arriba y el dock solo con apps, como macOS (ver `topbar`).
     #[serde(default)]
     top_bar: bool,
+    /// El reloj muestra también los segundos.
+    #[serde(default)]
+    clock_seconds: bool,
+    /// Tamaño del dock respecto al normal, en tanto por ciento (ver `DOCK_SIZES`).
+    #[serde(default = "default_dock_size")]
+    dock_size: u8,
+}
+
+/// Tamaños del dock que se pueden elegir, con su nombre, en tanto por ciento.
+pub const DOCK_SIZES: [(u8, &str); 4] = [
+    (80, "Pequeño"),
+    (100, "Normal"),
+    (115, "Grande"),
+    (130, "Muy grande"),
+];
+
+fn default_dock_size() -> u8 {
+    100
 }
 
 fn default_menu_opacity() -> u8 {
@@ -145,6 +163,8 @@ impl Default for Styles {
             menu_opacity: default_menu_opacity(),
             always_visible: false,
             top_bar: false,
+            clock_seconds: false,
+            dock_size: default_dock_size(),
         }
     }
 }
@@ -170,6 +190,37 @@ impl Styles {
     }
     pub fn set_top_bar(&mut self, on: bool) {
         self.top_bar = on;
+    }
+    /// El reloj con segundos: se redibuja cada segundo en vez de cada minuto.
+    pub fn clock_seconds(&self) -> bool {
+        self.clock_seconds
+    }
+    pub fn set_clock_seconds(&mut self, on: bool) {
+        self.clock_seconds = on;
+    }
+    /// Posición del tamaño del dock en `DOCK_SIZES` (uno desconocido cuenta como Normal).
+    fn dock_size_index(&self) -> usize {
+        DOCK_SIZES
+            .iter()
+            .position(|(percent, _)| *percent == self.dock_size)
+            .unwrap_or(1)
+    }
+    /// Factor por el que se multiplica la escala del dock.
+    pub fn dock_factor(&self) -> f32 {
+        DOCK_SIZES[self.dock_size_index()].0 as f32 / 100.0
+    }
+    pub fn dock_size_name(&self) -> &'static str {
+        DOCK_SIZES[self.dock_size_index()].1
+    }
+    /// Pasa al tamaño siguiente (`next`) o al anterior, sin dar la vuelta.
+    pub fn step_dock_size(&mut self, next: bool) {
+        let index = self.dock_size_index();
+        let index = if next {
+            (index + 1).min(DOCK_SIZES.len() - 1)
+        } else {
+            index.saturating_sub(1)
+        };
+        self.dock_size = DOCK_SIZES[index].0;
     }
     pub fn look(&self, state: State) -> Look {
         let index = state as usize;
@@ -857,6 +908,25 @@ fn set_accent(hwnd: HWND, state: u32, color: u32) {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn dock_size_steps_between_the_known_sizes() {
+        let mut styles = Styles::default();
+        assert_eq!(styles.dock_factor(), 1.0);
+        assert_eq!(styles.dock_size_name(), "Normal");
+        styles.step_dock_size(false);
+        styles.step_dock_size(false);
+        assert_eq!(styles.dock_size_name(), "Pequeño");
+        for _ in 0..5 {
+            styles.step_dock_size(true);
+        }
+        assert_eq!(styles.dock_factor(), 1.3);
+        // Unos ajustes guardados antes de existir el tamaño, o con uno desconocido.
+        let old: Styles = serde_json::from_str(r#"{"looks":[]}"#).unwrap();
+        assert_eq!(old.dock_factor(), 1.0);
+        let odd: Styles = serde_json::from_str(r#"{"looks":[],"dock_size":7}"#).unwrap();
+        assert_eq!(odd.dock_size_name(), "Normal");
+    }
 
     #[test]
     fn by_default_the_dock_looks_as_always() {

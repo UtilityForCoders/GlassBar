@@ -364,13 +364,27 @@ const LIST_VERSIONS: [GUID; 2] = [
 
 /// La lista de destinos con la primera versión de la interfaz que admita.
 unsafe fn destination_list() -> Option<IInternalCustomDestinationList> {
+    const NAME: &str = "IInternalCustomDestinationList";
     let unknown: IUnknown =
-        CoCreateInstance(&CLSID_DESTINATION_LIST, None, CLSCTX_INPROC_SERVER).ok()?;
-    LIST_VERSIONS.iter().find_map(|iid| {
+        match CoCreateInstance(&CLSID_DESTINATION_LIST, None, CLSCTX_INPROC_SERVER) {
+            Ok(unknown) => unknown,
+            Err(error) => {
+                crate::diag::report(NAME, Err(format!("crear 0x{:08X}", error.code().0)));
+                return None;
+            }
+        };
+    let list = LIST_VERSIONS.iter().find_map(|iid| {
         let mut raw = std::ptr::null_mut();
         unknown.query(iid, &mut raw).ok().ok()?;
         (!raw.is_null()).then(|| IInternalCustomDestinationList::from_raw(raw))
-    })
+    });
+    crate::diag::report(
+        NAME,
+        list.as_ref()
+            .map(|_| ())
+            .ok_or_else(|| "ninguna versión conocida".into()),
+    );
+    list
 }
 
 /// La lista propia de la app, si declaró una. `None` si no la tiene o si la
@@ -441,11 +455,8 @@ pub fn app_id(command: &str, windows: &[isize]) -> Option<String> {
     if let Some(id) = windows.iter().find_map(|&w| window_app_id(w)) {
         return Some(id);
     }
-    let lower = command.to_lowercase();
-    if lower.ends_with(".lnk") {
-        if let Some(id) = with_com(|| item_app_id(command)) {
-            return Some(id);
-        }
+    if let Some(id) = shortcut_app_id(command) {
+        return Some(id);
     }
     let exe = crate::pins::shortcut_target(command).unwrap_or_else(|| command.to_string());
     if exe.is_empty() {
@@ -503,6 +514,15 @@ pub fn window_app(window: isize) -> Option<WindowApp> {
             icon: text(&PKEY_AppUserModel_RelaunchIconResource),
         })
     })
+}
+
+/// El AppUserModelID que guarda el acceso directo `command`, si es un .lnk y lo
+/// tiene (los instaladores lo ponen para que la barra reconozca sus ventanas).
+pub fn shortcut_app_id(command: &str) -> Option<String> {
+    if !command.to_lowercase().ends_with(".lnk") {
+        return None;
+    }
+    with_com(|| item_app_id(command))
 }
 
 /// El que guarda un acceso directo (.lnk) en sus propiedades.

@@ -12,12 +12,15 @@ mod attention;
 mod audio;
 mod autohide;
 mod autostart;
+mod backup;
 mod bar;
 mod bluetooth;
 mod calendar;
 mod catalog;
 mod categories;
 mod clock;
+mod diag;
+mod extras;
 mod font;
 mod frames;
 mod games;
@@ -83,7 +86,8 @@ use windows::Win32::UI::WindowsAndMessaging::{
 
 use crate::appmenu::{
     CMD_APP_CLOSE, CMD_APP_END_TASK, CMD_APP_OPEN, CMD_APP_PIN, CMD_APP_UNPIN, CMD_AUTOHIDE,
-    CMD_AUTOSTART, CMD_EXIT, CMD_JUMP, CMD_SETTINGS, CMD_TOP_BAR, CMD_UPDATE, CMD_UPDATE_CHECK,
+    CMD_AUTOSTART, CMD_CLOCK_SECONDS, CMD_EXIT, CMD_JUMP, CMD_SETTINGS, CMD_TOP_BAR, CMD_UPDATE,
+    CMD_UPDATE_CHECK,
 };
 use crate::autohide::AutoHide;
 use crate::bar::{BarState, HoverTarget, BOTTOM_MARGIN};
@@ -853,6 +857,15 @@ impl QuickWindow {
         }
         self.render();
     }
+    /// Lleva el volumen de una aplicación del mezclador a `value` (de 0 a 1).
+    fn set_app_volume(&mut self, app: usize, value: f32) {
+        if let Some(app) = self.model.system.audio.apps.get_mut(app) {
+            // Se ve al instante; el hilo de sistema lo aplica.
+            app.volume = value;
+            self.backend.set_app_volume(app.pids.clone(), value);
+        }
+        self.render();
+    }
 }
 impl Drop for QuickWindow {
     fn drop(&mut self) {
@@ -1103,6 +1116,7 @@ unsafe extern "system" fn quick_wndproc(
             with_app(|app| {
                 if let Some(panel) = &mut app.quick {
                     panel.model.dragging = None;
+                    panel.model.app_drag = None;
                     panel.model.scroll_drag = None;
                 }
             });
@@ -1133,6 +1147,10 @@ unsafe extern "system" fn quick_wndproc(
                     panel.set_slider(slider, quick::QuickState::slider_value(x));
                     return;
                 }
+                if let Some(app) = panel.model.app_drag {
+                    panel.set_app_volume(app, quick::QuickState::app_slider_value(x));
+                    return;
+                }
                 if panel.model.scroll_drag.is_some() {
                     panel.model.drag_scrollbar(y);
                     panel.render();
@@ -1157,6 +1175,11 @@ unsafe extern "system" fn quick_wndproc(
                         panel.model.dragging = Some(slider);
                         panel.set_slider(slider, quick::QuickState::slider_value(x));
                     }
+                    Some(quick::Hit::AppVolume(app)) => {
+                        SetCapture(hwnd);
+                        panel.model.app_drag = Some(app);
+                        panel.set_app_volume(app, quick::QuickState::app_slider_value(x));
+                    }
                     Some(quick::Hit::Scrollbar) => {
                         SetCapture(hwnd);
                         panel.model.grab_scrollbar(y);
@@ -1171,7 +1194,9 @@ unsafe extern "system" fn quick_wndproc(
                 let Some(panel) = app.quick.as_mut().filter(|p| p.visible) else {
                     return;
                 };
-                if panel.model.dragging.take().is_some() || panel.model.scroll_drag.take().is_some()
+                if panel.model.dragging.take().is_some()
+                    || panel.model.app_drag.take().is_some()
+                    || panel.model.scroll_drag.take().is_some()
                 {
                     let _ = ReleaseCapture();
                     panel.render();
@@ -1190,6 +1215,14 @@ unsafe extern "system" fn quick_wndproc(
                 };
                 let steps = ((wparam.0 >> 16) & 0xffff) as i16 as f32 / 120.0;
                 // En las listas, la rueda las desplaza (algo más de una fila por muesca).
+                // Sobre la barra del volumen de una aplicación, la mueve.
+                if let Some(quick::Hit::AppVolume(app)) = panel.model.hovered {
+                    if let Some(value) = panel.model.app_volume(app) {
+                        let value = ((value * 50.0).round() + steps).clamp(0.0, 50.0) / 50.0;
+                        panel.set_app_volume(app, value);
+                    }
+                    return;
+                }
                 if panel.model.view != quick::View::Main {
                     panel.model.scroll_list(-steps * 60.0);
                     let (x, y) = {
@@ -1250,6 +1283,15 @@ unsafe extern "system" fn quick_wndproc(
                         }
                         0x25 | 0x27 => {
                             let step = if wparam.0 == 0x25 { -1 } else { 1 };
+                            if let Some(quick::Hit::AppVolume(app)) = panel.model.hovered {
+                                if let Some(value) = panel.model.app_volume(app) {
+                                    let value = ((value * 50.0).round() + step as f32)
+                                        .clamp(0.0, 50.0)
+                                        / 50.0;
+                                    panel.set_app_volume(app, value);
+                                }
+                                return;
+                            }
                             let slider = match panel.model.hovered {
                                 Some(quick::Hit::Slider(slider)) => Some(slider),
                                 _ => None,
@@ -1709,6 +1751,7 @@ unsafe extern "system" fn launcher_wndproc(
             launcher::Action::OpenFile(entry) => {
                 apps::launch_entry(&entry);
             }
+            launcher::Action::Copy(text) => set_clipboard_text(hwnd, &text),
             launcher::Action::OpenLocation(entry) => {
                 apps::open_entry_location(&entry);
             }
@@ -1876,8 +1919,10 @@ impl App {
         let styles = style::Styles::load();
         bar.appearance = styles.look(style::State::Desktop).appearance;
         glass::set_menu_opacity(styles.menu_opacity());
+        clock::set_seconds(styles.clock_seconds());
         let (update_sender, update_events) = std::sync::mpsc::channel();
-        let scale = scale.min((rc.right - rc.left) as f32 / (bar.dock_width() + 40.0));
+        let scale = (scale * styles.dock_factor())
+            .min((rc.right - rc.left) as f32 / (bar.dock_width() + 40.0));
         let (width, height) = bar.window_size(scale);
         let surface = Surface::new(width, height)?;
 
@@ -3115,7 +3160,8 @@ impl App {
     /// Ajusta tamaño y posición del dock al número de iconos.
     fn relayout(&mut self) {
         let (rc, dpi) = monitors::get_info(monitors::dock());
-        self.scale = dpi.min((rc.right - rc.left) as f32 / (self.bar.dock_width() + 40.0));
+        self.scale = (dpi * self.styles.dock_factor())
+            .min((rc.right - rc.left) as f32 / (self.bar.dock_width() + 40.0));
         let (width, height) = self.bar.window_size(self.scale);
         if let Ok(surface) = Surface::new(width, height) {
             self.surface = surface;
@@ -6377,6 +6423,7 @@ unsafe extern "system" fn settings_wndproc(
             });
         }
         WM_LBUTTONUP => {
+            let mut backup = None;
             with_app(|app| {
                 let Some(panel) = app.settings.as_mut().filter(|p| p.visible) else {
                     return;
@@ -6401,10 +6448,19 @@ unsafe extern "system" fn settings_wndproc(
                     return;
                 }
                 if let Some(command) = panel.model.command(hit) {
+                    if matches!(command, appmenu::CMD_EXPORT | appmenu::CMD_IMPORT) {
+                        backup = Some((app.hwnd, command == appmenu::CMD_EXPORT));
+                        return;
+                    }
                     handle_menu_command(app, command);
                     app.refresh_settings();
                 }
             });
+            // El diálogo de Windows atiende mensajes mientras está abierto: se abre con
+            // la app ya libre, para que el dock siga respondiendo.
+            if let Some((owner, export)) = backup {
+                copy_settings(owner, export);
+            }
         }
         WM_KEYDOWN if wparam.0 == 0x1B => {
             with_app(|app| app.settings.as_mut().map(SettingsWindow::hide));
@@ -6412,6 +6468,41 @@ unsafe extern "system" fn settings_wndproc(
         _ => return DefWindowProcW(hwnd, msg, wparam, lparam),
     }
     LRESULT(0)
+}
+
+/// Exporta la configuración a un archivo que se elige, o la sustituye por la de
+/// uno. Tras importar, GlassBar se reinicia para leerla.
+fn copy_settings(owner: HWND, export: bool) {
+    let Some(path) = backup::pick(owner, export) else {
+        return;
+    };
+    let result = if export {
+        backup::export(&path)
+    } else {
+        backup::import(&path)
+    };
+    let (title, text) = match (&result, export) {
+        (Ok(()), true) => (
+            "Configuración exportada",
+            format!("Guardada en {}.", path.display()),
+        ),
+        (Ok(()), false) => {
+            // La instancia nueva cierra esta y arranca con la configuración importada.
+            if let Ok(exe) = std::env::current_exe() {
+                let _ = std::process::Command::new(exe).arg("--replace").spawn();
+            }
+            return;
+        }
+        (Err(error), true) => (
+            "No se pudo exportar la configuración",
+            format!("Motivo: {error}."),
+        ),
+        (Err(error), false) => (
+            "No se pudo importar la configuración",
+            format!("Motivo: {error}."),
+        ),
+    };
+    with_app(|app| app.tray.notify(title, &text));
 }
 
 fn handle_menu_command(app: &mut App, cmd: u32) {
@@ -6428,11 +6519,27 @@ fn handle_menu_command(app: &mut App, cmd: u32) {
             app.expand();
         }
         CMD_SETTINGS => app.open_settings(),
+        appmenu::CMD_DOCK_SMALLER | appmenu::CMD_DOCK_BIGGER => {
+            app.styles.step_dock_size(cmd == appmenu::CMD_DOCK_BIGGER);
+            let _ = app.styles.save();
+            app.relayout();
+            // En el modo siempre visible cambia el sitio que Windows le reserva.
+            app.sync_appbar();
+            app.expand();
+        }
         CMD_TOP_BAR => {
             let on = !app.styles.top_bar();
             app.styles.set_top_bar(on);
             let _ = app.styles.save();
             app.sync_top_bar();
+        }
+        CMD_CLOCK_SECONDS => {
+            let on = !app.styles.clock_seconds();
+            app.styles.set_clock_seconds(on);
+            let _ = app.styles.save();
+            clock::set_seconds(on);
+            app.render();
+            app.refresh_top_bar();
         }
         CMD_EXIT => {
             app.release_shell();
@@ -6535,6 +6642,7 @@ fn main() -> Result<()> {
     if guard::run(&std::env::args().collect::<Vec<_>>()) {
         return Ok(());
     }
+    diag::start();
     unsafe {
         if std::env::args().any(|arg| arg == "--replace") {
             if let Ok(old) =
