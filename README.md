@@ -122,7 +122,7 @@ Volver a ejecutar GlassBar mientras ya está abierto muestra u oculta este lanza
 
 El clic derecho en el icono de GlassBar, en el panel de apps en segundo plano (o en la bandeja de Windows si la propia no está), abre su menú con **Configuración** y **Salir de GlassBar**. **Configuración** abre la ventana de configuración, centrada en el monitor del dock y con el estilo de los demás paneles:
 
-- **Dock:** ocultar el dock automáticamente, controles en una barra superior e iniciar con Windows, con interruptores.
+- **Dock:** ocultar el dock automáticamente, controles en una barra superior e iniciar con Windows, con interruptores, y el **tamaño del dock** (Pequeño, Normal, Grande o Muy grande), que escala iconos, reloj y márgenes sobre la escala de la pantalla. Si con el tamaño elegido el dock no cabe en el monitor, se reduce lo justo.
 - **Apariencia según lo que hay en pantalla:** una fila por situación (ver Estilos) con su icono, un interruptor para activarla (el escritorio siempre cuenta) y un selector con flechas que pasa por Normal, Opaca, Transparente, Desenfoque y Acrílico. Debajo, la barra de la **opacidad de los menús**.
 - **GlassBar:** buscar actualizaciones o instalar la nueva, y salir de GlassBar.
 

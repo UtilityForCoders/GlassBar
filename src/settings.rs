@@ -45,6 +45,8 @@ pub enum Hit {
     Enabled(State),
     /// Cambiar la apariencia de una situación a la anterior (`false`) o la siguiente.
     Appearance(State, bool),
+    /// Tamaño del dock: el anterior (`false`) o el siguiente.
+    DockSize(bool),
     Opacity,
     Update,
     Exit,
@@ -73,6 +75,7 @@ pub struct SettingsState {
 enum Line {
     Section(&'static str),
     Switch(Switch),
+    DockSize,
     Look(State),
     Opacity,
     Update,
@@ -83,6 +86,7 @@ fn lines() -> Vec<Line> {
     let mut lines = vec![
         Line::Section("Dock"),
         Line::Switch(Switch::AutoHide),
+        Line::DockSize,
         Line::Switch(Switch::TopBar),
         Line::Switch(Switch::Autostart),
         Line::Section("Apariencia según lo que hay en pantalla"),
@@ -175,6 +179,12 @@ impl SettingsState {
                 }
                 None
             }
+            Line::DockSize => {
+                let picker = right - PICKER_W;
+                (picker..right)
+                    .contains(&x)
+                    .then_some(Hit::DockSize(x >= picker + PICKER_W / 2.0))
+            }
             Line::Opacity => {
                 let left = right - SLIDER_W - 44.0;
                 ((left - 6.0..right).contains(&x)).then_some(Hit::Opacity)
@@ -222,6 +232,8 @@ impl SettingsState {
                 };
                 Choice::Set(state, all[to]).command()
             }
+            Hit::DockSize(true) => crate::appmenu::CMD_DOCK_BIGGER,
+            Hit::DockSize(false) => crate::appmenu::CMD_DOCK_SMALLER,
             Hit::Update if self.updates.available.is_some() => CMD_UPDATE,
             Hit::Update => crate::appmenu::CMD_UPDATE_CHECK,
             Hit::Exit => CMD_EXIT,
@@ -326,12 +338,34 @@ impl SettingsState {
                         let x = picker - 12.0 - SWITCH_W;
                         draw_switch(image, x, cy, look.enabled, true, scale);
                     }
-                    self.draw_picker(
+                    let hovered =
+                        matches!(self.hovered, Some(Hit::Appearance(st, _)) if st == state);
+                    draw_picker(
                         image,
-                        state,
-                        look.appearance,
+                        look.appearance.name(),
+                        hovered,
                         look.enabled,
                         picker,
+                        cy,
+                        scale,
+                    );
+                }
+                Line::DockSize => {
+                    draw_text_on_baseline(
+                        image,
+                        "Tamaño del dock",
+                        s(PAD + 2.0),
+                        baseline,
+                        size,
+                        0.95,
+                    );
+                    let hovered = matches!(self.hovered, Some(Hit::DockSize(_)));
+                    draw_picker(
+                        image,
+                        self.styles.dock_size_name(),
+                        hovered,
+                        true,
+                        right - PICKER_W,
                         cy,
                         scale,
                     );
@@ -419,20 +453,20 @@ impl SettingsState {
             6.0 * scale,
         );
     }
+}
 
-    #[allow(clippy::too_many_arguments)]
-    fn draw_picker(
-        &self,
-        image: &mut Pixmap,
-        state: State,
-        appearance: Appearance,
-        enabled: bool,
-        left: f32,
-        cy: f32,
-        scale: f32,
-    ) {
+/// Selector "‹ nombre ›" de la configuración.
+fn draw_picker(
+    image: &mut Pixmap,
+    name: &str,
+    hovered: bool,
+    enabled: bool,
+    left: f32,
+    cy: f32,
+    scale: f32,
+) {
+    {
         let s = |v: f32| v * scale;
-        let hovered = matches!(self.hovered, Some(Hit::Appearance(st, _)) if st == state);
         fill_rounded(
             image,
             [255, 255, 255, if hovered { 30 } else { 16 }],
@@ -446,7 +480,6 @@ impl SettingsState {
         let size = s(TEXT);
         let (ascent, descent) = line_metrics(size);
         let baseline = s(cy) + (ascent - descent) / 2.0;
-        let name = appearance.name();
         let tx = s(left + PICKER_W / 2.0) - text_width(name, size) / 2.0;
         draw_text_on_baseline(image, name, tx, baseline, size, opacity);
         for (glyph, x) in [
