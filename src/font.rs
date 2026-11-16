@@ -5,7 +5,9 @@
 //!
 //! El antialias calcula el área exacta que cubre la letra en cada píxel, el mismo
 //! método de `font-rs` y `fontdue`, así que el texto se ve igual que antes.
-use ttf_parser::{Face, GlyphId, OutlineBuilder};
+use skrifa::outline::{DrawSettings, OutlinePen};
+use skrifa::prelude::{LocationRef, Size};
+use skrifa::{FontRef, GlyphId, MetadataProvider};
 
 /// Posición y tamaño de una letra dibujada, en píxeles. `ymin` es el borde inferior
 /// respecto a la línea base (hacia arriba es positivo).
@@ -27,7 +29,11 @@ pub struct LineMetrics {
 
 #[derive(Clone)]
 pub struct Font {
-    face: Face<'static>,
+    face: FontRef<'static>,
+    /// Unidades de diseño por em, ascendente y descendente (en unidades).
+    units_per_em: f32,
+    ascent: f32,
+    descent: f32,
 }
 
 impl Font {
@@ -37,37 +43,56 @@ impl Font {
     /// así que la proyección no se cierra nunca.
     pub fn from_file(path: &std::path::Path) -> Option<Self> {
         let bytes = map_file(path)?;
+        let face = FontRef::new(bytes).ok()?;
+        let metrics = face.metrics(Size::unscaled(), LocationRef::default());
         Some(Self {
-            face: Face::parse(bytes, 0).ok()?,
+            face,
+            units_per_em: metrics.units_per_em.max(1) as f32,
+            ascent: metrics.ascent,
+            descent: metrics.descent,
         })
     }
 
     fn scale(&self, size: f32) -> f32 {
-        size / self.face.units_per_em() as f32
+        size / self.units_per_em
     }
 
     fn glyph(&self, c: char) -> GlyphId {
-        self.face.glyph_index(c).unwrap_or(GlyphId(0))
+        self.face.charmap().map(c).unwrap_or(GlyphId::NOTDEF)
+    }
+
+    /// Avance horizontal y caja de la letra, en unidades de la fuente.
+    fn glyph_box(&self, id: GlyphId) -> (f32, Option<skrifa::metrics::BoundingBox>) {
+        let glyphs = self
+            .face
+            .glyph_metrics(Size::unscaled(), LocationRef::default());
+        (
+            glyphs.advance_width(id).unwrap_or(0.0),
+            glyphs
+                .bounds(id)
+                .filter(|b| b.x_max > b.x_min || b.y_max > b.y_min),
+        )
     }
 
     pub fn horizontal_line_metrics(&self, size: f32) -> Option<LineMetrics> {
         let scale = self.scale(size);
         Some(LineMetrics {
-            ascent: self.face.ascender() as f32 * scale,
-            descent: self.face.descender() as f32 * scale,
+            ascent: self.ascent * scale,
+            descent: self.descent * scale,
         })
     }
 
     pub fn metrics(&self, c: char, size: f32) -> Metrics {
         let id = self.glyph(c);
         let scale = self.scale(size);
-        let advance_width = self.face.glyph_hor_advance(id).unwrap_or(0) as f32 * scale;
-        match self.face.glyph_bounding_box(id) {
+        let (advance, bbox) = self.glyph_box(id);
+        let advance_width = advance * scale;
+        match bbox {
             Some(bbox) => bounds(
-                bbox.x_min as f32 * scale,
-                bbox.y_min as f32 * scale,
-                bbox.x_max as f32 * scale,
-                bbox.y_max as f32 * scale,
+                bbox.x_min * scale,
+                bbox.y_min * scale,
+                bbox.x_max * scale,
+                bbox.y_max * scale,
                 advance_width,
             ),
             None => Metrics {
@@ -83,16 +108,25 @@ impl Font {
         let id = self.glyph(c);
         let scale = self.scale(size);
         let mut outline = Outline::default();
-        let Some(bbox) = self.face.outline_glyph(id, &mut outline) else {
+        let (advance, bbox) = self.glyph_box(id);
+        let drawn = self.face.outline_glyphs().get(id).is_some_and(|glyph| {
+            glyph
+                .draw(
+                    DrawSettings::unhinted(Size::unscaled(), LocationRef::default()),
+                    &mut outline,
+                )
+                .is_ok()
+        });
+        outline.close();
+        let Some(bbox) = bbox.filter(|_| drawn && !outline.contours.is_empty()) else {
             return (self.metrics(c, size), Vec::new());
         };
-        let advance_width = self.face.glyph_hor_advance(id).unwrap_or(0) as f32 * scale;
         let metrics = bounds(
-            bbox.x_min as f32 * scale,
-            bbox.y_min as f32 * scale,
-            bbox.x_max as f32 * scale,
-            bbox.y_max as f32 * scale,
-            advance_width,
+            bbox.x_min * scale,
+            bbox.y_min * scale,
+            bbox.x_max * scale,
+            bbox.y_max * scale,
+            advance * scale,
         );
         if metrics.width == 0 || metrics.height == 0 {
             return (metrics, Vec::new());
@@ -187,7 +221,7 @@ impl Outline {
     }
 }
 
-impl OutlineBuilder for Outline {
+impl OutlinePen for Outline {
     fn move_to(&mut self, x: f32, y: f32) {
         self.close();
         self.current.push((x, y));
