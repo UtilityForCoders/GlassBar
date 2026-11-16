@@ -87,7 +87,7 @@ El reloj muestra la hora y, debajo, la fecha corta en el formato regional del us
 
 Entre la flecha de iconos ocultos y la hora, el dock muestra el estado del sistema con los iconos de Windows 11 (Segoe Fluent Icons):
 
-- **Red:** Wi-Fi o cable según el adaptador en uso (si hay los dos, el cable, como Windows); atenuado si Windows indica que no hay acceso a Internet, y un globo tachado sin conexión. La intensidad de la señal Wi-Fi no se muestra.
+- **Red:** Wi-Fi o cable según el adaptador en uso (si hay los dos, el cable, como Windows); atenuado si Windows indica que no hay acceso a Internet, y un globo tachado sin conexión. Con Wi-Fi, el icono lleva de una a cuatro barras según la intensidad de la señal, que se lee cada 10 s.
 - **Volumen:** de cero a tres ondas según el nivel de la salida predeterminada, y una cruz si está silenciada. La rueda del ratón sobre el icono lo sube o lo baja de 2 % en 2 %.
 - **Batería:** solo en equipos con batería; el nivel en once pasos, con rayo mientras está enchufada.
 
