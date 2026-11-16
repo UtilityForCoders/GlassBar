@@ -23,7 +23,7 @@ use windows::Win32::UI::WindowsAndMessaging::{
 use crate::jumplist::WindowApp;
 use crate::spring::Spring;
 
-#[derive(Clone, serde::Serialize, serde::Deserialize)]
+#[derive(Clone, Debug, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
 pub struct AppEntry {
     pub name: String,
     pub command: String,

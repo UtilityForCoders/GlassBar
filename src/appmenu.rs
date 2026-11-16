@@ -465,6 +465,8 @@ pub const CMD_AUTOHIDE: u32 = 7;
 pub const CMD_TOP_BAR: u32 = 8;
 /// Abrir la ventana de configuración.
 pub const CMD_SETTINGS: u32 = 9;
+/// Mostrar los segundos en el reloj.
+pub const CMD_CLOCK_SECONDS: u32 = 10;
 /// Guardar la configuración en un archivo, y sustituirla por la de uno.
 pub const CMD_EXPORT: u32 = 11;
 pub const CMD_IMPORT: u32 = 12;

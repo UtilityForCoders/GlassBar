@@ -26,6 +26,8 @@ mod categories;
 mod clock;
 #[path = "../src/diag.rs"]
 mod diag;
+#[path = "../src/extras.rs"]
+mod extras;
 #[path = "../src/font.rs"]
 mod font;
 #[path = "../src/glass.rs"]
