@@ -54,6 +54,8 @@ mod textfield;
 mod update;
 #[path = "../src/usage.rs"]
 mod usage;
+#[path = "../src/wifi.rs"]
+mod wifi;
 
 use bar::BarState;
 
