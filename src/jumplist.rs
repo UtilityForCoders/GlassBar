@@ -364,13 +364,27 @@ const LIST_VERSIONS: [GUID; 2] = [
 
 /// La lista de destinos con la primera versión de la interfaz que admita.
 unsafe fn destination_list() -> Option<IInternalCustomDestinationList> {
+    const NAME: &str = "IInternalCustomDestinationList";
     let unknown: IUnknown =
-        CoCreateInstance(&CLSID_DESTINATION_LIST, None, CLSCTX_INPROC_SERVER).ok()?;
-    LIST_VERSIONS.iter().find_map(|iid| {
+        match CoCreateInstance(&CLSID_DESTINATION_LIST, None, CLSCTX_INPROC_SERVER) {
+            Ok(unknown) => unknown,
+            Err(error) => {
+                crate::diag::report(NAME, Err(format!("crear 0x{:08X}", error.code().0)));
+                return None;
+            }
+        };
+    let list = LIST_VERSIONS.iter().find_map(|iid| {
         let mut raw = std::ptr::null_mut();
         unknown.query(iid, &mut raw).ok().ok()?;
         (!raw.is_null()).then(|| IInternalCustomDestinationList::from_raw(raw))
-    })
+    });
+    crate::diag::report(
+        NAME,
+        list.as_ref()
+            .map(|_| ())
+            .ok_or_else(|| "ninguna versión conocida".into()),
+    );
+    list
 }
 
 /// La lista propia de la app, si declaró una. `None` si no la tiene o si la

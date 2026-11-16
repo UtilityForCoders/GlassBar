@@ -267,7 +267,10 @@ fn code(result: HRESULT) -> String {
 /// Windows al elegir "Dispositivo predeterminado"). Si falla, dice en qué paso.
 pub fn set_default(id: &str) -> Result<(), String> {
     let id = id.to_string();
-    in_sta(move || set_default_here(&id)).unwrap_or_else(|| Err("hilo de audio".into()))
+    let result =
+        in_sta(move || set_default_here(&id)).unwrap_or_else(|| Err("hilo de audio".into()));
+    crate::diag::report("IPolicyConfig", result.clone());
+    result
 }
 
 fn set_default_here(id: &str) -> Result<(), String> {
@@ -357,9 +360,11 @@ impl Policy {
                 RoGetActivationFactory(std::mem::transmute_copy(&class), &iid, &mut factory)
             };
             if result.is_ok() && !factory.is_null() {
+                crate::diag::report("AudioPolicyConfig", Ok(()));
                 return Some(Self { factory });
             }
         }
+        crate::diag::report("AudioPolicyConfig", Err("ninguna versión conocida".into()));
         None
     }
 

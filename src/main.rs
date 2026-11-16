@@ -18,6 +18,7 @@ mod calendar;
 mod catalog;
 mod categories;
 mod clock;
+mod diag;
 mod font;
 mod frames;
 mod games;
@@ -6535,6 +6536,7 @@ fn main() -> Result<()> {
     if guard::run(&std::env::args().collect::<Vec<_>>()) {
         return Ok(());
     }
+    diag::start();
     unsafe {
         if std::env::args().any(|arg| arg == "--replace") {
             if let Ok(old) =

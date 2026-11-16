@@ -153,6 +153,10 @@ La transparencia usa composición alfa real; el desenfoque de fondo solo aparece
 
 El dock se pone por encima de las demás ventanas "siempre encima" al mostrarse y, mientras está a la vista, cada vez que cambia la ventana activa. Si la que se activa también es "siempre encima" (un vídeo flotante, "Siempre visible" de PowerToys), no se le quita el sitio. Con una app a pantalla completa en su monitor no aparece al llevar el ratón al borde; la tecla Windows sigue abriendo el lanzador. Cuenta como pantalla completa la ventana activa que cubre el monitor sin barra de título, un juego a pantalla completa exclusiva o el modo presentación de Windows (aunque no tengan el foco) y, en el modo siempre visible, lo que Windows avisa a su barra de aplicación.
 
+## Diagnóstico
+
+GlassBar usa varias interfaces internas de Windows sin documentar (la jump list, la salida de audio por aplicación, el modo avión), que una actualización de Windows puede cambiar. En cada arranque escribe en `%LOCALAPPDATA%\GlassBar\diagnostico.log` su versión, la compilación de Windows y, la primera vez que usa cada interfaz, si respondió o el código con que falló. Solo guarda nombres de interfaces y códigos de error; si algo deja de funcionar tras actualizar Windows, ese archivo dice qué fue.
+
 ## Desarrollo
 
 Requiere Windows, Rust y las herramientas de compilación de Visual Studio.
