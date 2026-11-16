@@ -8,7 +8,7 @@ use windows::Win32::UI::Accessibility::{SetWinEventHook, UnhookWinEvent, HWINEVE
 use windows::Win32::UI::WindowsAndMessaging::{
     GetClassNameW, GetForegroundWindow, GetWindowLongW, GetWindowRect, GetWindowThreadProcessId,
     PostMessageW, SetWindowPos, EVENT_SYSTEM_FOREGROUND, GWL_STYLE, HWND_TOPMOST, SWP_NOACTIVATE,
-    SWP_NOMOVE, SWP_NOSIZE, WINEVENT_OUTOFCONTEXT, WS_CAPTION,
+    SWP_NOMOVE, SWP_NOSIZE, SWP_NOZORDER, WINEVENT_OUTOFCONTEXT, WS_CAPTION,
 };
 
 static TARGET: AtomicIsize = AtomicIsize::new(0);
@@ -201,8 +201,81 @@ pub fn fullscreen_app(monitor: RECT) -> bool {
             return false;
         }
         let style = GetWindowLongW(window, GWL_STYLE) as u32;
-        covers(rect, monitor, style & WS_CAPTION.0 == WS_CAPTION.0)
+        let captioned = style & WS_CAPTION.0 == WS_CAPTION.0;
+        if covers(rect, monitor, captioned) {
+            return true;
+        }
+        let Some((screen, work)) = monitor_of(window) else {
+            return false;
+        };
+        if !overlaps(screen, monitor) {
+            return false;
+        }
+        // Juegos "sin bordes" que se desplazaron con la franja reservada de la barra:
+        // tienen el tamaño del monitor pero empiezan más abajo. Se devuelven a la
+        // esquina del monitor y cuentan como pantalla completa.
+        if shifted_fullscreen(rect, screen, captioned) {
+            let _ = SetWindowPos(
+                window,
+                None,
+                screen.left,
+                screen.top,
+                0,
+                0,
+                SWP_NOSIZE | SWP_NOZORDER | SWP_NOACTIVATE,
+            );
+            return true;
+        }
+        // Un juego que Windows reconoce, sin título y llenando al menos el área de
+        // trabajo, también: así no hace falta que tape el monitor entero.
+        fills_work_area(rect, work, captioned) && crate::games::is_game(process)
     }
+}
+
+/// Rectángulo del monitor donde está casi toda `window` y su área de trabajo.
+fn monitor_of(window: HWND) -> Option<(RECT, RECT)> {
+    use windows::Win32::Graphics::Gdi::{
+        GetMonitorInfoW, MonitorFromWindow, MONITORINFO, MONITOR_DEFAULTTONULL,
+    };
+    unsafe {
+        let handle = MonitorFromWindow(window, MONITOR_DEFAULTTONULL);
+        if handle.is_invalid() {
+            return None;
+        }
+        let mut info = MONITORINFO {
+            cbSize: std::mem::size_of::<MONITORINFO>() as u32,
+            ..Default::default()
+        };
+        GetMonitorInfoW(handle, &mut info)
+            .as_bool()
+            .then_some((info.rcMonitor, info.rcWork))
+    }
+}
+
+/// Sin título y ocupando, como poco, toda el área de trabajo: un juego a pantalla
+/// completa aunque la franja de una barra lo deje más bajo. Un lanzador o un juego
+/// en ventana (más pequeños o con título) no cuentan.
+fn fills_work_area(window: RECT, work: RECT, captioned: bool) -> bool {
+    !captioned
+        && window.left <= work.left
+        && window.top <= work.top
+        && window.right >= work.right
+        && window.bottom >= work.bottom
+}
+
+/// Una ventana sin título con el tamaño exacto del monitor, movida un poco de su
+/// esquina: un juego a pantalla completa sin bordes que Windows o el propio juego
+/// corrió por la franja de una barra. Las apps maximizadas sin título (VS Code,
+/// Spotify) ocupan el área de trabajo, más pequeña, y no cuentan.
+fn shifted_fullscreen(window: RECT, monitor: RECT, captioned: bool) -> bool {
+    let (width, height) = (monitor.right - monitor.left, monitor.bottom - monitor.top);
+    let (dx, dy) = (window.left - monitor.left, window.top - monitor.top);
+    !captioned
+        && window.right - window.left == width
+        && window.bottom - window.top == height
+        && (dx, dy) != (0, 0)
+        && dx.abs() < width / 4
+        && dy.abs() < height / 4
 }
 
 /// El escritorio también ocupa todo el monitor sin título, pero no es pantalla completa.
@@ -260,5 +333,52 @@ mod tests {
         assert!(!covers(rect(0, 0, 1920, 1040), monitor, false));
         // A pantalla completa en otro monitor.
         assert!(!covers(rect(1920, 0, 3840, 1080), monitor, false));
+    }
+
+    #[test]
+    fn borderless_games_pushed_down_by_the_bar_count_as_fullscreen() {
+        let rect = |left, top, right, bottom| RECT {
+            left,
+            top,
+            right,
+            bottom,
+        };
+        let monitor = rect(0, 0, 1920, 1080);
+        // Rocket League sin bordes, 56 px más abajo por la barra superior.
+        let game = rect(0, 56, 1920, 1136);
+        assert!(!covers(game, monitor, false));
+        assert!(shifted_fullscreen(game, monitor, false));
+        // En su sitio ya lo cubre `covers`; no hay nada que mover.
+        assert!(!shifted_fullscreen(monitor, monitor, false));
+        // Maximizada sin título (VS Code): ocupa el área de trabajo, no el monitor.
+        assert!(!shifted_fullscreen(rect(0, 28, 1920, 1080), monitor, false));
+        // Con título no es un juego sin bordes.
+        assert!(!shifted_fullscreen(game, monitor, true));
+        // Del tamaño del monitor pero lejos de su esquina: no se toca.
+        assert!(!shifted_fullscreen(
+            rect(0, 600, 1920, 1680),
+            monitor,
+            false
+        ));
+        // En un segundo monitor a la izquierda.
+        let left = rect(-1920, 0, 0, 1080);
+        assert!(shifted_fullscreen(rect(-1920, 56, 0, 1136), left, false));
+    }
+
+    #[test]
+    fn known_games_only_need_to_fill_the_work_area() {
+        let rect = |left, top, right, bottom| RECT {
+            left,
+            top,
+            right,
+            bottom,
+        };
+        let work = rect(0, 28, 1920, 1080);
+        // Juego sin bordes encajado bajo la barra superior.
+        assert!(fills_work_area(work, work, false));
+        assert!(fills_work_area(rect(0, 0, 1920, 1080), work, false));
+        // Lanzador sin título (el cliente de League of Legends) o juego en ventana.
+        assert!(!fills_work_area(rect(320, 180, 1600, 900), work, false));
+        assert!(!fills_work_area(rect(-8, 20, 1928, 1088), work, true));
     }
 }

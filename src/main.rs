@@ -20,6 +20,7 @@ mod categories;
 mod clock;
 mod font;
 mod frames;
+mod games;
 mod glass;
 mod guard;
 mod icons;
