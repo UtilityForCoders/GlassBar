@@ -26,6 +26,9 @@ const PICKER_H: f32 = 28.0;
 const SLIDER_W: f32 = 150.0;
 /// Botón de las actualizaciones.
 const BUTTON_W: f32 = 150.0;
+/// Botones de la copia de la configuración, uno junto al otro.
+const BACKUP_W: f32 = 72.0;
+const BACKUP_GAP: f32 = 6.0;
 const TEXT: f32 = 13.0;
 
 /// Interruptores de la sección del dock.
@@ -47,6 +50,9 @@ pub enum Hit {
     Appearance(State, bool),
     Opacity,
     Update,
+    /// Guardar la configuración en un archivo, o sustituirla por la de uno.
+    Export,
+    Import,
     Exit,
 }
 
@@ -76,6 +82,8 @@ enum Line {
     Look(State),
     Opacity,
     Update,
+    /// Copia de la configuración: "Exportar" e "Importar".
+    Backup,
     Exit,
 }
 
@@ -91,6 +99,7 @@ fn lines() -> Vec<Line> {
     lines.push(Line::Opacity);
     lines.push(Line::Section("GlassBar"));
     lines.push(Line::Update);
+    lines.push(Line::Backup);
     lines.push(Line::Exit);
     lines
 }
@@ -130,6 +139,15 @@ fn switch_label(switch: Switch) -> &'static str {
 /// Borde izquierdo de los controles alineados a la derecha.
 fn right_edge() -> f32 {
     WIDTH - PAD
+}
+
+/// Borde izquierdo de "Exportar" y de "Importar".
+fn backup_buttons() -> [(Hit, f32); 2] {
+    let right = right_edge();
+    [
+        (Hit::Export, right - BACKUP_W * 2.0 - BACKUP_GAP),
+        (Hit::Import, right - BACKUP_W),
+    ]
 }
 
 impl SettingsState {
@@ -184,6 +202,10 @@ impl SettingsState {
                 let inside = (right - BUTTON_W..right).contains(&x);
                 (inside && !busy).then_some(Hit::Update)
             }
+            Line::Backup => backup_buttons()
+                .into_iter()
+                .find(|(_, left)| (*left..*left + BACKUP_W).contains(&x))
+                .map(|(hit, _)| hit),
             Line::Exit => {
                 let _ = top;
                 Some(Hit::Exit)
@@ -205,7 +227,9 @@ impl SettingsState {
     /// La orden del menú que corresponde a pulsar `hit`, si la tiene. Cerrar y la
     /// barra de la opacidad los atiende la ventana.
     pub fn command(&self, hit: Hit) -> Option<u32> {
-        use crate::appmenu::{CMD_AUTOHIDE, CMD_AUTOSTART, CMD_EXIT, CMD_TOP_BAR, CMD_UPDATE};
+        use crate::appmenu::{
+            CMD_AUTOHIDE, CMD_AUTOSTART, CMD_EXIT, CMD_EXPORT, CMD_IMPORT, CMD_TOP_BAR, CMD_UPDATE,
+        };
         Some(match hit {
             Hit::Switch(Switch::AutoHide) => CMD_AUTOHIDE,
             Hit::Switch(Switch::TopBar) => CMD_TOP_BAR,
@@ -224,6 +248,8 @@ impl SettingsState {
             }
             Hit::Update if self.updates.available.is_some() => CMD_UPDATE,
             Hit::Update => crate::appmenu::CMD_UPDATE_CHECK,
+            Hit::Export => CMD_EXPORT,
+            Hit::Import => CMD_IMPORT,
             Hit::Exit => CMD_EXIT,
             Hit::Close | Hit::Opacity => return None,
         })
@@ -382,6 +408,35 @@ impl SettingsState {
                     let tx = s(left + BUTTON_W / 2.0) - text_width(&label, size) / 2.0;
                     let opacity = if enabled { 0.95 } else { 0.5 };
                     draw_text_on_baseline(image, &label, tx, baseline, size, opacity);
+                }
+                Line::Backup => {
+                    draw_text_on_baseline(
+                        image,
+                        "Copia de la configuración",
+                        s(PAD + 2.0),
+                        baseline,
+                        size,
+                        0.95,
+                    );
+                    for (hit, left) in backup_buttons() {
+                        let alpha = if row_hover(hit) { 34 } else { 18 };
+                        fill_rounded(
+                            image,
+                            [255, 255, 255, alpha],
+                            s(left),
+                            s(cy - PICKER_H / 2.0),
+                            s(BACKUP_W),
+                            s(PICKER_H),
+                            s(6.0),
+                        );
+                        let label = if hit == Hit::Export {
+                            "Exportar"
+                        } else {
+                            "Importar"
+                        };
+                        let tx = s(left + BACKUP_W / 2.0) - text_width(label, size) / 2.0;
+                        draw_text_on_baseline(image, label, tx, baseline, size, 0.95);
+                    }
                 }
                 Line::Exit => {
                     if row_hover(Hit::Exit) {
