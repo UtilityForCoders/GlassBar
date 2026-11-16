@@ -853,6 +853,15 @@ impl QuickWindow {
         }
         self.render();
     }
+    /// Lleva el volumen de una aplicación del mezclador a `value` (de 0 a 1).
+    fn set_app_volume(&mut self, app: usize, value: f32) {
+        if let Some(app) = self.model.system.audio.apps.get_mut(app) {
+            // Se ve al instante; el hilo de sistema lo aplica.
+            app.volume = value;
+            self.backend.set_app_volume(app.pids.clone(), value);
+        }
+        self.render();
+    }
 }
 impl Drop for QuickWindow {
     fn drop(&mut self) {
@@ -1103,6 +1112,7 @@ unsafe extern "system" fn quick_wndproc(
             with_app(|app| {
                 if let Some(panel) = &mut app.quick {
                     panel.model.dragging = None;
+                    panel.model.app_drag = None;
                     panel.model.scroll_drag = None;
                 }
             });
@@ -1133,6 +1143,10 @@ unsafe extern "system" fn quick_wndproc(
                     panel.set_slider(slider, quick::QuickState::slider_value(x));
                     return;
                 }
+                if let Some(app) = panel.model.app_drag {
+                    panel.set_app_volume(app, quick::QuickState::app_slider_value(x));
+                    return;
+                }
                 if panel.model.scroll_drag.is_some() {
                     panel.model.drag_scrollbar(y);
                     panel.render();
@@ -1157,6 +1171,11 @@ unsafe extern "system" fn quick_wndproc(
                         panel.model.dragging = Some(slider);
                         panel.set_slider(slider, quick::QuickState::slider_value(x));
                     }
+                    Some(quick::Hit::AppVolume(app)) => {
+                        SetCapture(hwnd);
+                        panel.model.app_drag = Some(app);
+                        panel.set_app_volume(app, quick::QuickState::app_slider_value(x));
+                    }
                     Some(quick::Hit::Scrollbar) => {
                         SetCapture(hwnd);
                         panel.model.grab_scrollbar(y);
@@ -1171,7 +1190,9 @@ unsafe extern "system" fn quick_wndproc(
                 let Some(panel) = app.quick.as_mut().filter(|p| p.visible) else {
                     return;
                 };
-                if panel.model.dragging.take().is_some() || panel.model.scroll_drag.take().is_some()
+                if panel.model.dragging.take().is_some()
+                    || panel.model.app_drag.take().is_some()
+                    || panel.model.scroll_drag.take().is_some()
                 {
                     let _ = ReleaseCapture();
                     panel.render();
@@ -1190,6 +1211,14 @@ unsafe extern "system" fn quick_wndproc(
                 };
                 let steps = ((wparam.0 >> 16) & 0xffff) as i16 as f32 / 120.0;
                 // En las listas, la rueda las desplaza (algo más de una fila por muesca).
+                // Sobre la barra del volumen de una aplicación, la mueve.
+                if let Some(quick::Hit::AppVolume(app)) = panel.model.hovered {
+                    if let Some(value) = panel.model.app_volume(app) {
+                        let value = ((value * 50.0).round() + steps).clamp(0.0, 50.0) / 50.0;
+                        panel.set_app_volume(app, value);
+                    }
+                    return;
+                }
                 if panel.model.view != quick::View::Main {
                     panel.model.scroll_list(-steps * 60.0);
                     let (x, y) = {
@@ -1250,6 +1279,15 @@ unsafe extern "system" fn quick_wndproc(
                         }
                         0x25 | 0x27 => {
                             let step = if wparam.0 == 0x25 { -1 } else { 1 };
+                            if let Some(quick::Hit::AppVolume(app)) = panel.model.hovered {
+                                if let Some(value) = panel.model.app_volume(app) {
+                                    let value = ((value * 50.0).round() + step as f32)
+                                        .clamp(0.0, 50.0)
+                                        / 50.0;
+                                    panel.set_app_volume(app, value);
+                                }
+                                return;
+                            }
                             let slider = match panel.model.hovered {
                                 Some(quick::Hit::Slider(slider)) => Some(slider),
                                 _ => None,

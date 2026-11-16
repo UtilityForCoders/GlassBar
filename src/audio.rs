@@ -30,6 +30,8 @@ pub struct App {
     pub pids: Vec<u32>,
     /// Salida elegida para ella; `None` si usa la predeterminada.
     pub output: Option<String>,
+    /// Su volumen en el mezclador, de 0 a 1 (el más alto de sus sesiones).
+    pub volume: f32,
     pub icon: Option<Pixmap>,
 }
 
@@ -92,7 +94,7 @@ pub fn read(icons: &mut std::collections::HashMap<String, Option<Pixmap>>) -> Mi
         let parents = processes();
         let mut apps: Vec<App> = Vec::new();
         for output in &outputs {
-            for pid in session_processes(&enumerator, &output.id) {
+            for (pid, volume) in session_processes(&enumerator, &output.id) {
                 // El audio de WebView2 se atribuye a la aplicación que lo usa.
                 let owner = owner(pid, &parents);
                 let Some((exe, app_id)) = crate::apps::process_info(owner) else {
@@ -105,6 +107,7 @@ pub fn read(icons: &mut std::collections::HashMap<String, Option<Pixmap>>) -> Mi
                     if !app.pids.contains(&pid) {
                         app.pids.push(pid);
                     }
+                    app.volume = app.volume.max(volume);
                     continue;
                 }
                 let name = shell
@@ -126,6 +129,7 @@ pub fn read(icons: &mut std::collections::HashMap<String, Option<Pixmap>>) -> Mi
                     output: policy.as_ref().and_then(|p| p.get(pid)),
                     path: key,
                     pids: vec![pid],
+                    volume,
                     icon,
                 });
             }
@@ -141,22 +145,25 @@ pub fn read(icons: &mut std::collections::HashMap<String, Option<Pixmap>>) -> Mi
     }
 }
 
-/// Procesos con una sesión de audio viva en la salida `id` (sin los sonidos del
-/// sistema).
-unsafe fn session_processes(enumerator: &IMMDeviceEnumerator, id: &str) -> Vec<u32> {
+/// Sesiones de audio vivas en la salida `id` (sin los sonidos del sistema): el
+/// proceso de cada una y su control de volumen.
+unsafe fn sessions(
+    enumerator: &IMMDeviceEnumerator,
+    id: &str,
+) -> Vec<(u32, windows::Win32::Media::Audio::ISimpleAudioVolume)> {
     use windows::Win32::Media::Audio::{
-        AudioSessionStateExpired, IAudioSessionControl2, IAudioSessionManager2,
+        AudioSessionStateExpired, IAudioSessionControl2, IAudioSessionManager2, ISimpleAudioVolume,
     };
     let wide: Vec<u16> = id.encode_utf16().chain(Some(0)).collect();
-    let mut pids = Vec::new();
+    let mut list = Vec::new();
     let Ok(device) = enumerator.GetDevice(PCWSTR(wide.as_ptr())) else {
-        return pids;
+        return list;
     };
     let Ok(manager) = device.Activate::<IAudioSessionManager2>(CLSCTX_ALL, None) else {
-        return pids;
+        return list;
     };
     let Ok(sessions) = manager.GetSessionEnumerator() else {
-        return pids;
+        return list;
     };
     for index in 0..sessions.GetCount().unwrap_or(0) {
         let Ok(control) = sessions
@@ -173,13 +180,47 @@ unsafe fn session_processes(enumerator: &IMMDeviceEnumerator, id: &str) -> Vec<u
         {
             continue;
         }
-        if let Ok(pid) = control.GetProcessId() {
-            if pid != 0 && !pids.contains(&pid) {
-                pids.push(pid);
-            }
+        let Ok(pid) = control.GetProcessId() else {
+            continue;
+        };
+        if let (true, Ok(volume)) = (pid != 0, control.cast::<ISimpleAudioVolume>()) {
+            list.push((pid, volume));
+        }
+    }
+    list
+}
+
+/// Procesos con una sesión de audio viva en la salida `id`, con el volumen más alto
+/// de sus sesiones.
+unsafe fn session_processes(enumerator: &IMMDeviceEnumerator, id: &str) -> Vec<(u32, f32)> {
+    let mut pids: Vec<(u32, f32)> = Vec::new();
+    for (pid, volume) in sessions(enumerator, id) {
+        let level = volume.GetMasterVolume().unwrap_or(1.0).clamp(0.0, 1.0);
+        match pids.iter_mut().find(|(known, _)| *known == pid) {
+            Some((_, known)) => *known = known.max(level),
+            None => pids.push((pid, level)),
         }
     }
     pids
+}
+
+/// Pone el volumen (de 0 a 1) de las sesiones de audio de los procesos `pids`, en
+/// todas las salidas: es el mezclador de volumen de Windows, con su API pública.
+pub fn set_app_volume(pids: &[u32], level: f32) {
+    unsafe {
+        let Ok(enumerator) =
+            CoCreateInstance::<_, IMMDeviceEnumerator>(&MMDeviceEnumerator, None, CLSCTX_ALL)
+        else {
+            return;
+        };
+        for output in outputs(&enumerator).0 {
+            for (pid, volume) in sessions(&enumerator, &output.id) {
+                if pids.contains(&pid) {
+                    let _ = volume.SetMasterVolume(level.clamp(0.0, 1.0), std::ptr::null());
+                }
+            }
+        }
+    }
 }
 
 /// Padre y nombre del ejecutable de cada proceso en marcha.
