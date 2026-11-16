@@ -33,6 +33,7 @@ const TEXT: f32 = 13.0;
 pub enum Switch {
     AutoHide,
     TopBar,
+    ClockSeconds,
     Autostart,
 }
 
@@ -88,6 +89,7 @@ fn lines() -> Vec<Line> {
         Line::Switch(Switch::AutoHide),
         Line::DockSize,
         Line::Switch(Switch::TopBar),
+        Line::Switch(Switch::ClockSeconds),
         Line::Switch(Switch::Autostart),
         Line::Section("Apariencia según lo que hay en pantalla"),
     ];
@@ -127,6 +129,7 @@ fn switch_label(switch: Switch) -> &'static str {
     match switch {
         Switch::AutoHide => "Ocultar el dock automáticamente",
         Switch::TopBar => "Controles en una barra superior",
+        Switch::ClockSeconds => "Mostrar los segundos en el reloj",
         Switch::Autostart => "Iniciar con Windows",
     }
 }
@@ -151,6 +154,7 @@ impl SettingsState {
         match switch {
             Switch::AutoHide => !self.styles.always_visible(),
             Switch::TopBar => self.styles.top_bar(),
+            Switch::ClockSeconds => self.styles.clock_seconds(),
             Switch::Autostart => self.autostart,
         }
     }
@@ -215,10 +219,13 @@ impl SettingsState {
     /// La orden del menú que corresponde a pulsar `hit`, si la tiene. Cerrar y la
     /// barra de la opacidad los atiende la ventana.
     pub fn command(&self, hit: Hit) -> Option<u32> {
-        use crate::appmenu::{CMD_AUTOHIDE, CMD_AUTOSTART, CMD_EXIT, CMD_TOP_BAR, CMD_UPDATE};
+        use crate::appmenu::{
+            CMD_AUTOHIDE, CMD_AUTOSTART, CMD_CLOCK_SECONDS, CMD_EXIT, CMD_TOP_BAR, CMD_UPDATE,
+        };
         Some(match hit {
             Hit::Switch(Switch::AutoHide) => CMD_AUTOHIDE,
             Hit::Switch(Switch::TopBar) => CMD_TOP_BAR,
+            Hit::Switch(Switch::ClockSeconds) => CMD_CLOCK_SECONDS,
             Hit::Switch(Switch::Autostart) => CMD_AUTOSTART,
             Hit::Enabled(state) => Choice::Toggle(state).command(),
             Hit::Appearance(state, next) => {

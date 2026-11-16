@@ -78,6 +78,48 @@ pub fn minute() -> u64 {
         + now.wMinute as u64
 }
 
+/// Si el reloj muestra los segundos (ajuste de la configuración).
+static SECONDS: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
+
+pub fn set_seconds(on: bool) {
+    SECONDS.store(on, std::sync::atomic::Ordering::Relaxed);
+}
+
+/// La hora en el formato regional del usuario (24 horas o 12 con "a. m."/"p. m."),
+/// con segundos si están activados, como el reloj de la barra de Windows.
+fn format_time(time: &windows::Win32::Foundation::SYSTEMTIME) -> String {
+    use windows::Win32::Globalization::{GetTimeFormatEx, TIME_FORMAT_FLAGS, TIME_NOSECONDS};
+    let seconds = SECONDS.load(std::sync::atomic::Ordering::Relaxed);
+    let flags = if seconds {
+        TIME_FORMAT_FLAGS(0)
+    } else {
+        TIME_NOSECONDS
+    };
+    let mut buffer = [0u16; 64];
+    // Sin nombre de configuración regional ni formato: los del usuario.
+    let len = unsafe {
+        GetTimeFormatEx(
+            windows::core::PCWSTR::null(),
+            flags,
+            Some(time),
+            windows::core::PCWSTR::null(),
+            Some(&mut buffer),
+        )
+    };
+    if len <= 1 {
+        return fallback_time(time.wHour, time.wMinute, seconds.then_some(time.wSecond));
+    }
+    String::from_utf16_lossy(&buffer[..len as usize - 1])
+}
+
+/// La hora en 24 horas, por si Windows no la da con el formato regional.
+fn fallback_time(hour: u16, minute: u16, second: Option<u16>) -> String {
+    match second {
+        Some(second) => format!("{hour:02}:{minute:02}:{second:02}"),
+        None => format!("{hour:02}:{minute:02}"),
+    }
+}
+
 /// Opacidad de la fecha: queda por detrás de la hora.
 const DATE_OPACITY: f32 = 0.75;
 
@@ -106,13 +148,14 @@ impl ClockRenderer {
     }
     /// Si la hora mostrada ya no es la actual (cambió el minuto) y hay que redibujar.
     pub fn outdated(&self) -> bool {
-        let now = unsafe { GetLocalTime() };
-        let time = format!("{:02}:{:02}", now.wHour, now.wMinute);
+        let time = format_time(&unsafe { GetLocalTime() });
         self.cached.borrow().as_ref().is_none_or(|c| c.time != time)
     }
-    pub fn draw(&self, target: &mut Pixmap, cx: f32, cy: f32, scale: f32) {
+    /// `room` es el ancho disponible: una hora más larga (12 horas con segundos)
+    /// se dibuja más pequeña para no salirse.
+    pub fn draw(&self, target: &mut Pixmap, cx: f32, cy: f32, scale: f32, room: f32) {
         let now = unsafe { GetLocalTime() };
-        let time = format!("{:02}:{:02}", now.wHour, now.wMinute);
+        let time = format_time(&now);
         let date = format_date(&now, false);
         // La hora, más grande; la fecha, más pequeña y atenuada debajo.
         let pixels = (14.0 * scale).round().max(8.0) as u32;
@@ -121,9 +164,17 @@ impl ClockRenderer {
             .as_ref()
             .is_some_and(|c| c.time == time && c.date == date && c.pixels == pixels)
         {
+            let fitted = |text: &str, size: f32| {
+                let line = rasterize_line(system_font(), text, size);
+                let width = line.0.width() as f32;
+                if width <= room {
+                    return line;
+                }
+                rasterize_line(system_font(), text, (size * room / width).floor().max(6.0))
+            };
             let lines = [
-                rasterize_line(system_font(), &time, pixels as f32),
-                rasterize_line(system_font(), &date, date_size(pixels)),
+                fitted(&time, pixels as f32),
+                fitted(&date, date_size(pixels)),
             ];
             *cached = Some(Clock {
                 time,
@@ -189,7 +240,7 @@ pub fn day_and_time() -> String {
     } else {
         format_date(&now, false)
     };
-    format!("{day}  {:02}:{:02}", now.wHour, now.wMinute)
+    format!("{day}  {}", format_time(&now))
 }
 
 fn format_date(date: &windows::Win32::Foundation::SYSTEMTIME, long: bool) -> String {
@@ -377,6 +428,32 @@ pub fn fit_text(text: &str, size: f32, width: f32) -> String {
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn time_follows_the_regional_format_and_the_seconds_setting() {
+        use windows::Win32::Foundation::SYSTEMTIME;
+        let time = SYSTEMTIME {
+            wYear: 2026,
+            wMonth: 11,
+            wDay: 16,
+            wHour: 21,
+            wMinute: 5,
+            wSecond: 7,
+            ..Default::default()
+        };
+        // El formato es el del usuario (24 horas o 12 con a. m./p. m.): lo seguro es
+        // que lleva los minutos y, solo con el ajuste, los segundos.
+        super::set_seconds(false);
+        let short = super::format_time(&time);
+        assert!(short.contains("05") && !short.contains("07"), "{short}");
+        super::set_seconds(true);
+        let long = super::format_time(&time);
+        assert!(long.contains("05") && long.contains("07"), "{long}");
+        super::set_seconds(false);
+        // Sin formato regional, 24 horas.
+        assert_eq!(super::fallback_time(9, 5, None), "09:05");
+        assert_eq!(super::fallback_time(21, 5, Some(7)), "21:05:07");
+    }
+
     #[test]
     fn clock_uses_smooth_system_glyphs() {
         let image = super::rasterize("09:41", 13.0);
