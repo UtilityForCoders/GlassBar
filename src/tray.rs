@@ -15,6 +15,15 @@ use windows::Win32::UI::WindowsAndMessaging::{
 
 pub const WM_TRAY: u32 = WM_APP + 1;
 const TRAY_ID: u32 = 101;
+/// Número del ícono de GlassBar entre sus recursos (`1 ICON` en `app.rc`).
+const ICON_RESOURCE: usize = 1;
+
+/// Un recurso por su número, como `MAKEINTRESOURCE`: el número va en el lugar del
+/// puntero al nombre. No es un puntero colgante: `std::ptr::dangling::<u16>()` vale 2
+/// (la alineación de `u16`) y pediría el recurso 2, que no existe.
+fn resource(id: usize) -> PCWSTR {
+    PCWSTR(id as *const u16)
+}
 
 pub struct Tray {
     hwnd: HWND,
@@ -25,8 +34,7 @@ impl Tray {
     pub fn new(hwnd: HWND) -> Self {
         let icon = unsafe {
             let instance = GetModuleHandleW(None).unwrap_or_default();
-            // Carga el ícono incrustado en el recurso 1 (ver app.rc)
-            LoadIconW(Some(instance.into()), PCWSTR(std::ptr::dangling::<u16>()))
+            LoadIconW(Some(instance.into()), resource(ICON_RESOURCE))
                 .or_else(|_| LoadIconW(None, IDI_APPLICATION))
                 .unwrap_or_default()
         };
@@ -103,5 +111,20 @@ impl Drop for Tray {
                 let _ = DestroyIcon(self.icon);
             }
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn icon_resource_is_the_one_declared_in_app_rc() {
+        assert_eq!(resource(ICON_RESOURCE).0 as usize, 1);
+        let declared = include_str!("../app.rc")
+            .lines()
+            .find_map(|line| line.trim().strip_suffix(" ICON \"assets/icon.ico\""))
+            .and_then(|id| id.parse::<usize>().ok());
+        assert_eq!(declared, Some(ICON_RESOURCE));
     }
 }
