@@ -35,6 +35,10 @@ pub struct AppItem {
     /// Con qué se agrupan las ventanas abiertas sin anclar: el ejecutable o, si la
     /// ventana es una app aparte (una app web), su AppUserModelID.
     key: String,
+    /// AppUserModelID con el que la barra de Windows reconoce sus ventanas: el de su
+    /// entrada del menú Inicio o el que guarda su acceso directo. Sin él, las
+    /// ventanas se reconocen solo por el ejecutable.
+    app_id: Option<String>,
     pub icon: Option<Pixmap>,
     /// Icono ya reducido al tamaño en pantalla.
     scaled: RefCell<Option<Pixmap>>,
@@ -74,8 +78,13 @@ impl AppItem {
                 .map(|s| s.to_string_lossy().into_owned())
                 .unwrap_or_default()
         };
+        let app_id = match entry.command.strip_prefix("shell:AppsFolder\\") {
+            Some(id) => Some(id.to_string()),
+            None => crate::jumplist::shortcut_app_id(&entry.command),
+        };
         Self {
             key: entry.command.clone(),
+            app_id,
             entry,
             process_name,
             icon,
@@ -140,6 +149,7 @@ impl AppItem {
             entry: AppEntry { name, command },
             process_name: file_name(&window.exe).to_string(),
             key: window.group_key().to_string(),
+            app_id: window.app_id.clone(),
             icon,
             scaled: RefCell::new(None),
             is_running: true,
@@ -414,6 +424,10 @@ pub struct OpenWindow {
     pub exe: String,
     /// AppUserModelID de las apps empaquetadas (Store) o de las apps web.
     pub app_id: Option<String>,
+    /// AppUserModelID que declara la propia ventana, sea o no una app aparte: los
+    /// programas lo fijan para que la barra los reconozca aunque su acceso directo
+    /// abra otro ejecutable (los que se actualizan solos, como Discord o Slack).
+    pub declared: Option<String>,
     /// La ventana es una app aparte del programa que la abre: una app web instalada
     /// desde el navegador (PWA), que comparte proceso con él. Se agrupa por su
     /// AppUserModelID, no por el ejecutable, como en la barra de Windows.
@@ -430,11 +444,11 @@ impl OpenWindow {
     }
 
     fn belongs_to(&self, app: &AppItem) -> bool {
-        let by_id = self.app_id.as_ref().is_some_and(|id| {
-            app.entry
-                .command
-                .strip_prefix("shell:AppsFolder\\")
-                .is_some_and(|c| c.eq_ignore_ascii_case(id))
+        let by_id = app.app_id.as_ref().is_some_and(|id| {
+            [&self.app_id, &self.declared]
+                .into_iter()
+                .flatten()
+                .any(|window| window.eq_ignore_ascii_case(id))
         });
         // Una app web no es del navegador anclado: solo de su propia entrada.
         if let Some(web) = &self.web {
@@ -670,18 +684,21 @@ unsafe extern "system" fn collect_window(hwnd: HWND, lparam: LPARAM) -> BOOL {
     if let Some((exe, app_id)) = taskbar_window_process(hwnd) {
         let hwnd = hwnd.0 as isize;
         // Las apps web comparten proceso con el navegador: solo su ventana dice cuál es.
-        let web = match app_id {
-            None => crate::jumplist::window_app(hwnd).filter(|web| {
-                let (registered, exe_id) =
-                    crate::jumplist::apps_folder_lookup(&web.id, &exe).unwrap_or_default();
-                is_own_app(&web.id, exe_id.as_deref(), registered)
-            }),
+        let declared = match app_id {
+            None => crate::jumplist::window_app(hwnd),
             Some(_) => None,
         };
+        let declared_id = declared.as_ref().map(|w| w.id.clone());
+        let web = declared.filter(|web| {
+            let (registered, exe_id) =
+                crate::jumplist::apps_folder_lookup(&web.id, &exe).unwrap_or_default();
+            is_own_app(&web.id, exe_id.as_deref(), registered)
+        });
         list.push(OpenWindow {
             hwnd,
             exe,
             app_id: web.as_ref().map(|w| w.id.clone()).or(app_id),
+            declared: declared_id,
             web,
         });
     }
@@ -1095,6 +1112,7 @@ mod tests {
             hwnd: 0,
             exe: r"C:\Program Files\WindowsApps\WhatsApp_1.0_x64\WhatsApp.Root.exe".into(),
             app_id: Some("5319275A.WhatsAppDesktop_cv1g1gvanyjgm!App".into()),
+            declared: None,
             web: None,
         };
         let entry = AppItem::open(&store).pin_entry();
@@ -1109,6 +1127,7 @@ mod tests {
             hwnd: 0,
             exe: r"C:\Program Files\Google\Chrome\Application\chrome.exe".into(),
             app_id: None,
+            declared: None,
             web: None,
         };
         let entry = AppItem::open(&desktop).pin_entry();
@@ -1125,6 +1144,7 @@ mod tests {
             hwnd,
             exe: CHROME.into(),
             app_id: Some(id.into()),
+            declared: Some(id.into()),
             web: Some(WindowApp {
                 id: id.into(),
                 relaunch: Some(format!(
@@ -1141,8 +1161,40 @@ mod tests {
             hwnd,
             exe: CHROME.into(),
             app_id: None,
+            declared: None,
             web: None,
         }
+    }
+
+    #[test]
+    fn windows_are_recognised_by_the_app_id_of_the_pinned_shortcut() {
+        // Discord: el acceso directo abre Update.exe, que lanza Discord.exe. Solo el
+        // AppUserModelID que guardan el acceso directo y la ventana los relaciona.
+        let id = "com.squirrel.Discord.Discord";
+        let window = |declared: Option<&str>| OpenWindow {
+            hwnd: 7,
+            exe: r"C:\Users\a\AppData\Local\Discord\app-1.0\Discord.exe".into(),
+            app_id: None,
+            declared: declared.map(Into::into),
+            web: None,
+        };
+        let mut pinned = AppItem::new(AppEntry {
+            name: "Discord".into(),
+            command: r"C:\Users\a\AppData\Local\Discord\Update.exe".into(),
+        });
+        // Sin identificador, por el ejecutable: no coincide.
+        assert!(!window(Some(id)).belongs_to(&pinned));
+        pinned.app_id = Some(id.to_uppercase());
+        assert!(window(Some(id)).belongs_to(&pinned));
+        assert!(!window(Some("com.squirrel.slack.slack")).belongs_to(&pinned));
+        assert!(!window(None).belongs_to(&pinned));
+
+        // El indicador se enciende y la ventana no sale además como app abierta.
+        let mut pinned = [pinned];
+        let mut open = Vec::new();
+        assign_windows(&[window(Some(id))], &mut pinned, &mut open);
+        assert!(pinned[0].is_running);
+        assert!(open.is_empty());
     }
 
     #[test]

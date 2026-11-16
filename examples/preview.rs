@@ -24,6 +24,8 @@ mod catalog;
 mod categories;
 #[path = "../src/clock.rs"]
 mod clock;
+#[path = "../src/diag.rs"]
+mod diag;
 #[path = "../src/extras.rs"]
 mod extras;
 #[path = "../src/font.rs"]
@@ -54,6 +56,8 @@ mod textfield;
 mod update;
 #[path = "../src/usage.rs"]
 mod usage;
+#[path = "../src/wifi.rs"]
+mod wifi;
 
 use bar::BarState;
 
