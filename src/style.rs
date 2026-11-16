@@ -129,6 +129,9 @@ pub struct Styles {
     /// Controles arriba y el dock solo con apps, como macOS (ver `topbar`).
     #[serde(default)]
     top_bar: bool,
+    /// El reloj muestra también los segundos.
+    #[serde(default)]
+    clock_seconds: bool,
 }
 
 fn default_menu_opacity() -> u8 {
@@ -145,6 +148,7 @@ impl Default for Styles {
             menu_opacity: default_menu_opacity(),
             always_visible: false,
             top_bar: false,
+            clock_seconds: false,
         }
     }
 }
@@ -170,6 +174,13 @@ impl Styles {
     }
     pub fn set_top_bar(&mut self, on: bool) {
         self.top_bar = on;
+    }
+    /// El reloj con segundos: se redibuja cada segundo en vez de cada minuto.
+    pub fn clock_seconds(&self) -> bool {
+        self.clock_seconds
+    }
+    pub fn set_clock_seconds(&mut self, on: bool) {
+        self.clock_seconds = on;
     }
     pub fn look(&self, state: State) -> Look {
         let index = state as usize;

@@ -81,7 +81,7 @@ Con más de un teclado instalado, entre la flecha de iconos ocultos y el estado 
 
 ## Hora y fecha
 
-El reloj muestra la hora y, debajo, la fecha corta en el formato regional del usuario; al pasar el cursor, el globo muestra la fecha larga. Un clic abre la configuración de fecha y hora.
+El reloj muestra la hora y, debajo, la fecha corta, las dos en el formato regional del usuario; con **Mostrar los segundos en el reloj** activado en la configuración lleva también los segundos y se redibuja cada segundo en vez de cada minuto. Si la hora no cabe (12 horas con segundos), se dibuja algo más pequeña; al pasar el cursor, el globo muestra la fecha larga. Un clic abre la configuración de fecha y hora.
 
 ## Red, volumen y batería
 
@@ -122,7 +122,7 @@ Volver a ejecutar GlassBar mientras ya está abierto muestra u oculta este lanza
 
 El clic derecho en el icono de GlassBar, en el panel de apps en segundo plano (o en la bandeja de Windows si la propia no está), abre su menú con **Configuración** y **Salir de GlassBar**. **Configuración** abre la ventana de configuración, centrada en el monitor del dock y con el estilo de los demás paneles:
 
-- **Dock:** ocultar el dock automáticamente, controles en una barra superior e iniciar con Windows, con interruptores.
+- **Dock:** ocultar el dock automáticamente, controles en una barra superior, mostrar los segundos en el reloj e iniciar con Windows, con interruptores.
 - **Apariencia según lo que hay en pantalla:** una fila por situación (ver Estilos) con su icono, un interruptor para activarla (el escritorio siempre cuenta) y un selector con flechas que pasa por Normal, Opaca, Transparente, Desenfoque y Acrílico. Debajo, la barra de la **opacidad de los menús**.
 - **GlassBar:** buscar actualizaciones o instalar la nueva, y salir de GlassBar.
 
@@ -147,7 +147,7 @@ Por defecto el dock se esconde solo. En la configuración, desactivar **Ocultar 
 
 Con el ocultar automático, acerca el cursor a los últimos 6 píxeles lógicos del borde inferior de cualquier monitor para desplegar la barra en él. Al alejarlo, espera 300 ms y se oculta con una animación suave sin rebote. El margen entre la barra y el borde también permite mantenerla abierta. Se oculta por completo, incluso si activaste el borde sin entrar en ella.
 
-La barra inicia con el Explorador si no hay configuración guardada. El ancho se adapta a los programas anclados; si supera la pantalla, se reduce la escala. La hora usa formato de 24 horas; la fecha, el formato regional. Los indicadores de ejecución comparan nombres de ejecutables; los accesos web y algunas aplicaciones empaquetadas pueden no mostrar indicador.
+La barra inicia con el Explorador si no hay configuración guardada. El ancho se adapta a los programas anclados; si supera la pantalla, se reduce la escala. La hora y la fecha usan el formato regional del usuario (24 horas, o 12 con a. m./p. m.). Los indicadores de ejecución comparan nombres de ejecutables; los accesos web y algunas aplicaciones empaquetadas pueden no mostrar indicador.
 
 La transparencia usa composición alfa real; el desenfoque de fondo solo aparece con las apariencias Desenfoque y Acrílico (ver Estilos). Mientras GlassBar está abierto, oculta las barras nativas del monitor principal y los secundarios. Un evento de Windows vuelve a ocultarlas cuando Explorer intenta mostrarlas; la comprobación periódica también cubre reinicios de Explorer. Al salir normalmente, se quita el detector y se restaura la barra original. Oculta, la barra nativa seguiría reservando su franja inferior y las ventanas maximizadas dejarían un hueco; por eso, si su ocultar automático está desactivado, GlassBar lo activa mientras está abierto y lo desactiva al salir. Lo apunta en `%LOCALAPPDATA%\GlassBar\native-autohide.txt` para devolverlo aunque se cierre a la fuerza; si ya estaba activado, no lo toca. Un segundo proceso `glassbar.exe` (el vigilante) espera a que GlassBar termine y vuelve a mostrar la barra nativa, incluso si se cerró a la fuerza o falló.
 

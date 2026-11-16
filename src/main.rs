@@ -83,7 +83,8 @@ use windows::Win32::UI::WindowsAndMessaging::{
 
 use crate::appmenu::{
     CMD_APP_CLOSE, CMD_APP_END_TASK, CMD_APP_OPEN, CMD_APP_PIN, CMD_APP_UNPIN, CMD_AUTOHIDE,
-    CMD_AUTOSTART, CMD_EXIT, CMD_JUMP, CMD_SETTINGS, CMD_TOP_BAR, CMD_UPDATE, CMD_UPDATE_CHECK,
+    CMD_AUTOSTART, CMD_CLOCK_SECONDS, CMD_EXIT, CMD_JUMP, CMD_SETTINGS, CMD_TOP_BAR, CMD_UPDATE,
+    CMD_UPDATE_CHECK,
 };
 use crate::autohide::AutoHide;
 use crate::bar::{BarState, HoverTarget, BOTTOM_MARGIN};
@@ -1876,6 +1877,7 @@ impl App {
         let styles = style::Styles::load();
         bar.appearance = styles.look(style::State::Desktop).appearance;
         glass::set_menu_opacity(styles.menu_opacity());
+        clock::set_seconds(styles.clock_seconds());
         let (update_sender, update_events) = std::sync::mpsc::channel();
         let scale = scale.min((rc.right - rc.left) as f32 / (bar.dock_width() + 40.0));
         let (width, height) = bar.window_size(scale);
@@ -6433,6 +6435,14 @@ fn handle_menu_command(app: &mut App, cmd: u32) {
             app.styles.set_top_bar(on);
             let _ = app.styles.save();
             app.sync_top_bar();
+        }
+        CMD_CLOCK_SECONDS => {
+            let on = !app.styles.clock_seconds();
+            app.styles.set_clock_seconds(on);
+            let _ = app.styles.save();
+            clock::set_seconds(on);
+            app.render();
+            app.refresh_top_bar();
         }
         CMD_EXIT => {
             app.release_shell();
