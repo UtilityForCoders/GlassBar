@@ -234,10 +234,22 @@ const RADIO_MANAGEMENT: GUID = GUID::from_u128(0x581333f6_28db_41be_bc7a_ff201f1
 
 fn radio_manager() -> Option<IRadioManager> {
     use windows::Win32::System::Com::{CoCreateInstance, CLSCTX_ALL};
+    const NAME: &str = "IRadioManager";
     let manager: IRadioManager =
-        unsafe { CoCreateInstance(&RADIO_MANAGEMENT, None, CLSCTX_ALL) }.ok()?;
+        match unsafe { CoCreateInstance(&RADIO_MANAGEMENT, None, CLSCTX_ALL) } {
+            Ok(manager) => manager,
+            Err(error) => {
+                crate::diag::report(NAME, Err(format!("crear 0x{:08X}", error.code().0)));
+                return None;
+            }
+        };
     let mut supported = 0;
-    unsafe { manager.is_supported(&mut supported) }.ok().ok()?;
+    let answered = unsafe { manager.is_supported(&mut supported) };
+    if answered.is_err() {
+        crate::diag::report(NAME, Err(format!("IsSupported 0x{:08X}", answered.0)));
+        return None;
+    }
+    crate::diag::report(NAME, Ok(()));
     (supported != 0).then_some(manager)
 }
 
