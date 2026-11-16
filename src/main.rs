@@ -12,6 +12,7 @@ mod attention;
 mod audio;
 mod autohide;
 mod autostart;
+mod backup;
 mod bar;
 mod bluetooth;
 mod calendar;
@@ -6422,6 +6423,7 @@ unsafe extern "system" fn settings_wndproc(
             });
         }
         WM_LBUTTONUP => {
+            let mut backup = None;
             with_app(|app| {
                 let Some(panel) = app.settings.as_mut().filter(|p| p.visible) else {
                     return;
@@ -6446,10 +6448,19 @@ unsafe extern "system" fn settings_wndproc(
                     return;
                 }
                 if let Some(command) = panel.model.command(hit) {
+                    if matches!(command, appmenu::CMD_EXPORT | appmenu::CMD_IMPORT) {
+                        backup = Some((app.hwnd, command == appmenu::CMD_EXPORT));
+                        return;
+                    }
                     handle_menu_command(app, command);
                     app.refresh_settings();
                 }
             });
+            // El diálogo de Windows atiende mensajes mientras está abierto: se abre con
+            // la app ya libre, para que el dock siga respondiendo.
+            if let Some((owner, export)) = backup {
+                copy_settings(owner, export);
+            }
         }
         WM_KEYDOWN if wparam.0 == 0x1B => {
             with_app(|app| app.settings.as_mut().map(SettingsWindow::hide));
@@ -6457,6 +6468,41 @@ unsafe extern "system" fn settings_wndproc(
         _ => return DefWindowProcW(hwnd, msg, wparam, lparam),
     }
     LRESULT(0)
+}
+
+/// Exporta la configuración a un archivo que se elige, o la sustituye por la de
+/// uno. Tras importar, GlassBar se reinicia para leerla.
+fn copy_settings(owner: HWND, export: bool) {
+    let Some(path) = backup::pick(owner, export) else {
+        return;
+    };
+    let result = if export {
+        backup::export(&path)
+    } else {
+        backup::import(&path)
+    };
+    let (title, text) = match (&result, export) {
+        (Ok(()), true) => (
+            "Configuración exportada",
+            format!("Guardada en {}.", path.display()),
+        ),
+        (Ok(()), false) => {
+            // La instancia nueva cierra esta y arranca con la configuración importada.
+            if let Ok(exe) = std::env::current_exe() {
+                let _ = std::process::Command::new(exe).arg("--replace").spawn();
+            }
+            return;
+        }
+        (Err(error), true) => (
+            "No se pudo exportar la configuración",
+            format!("Motivo: {error}."),
+        ),
+        (Err(error), false) => (
+            "No se pudo importar la configuración",
+            format!("Motivo: {error}."),
+        ),
+    };
+    with_app(|app| app.tray.notify(title, &text));
 }
 
 fn handle_menu_command(app: &mut App, cmd: u32) {

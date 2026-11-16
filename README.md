@@ -130,7 +130,7 @@ El clic derecho en el icono de GlassBar, en el panel de apps en segundo plano (o
 
 - **Dock:** ocultar el dock automáticamente, controles en una barra superior, mostrar los segundos en el reloj e iniciar con Windows, con interruptores, y el **tamaño del dock** (Pequeño, Normal, Grande o Muy grande), que escala iconos, reloj y márgenes sobre la escala de la pantalla. Si con el tamaño elegido el dock no cabe en el monitor, se reduce lo justo.
 - **Apariencia según lo que hay en pantalla:** una fila por situación (ver Estilos) con su icono, un interruptor para activarla (el escritorio siempre cuenta) y un selector con flechas que pasa por Normal, Opaca, Transparente, Desenfoque y Acrílico. Debajo, la barra de la **opacidad de los menús**.
-- **GlassBar:** buscar actualizaciones o instalar la nueva, y salir de GlassBar.
+- **GlassBar:** buscar actualizaciones o instalar la nueva, la copia de la configuración y salir de GlassBar. **Exportar** guarda en un archivo `.json` los programas anclados, los estilos, el orden de la bandeja y la vista del lanzador; **Importar** los sustituye por los de una copia y reinicia GlassBar para aplicarlos. El historial de apps abiertas no se copia. Una copia dañada o que no sea de GlassBar se rechaza sin tocar nada.
 
 Los cambios se aplican y se guardan al momento. La ventana se mueve arrastrando su cabecera, sin salirse del área de trabajo (no tapa la barra superior), y al volver a abrirla sale donde se dejó mientras GlassBar siga abierto. Escape, la ✕ o un clic fuera la cierran. El clic derecho en un hueco del dock o de la barra superior ya no abre ningún menú.
 
