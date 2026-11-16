@@ -48,6 +48,8 @@ impl Battery {
 pub struct Status {
     pub link: Link,
     pub internet: bool,
+    /// Barras de señal del Wi-Fi conectado, de 1 a 4; `None` si no se pudo leer.
+    pub wifi_bars: Option<u8>,
     /// `None` si no hay ninguna salida de audio.
     pub volume: Option<Volume>,
     /// `None` en equipos sin batería.
@@ -67,6 +69,7 @@ impl Default for Status {
         Self {
             link: Link::None,
             internet: false,
+            wifi_bars: None,
             volume: None,
             battery: None,
         }
@@ -87,7 +90,10 @@ impl Status {
         match item {
             Item::Network => match self.link {
                 // Sin Internet, el icono de la conexión se atenúa.
-                Link::Wifi => ('\u{E701}', if self.internet { 1.0 } else { 0.55 }),
+                Link::Wifi => (
+                    wifi_glyph(self.wifi_bars),
+                    if self.internet { 1.0 } else { 0.55 },
+                ),
                 Link::Ethernet => ('\u{E839}', if self.internet { 1.0 } else { 0.55 }),
                 Link::None => ('\u{F384}', 0.8),
             },
@@ -107,8 +113,17 @@ impl Status {
     pub fn label(&self, item: Item) -> String {
         match item {
             Item::Network => match (self.link, self.internet) {
-                (Link::Wifi, true) => "Wi-Fi: con acceso a Internet".into(),
-                (Link::Wifi, false) => "Wi-Fi: sin acceso a Internet".into(),
+                (Link::Wifi, internet) => {
+                    let access = if internet { "con" } else { "sin" };
+                    match self.wifi_bars {
+                        Some(bars) => format!(
+                            "Wi-Fi: {access} acceso a Internet (señal {})",
+                            ["débil", "aceptable", "buena", "excelente"]
+                                [(bars.clamp(1, 4) - 1) as usize]
+                        ),
+                        None => format!("Wi-Fi: {access} acceso a Internet"),
+                    }
+                }
                 (Link::Ethernet, true) => "Ethernet: con acceso a Internet".into(),
                 (Link::Ethernet, false) => "Ethernet: sin acceso a Internet".into(),
                 (Link::None, _) => "Sin conexión a Internet".into(),
@@ -123,6 +138,26 @@ impl Status {
                 None => String::new(),
             },
         }
+    }
+}
+
+/// Barras de señal (1 a 4) para una calidad de 0 a 100, como Windows.
+pub fn wifi_bars(quality: u8) -> u8 {
+    match quality {
+        0..=25 => 1,
+        26..=50 => 2,
+        51..=75 => 3,
+        _ => 4,
+    }
+}
+
+/// Wifi1 a Wifi3 y el icono completo. Sin lectura de la señal, el completo.
+pub fn wifi_glyph(bars: Option<u8>) -> char {
+    match bars {
+        Some(1) => '\u{E872}',
+        Some(2) => '\u{E873}',
+        Some(3) => '\u{E874}',
+        _ => '\u{E701}',
     }
 }
 
@@ -330,7 +365,13 @@ pub struct Reader {
     last_link: Option<(std::time::Instant, Link)>,
     /// Última comprobación de Internet y cuándo.
     last_internet: Option<(std::time::Instant, bool)>,
+    /// Sesión WLAN para la señal; se abre la primera vez que hay Wi-Fi.
+    wlan: Option<crate::wifi::Wlan>,
+    /// Últimas barras de señal leídas y cuándo.
+    last_signal: Option<(std::time::Instant, Option<u8>)>,
 }
+
+const SIGNAL_EVERY: std::time::Duration = std::time::Duration::from_secs(10);
 
 const LINK_EVERY: std::time::Duration = std::time::Duration::from_secs(60);
 const INTERNET_EVERY: std::time::Duration = std::time::Duration::from_secs(10);
@@ -438,6 +479,8 @@ impl Reader {
                 changes: AddressChanges::new(),
                 last_link: None,
                 last_internet: None,
+                wlan: None,
+                last_signal: None,
             }
         }
     }
@@ -462,9 +505,30 @@ impl Reader {
                 internet
             }
         };
+        let wifi_bars = if link == Link::Wifi {
+            match self.last_signal {
+                Some((at, bars)) if !changed && now.duration_since(at) < SIGNAL_EVERY => bars,
+                _ => {
+                    if self.wlan.is_none() {
+                        self.wlan = crate::wifi::Wlan::open();
+                    }
+                    let bars = self
+                        .wlan
+                        .as_ref()
+                        .and_then(crate::wifi::Wlan::signal)
+                        .map(wifi_bars);
+                    self.last_signal = Some((now, bars));
+                    bars
+                }
+            }
+        } else {
+            self.last_signal = None;
+            None
+        };
         Status {
             link,
             internet,
+            wifi_bars,
             volume: self.volume(),
             battery: unsafe { battery() },
         }
@@ -831,6 +895,22 @@ mod tests {
         status.internet = false;
         assert!(status.glyph(Item::Network).1 < 1.0);
         assert_eq!(status.label(Item::Network), "Wi-Fi: sin acceso a Internet");
+        // Con la señal leída, el icono lleva sus barras y el globo lo dice.
+        for (quality, bars, glyph) in [
+            (10, 1, '\u{E872}'),
+            (40, 2, '\u{E873}'),
+            (75, 3, '\u{E874}'),
+            (90, 4, '\u{E701}'),
+        ] {
+            assert_eq!(wifi_bars(quality), bars);
+            status.wifi_bars = Some(bars);
+            assert_eq!(status.glyph(Item::Network).0, glyph);
+        }
+        status.wifi_bars = Some(2);
+        assert_eq!(
+            status.label(Item::Network),
+            "Wi-Fi: sin acceso a Internet (señal aceptable)"
+        );
         status.link = Link::None;
         assert_eq!(status.label(Item::Network), "Sin conexión a Internet");
     }

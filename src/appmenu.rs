@@ -468,6 +468,9 @@ pub const CMD_SETTINGS: u32 = 9;
 /// Guardar la configuración en un archivo, y sustituirla por la de uno.
 pub const CMD_EXPORT: u32 = 11;
 pub const CMD_IMPORT: u32 = 12;
+/// Dock más pequeño o más grande.
+pub const CMD_DOCK_SMALLER: u32 = 13;
+pub const CMD_DOCK_BIGGER: u32 = 14;
 
 /// Menú del icono de GlassBar en la bandeja (clic derecho): configuración y salir.
 pub fn tray() -> AppMenu {

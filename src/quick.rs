@@ -44,6 +44,10 @@ const SLIDER_X: f32 = PAD + 40.0;
 /// flecha que abre las salidas de audio.
 const SLIDER_W: f32 = WIDTH - PAD - 76.0 - SLIDER_X;
 const AUDIO_BUTTON: f32 = 28.0;
+/// Barra del volumen de una aplicación, bajo su fila en la vista de audio: deja
+/// sitio a la izquierda para el icono del altavoz y a la derecha para el porcentaje.
+const APP_SLIDER_X: f32 = PAD + 64.0;
+const APP_SLIDER_W: f32 = WIDTH - PAD - 44.0 - APP_SLIDER_X;
 const FOOTER_Y: f32 = 280.0;
 const MORE_W: f32 = 112.0;
 fn background() -> [u8; 4] {
@@ -88,6 +92,8 @@ pub enum AudioRow {
     Output(usize),
     /// Aplicación, por su posición.
     App(usize),
+    /// Barra del volumen de la aplicación desplegada.
+    Volume(usize),
     /// Salida que se puede elegir para la aplicación desplegada; `None` es la
     /// predeterminada.
     Choice(usize, Option<usize>),
@@ -99,6 +105,7 @@ impl AudioRow {
             Self::Note(_) | Self::Error => 40.0,
             Self::Output(_) => 44.0,
             Self::App(_) => ROW,
+            Self::Volume(_) => 40.0,
             Self::Choice(..) => 36.0,
         }
     }
@@ -155,6 +162,8 @@ pub enum Hit {
     JoinCancel,
     /// Barra de desplazamiento de la lista.
     Scrollbar,
+    /// Barra del volumen de una aplicación (por su posición), en la vista de audio.
+    AppVolume(usize),
 }
 
 #[derive(Default)]
@@ -165,6 +174,8 @@ pub struct QuickState {
     pub hovered: Option<Hit>,
     /// Barra que se está arrastrando.
     pub dragging: Option<Slider>,
+    /// Aplicación cuya barra de volumen se está arrastrando.
+    pub app_drag: Option<usize>,
     pub view: View,
     /// Desplazamiento de la lista.
     pub list_scroll: f32,
@@ -286,6 +297,7 @@ impl QuickState {
             for (index, app) in mixer.apps.iter().enumerate() {
                 rows.push(AudioRow::App(index));
                 if self.audio_app.as_deref() == Some(app.path.as_str()) {
+                    rows.push(AudioRow::Volume(index));
                     rows.push(AudioRow::Choice(index, None));
                     rows.extend((0..mixer.outputs.len()).map(|o| AudioRow::Choice(index, Some(o))));
                 }
@@ -364,7 +376,7 @@ impl QuickState {
                 + rows[index..]
                     .iter()
                     .take_while(
-                        |r| matches!(r, AudioRow::App(i) | AudioRow::Choice(i, _) if *i == app),
+                        |r| matches!(r, AudioRow::App(i) | AudioRow::Volume(i) | AudioRow::Choice(i, _) if *i == app),
                     )
                     .map(|r| r.height())
                     .sum::<f32>();
@@ -440,8 +452,10 @@ impl QuickState {
                             audio.get(index),
                             Some(AudioRow::Header(_) | AudioRow::Note(_) | AudioRow::Error)
                         );
-                    if clickable {
-                        order.push(Hit::Row(index));
+                    match audio.get(index).filter(|_| self.view == View::Audio) {
+                        Some(AudioRow::Volume(app)) => order.push(Hit::AppVolume(*app)),
+                        _ if clickable => order.push(Hit::Row(index)),
+                        _ => {}
                     }
                 }
             }
@@ -647,6 +661,11 @@ impl QuickState {
             if self.view == View::Audio {
                 // Los títulos y avisos no se pulsan.
                 let row = self.audio_rows()[index];
+                if let AudioRow::Volume(app) = row {
+                    return (APP_SLIDER_X - 10.0..APP_SLIDER_X + APP_SLIDER_W + 10.0)
+                        .contains(&x)
+                        .then_some(Hit::AppVolume(app));
+                }
                 let clickable = !matches!(
                     row,
                     AudioRow::Header(_) | AudioRow::Note(_) | AudioRow::Error
@@ -725,6 +744,14 @@ impl QuickState {
     /// Valor de una barra para la posición `x` del cursor.
     pub fn slider_value(x: f32) -> f32 {
         ((x - SLIDER_X) / SLIDER_W).clamp(0.0, 1.0)
+    }
+    /// Valor (0 a 1) de la barra de volumen de una aplicación para el cursor en `x`.
+    pub fn app_slider_value(x: f32) -> f32 {
+        ((x - APP_SLIDER_X) / APP_SLIDER_W).clamp(0.0, 1.0)
+    }
+    /// Volumen de la aplicación `app` en el mezclador, de 0 a 1.
+    pub fn app_volume(&self, app: usize) -> Option<f32> {
+        self.mixer().apps.get(app).map(|a| a.volume)
     }
 
     pub fn draw(&self, image: &mut Pixmap, scale: f32) {
@@ -1604,6 +1631,73 @@ impl QuickState {
                     0.8,
                 );
             }
+            AudioRow::Volume(app) => {
+                let Some(value) = self.app_volume(app) else {
+                    return;
+                };
+                let hit = Hit::AppVolume(app);
+                let active = self.app_drag == Some(app) || self.hovered == Some(hit);
+                draw_icon_aligned(
+                    image,
+                    if value <= 0.0 {
+                        '\u{E74F}'
+                    } else {
+                        volume_glyph(value)
+                    },
+                    (APP_SLIDER_X - 20.0) * scale,
+                    cy * scale,
+                    14.0 * scale,
+                    0.9,
+                );
+                let color = crate::accent::current().light;
+                let thumb = APP_SLIDER_X + APP_SLIDER_W * value;
+                fill_rounded(
+                    image,
+                    [255, 255, 255, 60],
+                    APP_SLIDER_X * scale,
+                    (cy - 2.0) * scale,
+                    APP_SLIDER_W * scale,
+                    4.0 * scale,
+                    2.0 * scale,
+                );
+                fill_rounded(
+                    image,
+                    color,
+                    APP_SLIDER_X * scale,
+                    (cy - 2.0) * scale,
+                    (thumb - APP_SLIDER_X) * scale,
+                    4.0 * scale,
+                    2.0 * scale,
+                );
+                fill_rounded(
+                    image,
+                    [69, 69, 72, 255],
+                    (thumb - 9.0) * scale,
+                    (cy - 9.0) * scale,
+                    18.0 * scale,
+                    18.0 * scale,
+                    9.0 * scale,
+                );
+                let dot = if active { 6.5 } else { 5.0 };
+                fill_rounded(
+                    image,
+                    color,
+                    (thumb - dot) * scale,
+                    (cy - dot) * scale,
+                    dot * 2.0 * scale,
+                    dot * 2.0 * scale,
+                    dot * scale,
+                );
+                let percent = format!("{}", (value * 100.0).round() as u32);
+                draw_text_on_baseline(
+                    image,
+                    &percent,
+                    (WIDTH - PAD - 4.0) * scale - text_width(&percent, size),
+                    baseline(cy),
+                    size,
+                    0.9,
+                );
+            }
             AudioRow::Choice(app, output) => {
                 let Some(app) = mixer.apps.get(app) else {
                     return;
@@ -2258,6 +2352,7 @@ mod tests {
             path: format!("C:\\{name}.exe"),
             pids: vec![1, 2],
             output: output.map(Into::into),
+            volume: 0.5,
             icon: None,
         };
         Mixer {
@@ -2303,22 +2398,37 @@ mod tests {
         assert_eq!(quick.hit_test(WIDTH / 2.0, center(2)), Some(Hit::Row(2)));
         assert_eq!(quick.hit_test(WIDTH / 2.0, center(4)), Some(Hit::Row(4)));
 
-        // Al desplegar Discord aparecen "Predeterminada" y cada salida bajo ella.
+        // Al desplegar Discord aparecen su volumen, "Predeterminada" y cada salida.
         quick.toggle_audio_app(0);
         assert_eq!(
-            quick.audio_rows()[4..8],
+            quick.audio_rows()[4..9],
             [
                 AudioRow::App(0),
+                AudioRow::Volume(0),
                 AudioRow::Choice(0, None),
                 AudioRow::Choice(0, Some(0)),
                 AudioRow::Choice(0, Some(1)),
             ]
         );
-        assert_eq!(quick.audio_rows()[8], AudioRow::App(1));
+        assert_eq!(quick.audio_rows()[9], AudioRow::App(1));
         let center = |index: usize| {
             LIST_Y + quick.row_top(index) + quick.row_height(index) / 2.0 - quick.list_scroll
         };
-        assert_eq!(quick.hit_test(WIDTH / 2.0, center(7)), Some(Hit::Row(7)));
+        assert_eq!(quick.hit_test(WIDTH / 2.0, center(8)), Some(Hit::Row(8)));
+        // La barra del volumen se arrastra y se elige con el teclado; fuera de ella,
+        // su fila no hace nada.
+        assert_eq!(
+            quick.hit_test(APP_SLIDER_X + APP_SLIDER_W / 2.0, center(5)),
+            Some(Hit::AppVolume(0))
+        );
+        assert_eq!(quick.hit_test(PAD, center(5)), None);
+        assert!(quick.focus_order().contains(&Hit::AppVolume(0)));
+        assert_eq!(quick.app_volume(0), Some(0.5));
+        assert_eq!(QuickState::app_slider_value(APP_SLIDER_X), 0.0);
+        assert_eq!(
+            QuickState::app_slider_value(APP_SLIDER_X + APP_SLIDER_W),
+            1.0
+        );
         // Otro clic la pliega.
         quick.toggle_audio_app(0);
         assert_eq!(quick.audio_rows().len(), 6);
@@ -2377,6 +2487,7 @@ mod tests {
             path: format!("C:\\app{i}.exe"),
             pids: vec![i],
             output: None,
+            volume: 1.0,
             icon: None,
         });
         quick.system.audio.apps.extend(many);

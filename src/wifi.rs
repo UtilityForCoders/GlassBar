@@ -205,6 +205,33 @@ impl Wlan {
         }
     }
 
+    /// Calidad de la señal (0 a 100) de la red a la que está conectado el adaptador;
+    /// `None` sin adaptador o sin conexión.
+    pub fn signal(&self) -> Option<u8> {
+        let guid = self.interface()?;
+        unsafe {
+            let (mut size, mut data) = (0u32, std::ptr::null_mut::<core::ffi::c_void>());
+            let result = WlanQueryInterface(
+                self.handle,
+                &guid,
+                wlan_intf_opcode_current_connection,
+                None,
+                &mut size,
+                &mut data,
+                None,
+            );
+            if result != 0 || data.is_null() {
+                return None;
+            }
+            let quality = ((size as usize) >= std::mem::size_of::<WLAN_CONNECTION_ATTRIBUTES>())
+                .then(|| &*(data as *const WLAN_CONNECTION_ATTRIBUTES))
+                .filter(|c| c.isState == wlan_interface_state_connected)
+                .map(|c| c.wlanAssociationAttributes.wlanSignalQuality.min(100) as u8);
+            WlanFreeMemory(data);
+            quality
+        }
+    }
+
     /// Se conecta con un perfil guardado.
     pub fn connect(&self, profile: &str) {
         let Some(guid) = self.interface() else {
