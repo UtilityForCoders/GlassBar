@@ -465,6 +465,9 @@ pub const CMD_AUTOHIDE: u32 = 7;
 pub const CMD_TOP_BAR: u32 = 8;
 /// Abrir la ventana de configuración.
 pub const CMD_SETTINGS: u32 = 9;
+/// Dock más pequeño o más grande.
+pub const CMD_DOCK_SMALLER: u32 = 13;
+pub const CMD_DOCK_BIGGER: u32 = 14;
 
 /// Menú del icono de GlassBar en la bandeja (clic derecho): configuración y salir.
 pub fn tray() -> AppMenu {

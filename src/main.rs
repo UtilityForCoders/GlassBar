@@ -1877,7 +1877,8 @@ impl App {
         bar.appearance = styles.look(style::State::Desktop).appearance;
         glass::set_menu_opacity(styles.menu_opacity());
         let (update_sender, update_events) = std::sync::mpsc::channel();
-        let scale = scale.min((rc.right - rc.left) as f32 / (bar.dock_width() + 40.0));
+        let scale = (scale * styles.dock_factor())
+            .min((rc.right - rc.left) as f32 / (bar.dock_width() + 40.0));
         let (width, height) = bar.window_size(scale);
         let surface = Surface::new(width, height)?;
 
@@ -3115,7 +3116,8 @@ impl App {
     /// Ajusta tamaño y posición del dock al número de iconos.
     fn relayout(&mut self) {
         let (rc, dpi) = monitors::get_info(monitors::dock());
-        self.scale = dpi.min((rc.right - rc.left) as f32 / (self.bar.dock_width() + 40.0));
+        self.scale = (dpi * self.styles.dock_factor())
+            .min((rc.right - rc.left) as f32 / (self.bar.dock_width() + 40.0));
         let (width, height) = self.bar.window_size(self.scale);
         if let Ok(surface) = Surface::new(width, height) {
             self.surface = surface;
@@ -6428,6 +6430,14 @@ fn handle_menu_command(app: &mut App, cmd: u32) {
             app.expand();
         }
         CMD_SETTINGS => app.open_settings(),
+        appmenu::CMD_DOCK_SMALLER | appmenu::CMD_DOCK_BIGGER => {
+            app.styles.step_dock_size(cmd == appmenu::CMD_DOCK_BIGGER);
+            let _ = app.styles.save();
+            app.relayout();
+            // En el modo siempre visible cambia el sitio que Windows le reserva.
+            app.sync_appbar();
+            app.expand();
+        }
         CMD_TOP_BAR => {
             let on = !app.styles.top_bar();
             app.styles.set_top_bar(on);
