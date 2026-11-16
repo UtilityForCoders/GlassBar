@@ -319,6 +319,8 @@ pub fn launch_entry_as_admin(entry: &AppEntry) -> bool {
 
 /// Windows ofrece "Ejecutar como administrador" para la app: su menú de Shell
 /// tiene la acción "runas", como mira el Inicio.
+// Solo la usa el lanzador, que los ejemplos compilan sin el resto del dock.
+#[allow(dead_code)]
 pub fn can_run_as_admin(command: &str) -> bool {
     with_shell_menu(command, |menu, _| unsafe { runas_id(menu) })
         .flatten()
@@ -1039,8 +1041,10 @@ pub fn stroke_rounded(
         ..Default::default()
     };
     paint.set_color_rgba8(r, g, b, a);
-    let mut stroke = Stroke::default();
-    stroke.width = width;
+    let stroke = Stroke {
+        width,
+        ..Default::default()
+    };
     if let Some(path) = rounded_rect(x, y, w, h, rad) {
         pixmap.stroke_path(&path, &paint, &stroke, Transform::identity(), None);
     }

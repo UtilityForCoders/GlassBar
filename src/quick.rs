@@ -1993,9 +1993,9 @@ mod tests {
         );
         assert_eq!(quick.hit_test(PAD + 4.0, FOOTER_Y + 24.0), None);
         // Todo cabe en el panel y no se solapa.
-        assert!(TILE_Y + TILE_H < BRIGHTNESS_Y - ROW_H / 2.0);
-        assert!(BRIGHTNESS_Y + ROW_H / 2.0 <= VOLUME_Y - ROW_H / 2.0);
-        assert!(VOLUME_Y + ROW_H / 2.0 <= FOOTER_Y);
+        const { assert!(TILE_Y + TILE_H < BRIGHTNESS_Y - ROW_H / 2.0) };
+        const { assert!(BRIGHTNESS_Y + ROW_H / 2.0 <= VOLUME_Y - ROW_H / 2.0) };
+        const { assert!(VOLUME_Y + ROW_H / 2.0 <= FOOTER_Y) };
         assert!(my + mh < HEIGHT);
     }
 
@@ -2045,7 +2045,7 @@ mod tests {
             Some(Hit::Slider(Slider::Brightness))
         );
         // Ni la nota bajo el nombre.
-        assert!(TOGGLE_NOTE_Y + 4.0 < BRIGHTNESS_Y - ROW_H / 2.0);
+        const { assert!(TOGGLE_NOTE_Y + 4.0 < BRIGHTNESS_Y - ROW_H / 2.0) };
     }
 
     #[test]

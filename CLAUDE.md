@@ -51,14 +51,14 @@ Todos los commits siguen [Conventional Commits 1.0](https://www.conventionalcomm
 - Los nombres de rama van en minúsculas y con guiones.
 - Nunca se hace commit directo en `main` ni en `develop`: todo entra por PR.
 - Los PR de `feature/*` y `bugfix/*` van contra `develop`. Los de `release/*` y `hotfix/*`, contra `main`; después se fusiona también en `develop`.
-- Antes de abrir un PR deben pasar `cargo fmt --check`, `cargo test` y `cargo build --release`, igual que en el CI.
+- Antes de abrir un PR deben pasar `cargo fmt --check`, `cargo clippy --all-targets -- -D warnings`, `cargo test` y `cargo build --release`, igual que en el CI.
 - Las versiones siguen SemVer: `feat` sube la menor, `fix` y `perf` la de parche, y un cambio incompatible la mayor.
 
 ## CI/CD
 
 | Workflow | Cuándo | Qué hace |
 |---|---|---|
-| `build.yml` (Compilar) | Push a `main` o `develop`, y cada PR | Formato, tests y compilación release; sube el `.exe` como artefacto. En los PR contra `main`, además exige una versión nueva en `Cargo.toml`. |
+| `build.yml` (Compilar) | Push a `main` o `develop`, y cada PR | Formato, clippy (`-D warnings`), tests, compilación release y arranque y consumo en reposo (`scripts/comprobar-app.ps1`); aparte, vulnerabilidades en las dependencias (cargo-deny); sube el `.exe` como artefacto. En los PR contra `main`, además exige una versión nueva en `Cargo.toml`. |
 | `pull-request.yml` (Normas del PR) | Cada PR | El título sigue Conventional Commits y la rama va contra la base que manda Git Flow: `feature/*`, `bugfix/*` y Dependabot contra `develop`; `release/*` y `hotfix/*` contra `main` o `develop`; `main` solo contra `develop`. |
 | `release.yml` (Publicar versión) | Tras cada Compilar correcto de un push a `main` | Si `vX.Y.Z` (de `Cargo.toml`) aún no existe, crea la etiqueta y la versión en GitHub con el `.exe`, el instalador de Inno Setup y `SHA256SUMS.txt`. Las notas se generan con los PR incluidos. |
 

@@ -1,6 +1,6 @@
 [package]
 name = "glassbar"
-version = "0.6.1"
+version = "0.7.0"
 edition = "2021"
 license = "MIT"
 description = "Barra de tareas moderna estilo Liquid Glass para Windows, ultraligera en Rust."
@@ -77,6 +77,15 @@ features = [
     "Win32_System_Wmi",
     "Win32_System_SystemInformation",
 ]
+
+# Avisos de clippy que aquí no ayudan. El resto se trata como error en el CI.
+[lints.clippy]
+# Las funciones de dibujo reciben posición, tamaño, color y escala por separado.
+too_many_arguments = "allow"
+# Los píxeles se recorren con `chunks_exact(4)`, que se lee mejor que `as_chunks`.
+chunks_exact_to_as_chunks = "allow"
+# Los literales agrupan por canal (AA_RR_GG_BB) o por campo, no de cuatro en cuatro.
+unusual_byte_groupings = "allow"
 
 [profile.release]
 opt-level = 3
