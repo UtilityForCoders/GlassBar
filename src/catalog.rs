@@ -231,6 +231,69 @@ pub fn recent_files() -> Vec<(AppEntry, u64)> {
 /// Nombre que se muestra de un acceso directo de Recientes ("foto.jpg.lnk" →
 /// "foto.jpg"). Los de carpetas no llevan extensión ("Descargas.lnk") y se dejan
 /// fuera, como en el Inicio.
+/// Archivos en los que busca el lanzador: los abiertos hace poco según Windows
+/// (los más nuevos delante) y lo que hay en el escritorio, Documentos y Descargas,
+/// sin entrar en sus carpetas. Solo se leen sus nombres.
+pub fn searchable_files() -> Vec<AppEntry> {
+    const MAX_PER_FOLDER: usize = 400;
+    let mut files: Vec<(AppEntry, u64)> = Vec::new();
+    let modified = |item: &std::fs::DirEntry| {
+        item.metadata()
+            .ok()
+            .and_then(|m| m.modified().ok())
+            .and_then(|t| t.duration_since(std::time::UNIX_EPOCH).ok())
+            .map_or(0, |d| d.as_secs())
+    };
+    if let Some(entries) = recent_folder().and_then(|f| std::fs::read_dir(f).ok()) {
+        files.extend(entries.flatten().take(MAX_PER_FOLDER).filter_map(|item| {
+            let path = item.path();
+            let shown = recent_file_name(path.file_name()?.to_str()?)?.to_string();
+            Some((
+                AppEntry {
+                    name: shown,
+                    command: path.to_string_lossy().into_owned(),
+                },
+                modified(&item),
+            ))
+        }));
+    }
+    files.sort_by_key(|(_, at)| std::cmp::Reverse(*at));
+    let mut list: Vec<AppEntry> = files.into_iter().map(|(entry, _)| entry).collect();
+    let home = std::env::var_os("USERPROFILE").map(PathBuf::from);
+    for folder in ["Desktop", "Documents", "Downloads"] {
+        let Some(entries) = home
+            .as_ref()
+            .and_then(|home| std::fs::read_dir(home.join(folder)).ok())
+        else {
+            continue;
+        };
+        for item in entries.flatten().take(MAX_PER_FOLDER) {
+            let path = item.path();
+            let Some(name) = path.file_name().and_then(|n| n.to_str()) else {
+                continue;
+            };
+            // Ni ocultos ni accesos directos (los programas ya salen como apps), ni
+            // lo que ya está entre los recientes.
+            let lower = name.to_lowercase();
+            if name.starts_with('.')
+                || lower == "desktop.ini"
+                || lower.ends_with(".lnk")
+                || lower.ends_with(".url")
+                || list
+                    .iter()
+                    .any(|known| known.name.eq_ignore_ascii_case(name))
+            {
+                continue;
+            }
+            list.push(AppEntry {
+                name: name.to_string(),
+                command: path.to_string_lossy().into_owned(),
+            });
+        }
+    }
+    list
+}
+
 fn recent_file_name(link: &str) -> Option<&str> {
     let stem = link
         .strip_suffix(".lnk")

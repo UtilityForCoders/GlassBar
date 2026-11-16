@@ -35,7 +35,13 @@ Solo aparecen programas del catálogo (accesos directos del menú Inicio y aplic
 
 El pie muestra el nombre de la cuenta y el botón de apagado. El panel tiene 96% de opacidad. Los iconos se obtienen del recurso original o de la fábrica de imágenes del Shell a alta resolución, y se reducen con un filtro de área sin ampliar los iconos pequeños.
 
-Escribe para buscar; la búsqueda ignora mayúsculas y tildes, admite varias palabras y prioriza las coincidencias exactas. Enter abre el elemento seleccionado o el primer resultado. El campo admite cursor, Inicio/Fin, Retroceso/Supr, Ctrl+A, Ctrl+V y un botón para limpiar. Las flechas mueven la selección por la cuadrícula y entre secciones (izquierda/derecha editan el texto mientras no haya selección). La rueda y Re Pág/Av Pág desplazan la vista. Escape o un clic fuera cierran el panel.
+Escribe para buscar; la búsqueda ignora mayúsculas y tildes, admite varias palabras y prioriza las coincidencias exactas. Además de los programas, los resultados incluyen:
+
+- **Calculadora:** si lo escrito es una operación (`+ - * / ^ %`, paréntesis, `x` para multiplicar, coma o punto decimal), su resultado sale lo primero y Enter lo copia.
+- **Configuración:** las páginas de la Configuración de Windows, por su nombre o por palabras afines ("ratón", "batería", "fondo de pantalla").
+- **Archivos:** los abiertos hace poco según Windows y los del escritorio, Documentos y Descargas (sin entrar en sus carpetas). Solo se leen sus nombres, al abrir el lanzador.
+- **Web:** la última opción busca lo escrito en Bing con el navegador predeterminado. Nada sale del equipo hasta que se elige.
+ Enter abre el elemento seleccionado o el primer resultado. El campo admite cursor, Inicio/Fin, Retroceso/Supr, Ctrl+A, Ctrl+V y un botón para limpiar. Las flechas mueven la selección por la cuadrícula y entre secciones (izquierda/derecha editan el texto mientras no haya selección). La rueda y Re Pág/Av Pág desplazan la vista. Escape o un clic fuera cierran el panel.
 
 El botón de encendido del pie abre un menú como el del Inicio de Windows 11 con **Bloquear**, **Suspender**, **Apagar** y **Reiniciar**, con los iconos del sistema (Segoe Fluent Icons). Aparece en 200 ms, desvaneciéndose y subiendo unos píxeles; si los efectos de animación de Windows están desactivados, aparece directamente. También se recorre con las flechas y Enter; Escape o un clic fuera lo cierran sin hacer nada. Apagar y reiniciar piden a Windows el cierre normal, sin forzar el de las aplicaciones abiertas.
 

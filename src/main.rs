@@ -19,6 +19,7 @@ mod catalog;
 mod categories;
 mod clock;
 mod diag;
+mod extras;
 mod font;
 mod frames;
 mod games;
@@ -1749,6 +1750,7 @@ unsafe extern "system" fn launcher_wndproc(
             launcher::Action::OpenFile(entry) => {
                 apps::launch_entry(&entry);
             }
+            launcher::Action::Copy(text) => set_clipboard_text(hwnd, &text),
             launcher::Action::OpenLocation(entry) => {
                 apps::open_entry_location(&entry);
             }

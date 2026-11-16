@@ -127,12 +127,16 @@ pub enum Hit {
     DetailOpen,
     DetailOptions,
     DetailJump(usize),
+    /// Resultado `n` que no es un programa (ver `crate::extras`).
+    Extra(usize),
 }
 pub enum Action {
     Launch(AppEntry),
     /// Un archivo reciente (o la carpeta de recientes): se abre sin pasar al
     /// historial de apps de GlassBar.
     OpenFile(AppEntry),
+    /// Copia un texto (el resultado de una operación).
+    Copy(String),
     Power(Power),
     RunAsAdmin(AppEntry),
     OpenLocation(AppEntry),
@@ -368,6 +372,10 @@ pub struct LauncherState {
     jumps: HashMap<String, Vec<crate::jumplist::Section>>,
     /// Si cada app admite "Ejecutar como administrador", por orden de la app.
     admin: HashMap<String, bool>,
+    /// Archivos en los que se busca; se leen en cada apertura.
+    files: Vec<AppEntry>,
+    /// Resultados de la búsqueda actual que no son programas.
+    extras: Vec<crate::extras::Extra>,
 }
 impl LauncherState {
     pub fn new(pinned: &[AppEntry]) -> Self {
@@ -399,6 +407,8 @@ impl LauncherState {
             detail_icons: HashMap::new(),
             jumps: HashMap::new(),
             admin: HashMap::new(),
+            files: Vec::new(),
+            extras: Vec::new(),
         };
         state.refresh(pinned);
         state
@@ -420,6 +430,7 @@ impl LauncherState {
             crate::catalog::recent_files(),
         );
         self.regroup(&usage);
+        self.files = crate::catalog::searchable_files();
         self.open_category = None;
         self.query.clear();
         self.caret_on = true;
@@ -561,9 +572,43 @@ impl LauncherState {
             // Como en Windows: la mejor coincidencia aparte y debajo las demás apps;
             // el detalle del elegido ocupa la columna derecha.
             let hits = self.filtered();
-            if hits.is_empty() {
+            // Los que no son programas, por secciones: el resultado de una operación
+            // delante de todo y el resto detrás de las apps.
+            let section = |kind: crate::extras::Kind,
+                           headers: &mut Vec<(String, f32)>,
+                           slots: &mut Vec<Slot>,
+                           y: &mut f32| {
+                let mut first = true;
+                for (index, extra) in self.extras.iter().enumerate() {
+                    if extra.kind != kind {
+                        continue;
+                    }
+                    if first {
+                        if *y > 0.0 {
+                            *y += SECTION_GAP;
+                        }
+                        headers.push((kind.header().to_string(), *y));
+                        *y += HEADER_H;
+                        first = false;
+                    }
+                    slots.push(Slot {
+                        hit: Hit::Extra(index),
+                        x: 0.0,
+                        y: *y,
+                        w: LIST_W,
+                        h: ROW_H - 4.0,
+                        shape: Shape::Row,
+                    });
+                    *y += ROW_H;
+                }
+            };
+            use crate::extras::Kind;
+            section(Kind::Calc, &mut headers, &mut slots, &mut y);
+            if hits.is_empty() && self.extras.iter().all(|e| e.kind == Kind::Web) {
                 headers.push(("Sin resultados".to_string(), y));
                 y += HEADER_H;
+            } else if !hits.is_empty() && y > 0.0 {
+                y += SECTION_GAP;
             }
             for (n, index) in hits.into_iter().enumerate() {
                 if n < 2 {
@@ -587,6 +632,9 @@ impl LauncherState {
                     shape: Shape::Row,
                 });
                 y += ROW_H;
+            }
+            for kind in [Kind::Setting, Kind::File, Kind::Web] {
+                section(kind, &mut headers, &mut slots, &mut y);
             }
             return Layout {
                 headers,
@@ -765,6 +813,7 @@ impl LauncherState {
         self.edit(|field| field.insert(text));
     }
     fn reset_results(&mut self) {
+        self.extras = crate::extras::search(self.query.text(), &self.files);
         self.scroll = 0.0;
         self.hovered = None;
         self.selection = None;
@@ -884,7 +933,25 @@ impl LauncherState {
             Hit::Pinned(i) => self.pinned.get(i),
             Hit::Recent(i) => self.recent.get(i).map(|r| &r.entry),
             Hit::App(i) => self.apps.get(i),
+            Hit::Extra(i) => self.extras.get(i).map(|e| &e.entry),
             _ => None,
+        }
+    }
+    /// El resultado que no es un programa bajo `hit`, o el del detalle si `hit` es
+    /// uno de sus botones.
+    fn extra(&self, hit: Hit) -> Option<&crate::extras::Extra> {
+        match hit {
+            Hit::Extra(i) => self.extras.get(i),
+            Hit::DetailOpen | Hit::DetailOptions => self.extra(self.detail_hit()?),
+            _ => None,
+        }
+    }
+    /// Lo que hace elegir un resultado que no es un programa: copiar el de una
+    /// operación o abrir los demás.
+    fn extra_action(extra: &crate::extras::Extra) -> Action {
+        match extra.kind {
+            crate::extras::Kind::Calc => Action::Copy(extra.entry.command.clone()),
+            _ => Action::OpenFile(extra.entry.clone()),
         }
     }
     pub fn activate(&mut self, hit: Hit) -> Option<Action> {
@@ -926,6 +993,7 @@ impl LauncherState {
                 });
             }
             Hit::Pinned(_) | Hit::App(_) => return self.entry(hit).cloned().map(Action::Launch),
+            Hit::Extra(_) => return self.extra(hit).map(Self::extra_action),
             Hit::ShowAllRecent => {
                 let folder = crate::catalog::recent_folder()?;
                 return Some(Action::OpenFile(AppEntry {
@@ -955,7 +1023,12 @@ impl LauncherState {
                 self.selection = None;
                 self.hovered = None;
             }
-            Hit::DetailOpen => return self.detail_entry().cloned().map(Action::Launch),
+            Hit::DetailOpen => {
+                if let Some(extra) = self.extra(hit) {
+                    return Some(Self::extra_action(extra));
+                }
+                return self.detail_entry().cloned().map(Action::Launch);
+            }
             Hit::DetailOptions => {
                 let (x, y, _, h) = Self::detail_options_rect();
                 self.open_context(Hit::DetailOptions, x, y + h + 4.0);
@@ -983,6 +1056,10 @@ impl LauncherState {
     /// salirse del panel. Devuelve si había una app ahí (los archivos recientes no
     /// tienen menú de app).
     pub fn open_context(&mut self, hit: Hit, x: f32, y: f32) -> bool {
+        // Los resultados que no son programas no tienen menú.
+        if self.extra(hit).is_some() {
+            return false;
+        }
         if let Hit::Recent(i) = hit {
             if self.recent.get(i).is_some_and(|r| r.file) {
                 return false;
@@ -1252,7 +1329,7 @@ impl LauncherState {
                 return Some(Hit::DetailOpen);
             }
             let (ox, oy, ow, oh) = Self::detail_options_rect();
-            if within(ox, oy, ow, oh) {
+            if within(ox, oy, ow, oh) && self.extra(Hit::DetailOptions).is_none() {
                 return Some(Hit::DetailOptions);
             }
             return self
@@ -1502,23 +1579,39 @@ impl LauncherState {
                     1.5 * scale,
                 );
             }
+            let extra = self
+                .extra(slot.hit)
+                .map(|e| (e.kind.glyph(), e.detail.clone()));
             match slot.shape {
                 Shape::Row => {
-                    self.icon(
-                        &mut view,
-                        &entry,
-                        x + 12.0,
-                        y + (slot.h - ICON) / 2.0,
-                        ICON,
-                        scale,
-                    );
+                    match extra.as_ref().and_then(|(glyph, _)| *glyph) {
+                        Some(glyph) => draw_icon(
+                            &mut view,
+                            glyph,
+                            (x + 12.0 + ICON / 2.0) * scale,
+                            (y + slot.h / 2.0) * scale,
+                            20.0 * scale,
+                            0.9,
+                        ),
+                        None => self.icon(
+                            &mut view,
+                            &entry,
+                            x + 12.0,
+                            y + (slot.h - ICON) / 2.0,
+                            ICON,
+                            scale,
+                        ),
+                    }
                     let name = fit_text(&entry.name, 13.0 * scale, (slot.w - 64.0) * scale);
                     let subtitle = match slot.hit {
                         Hit::Recent(i) => match self.recent.get(i) {
                             Some(item) if item.at > 0 => describe_time(now, item.at, local_moment),
                             _ => "Abierta recientemente".into(),
                         },
-                        _ => "Aplicación".into(),
+                        _ => match &extra {
+                            Some((_, detail)) => detail.clone(),
+                            None => "Aplicación".into(),
+                        },
                     };
                     let subtitle = fit_text(&subtitle, 11.5 * scale, (slot.w - 64.0) * scale);
                     self.text(&mut view, &name, x + 56.0, y + 8.0, 13.0, scale, 0.95);
@@ -1916,20 +2009,32 @@ impl LauncherState {
         };
         let command = entry.command.clone();
         let big = (DETAIL_ICON * scale).round().max(1.0) as u32;
-        let icon = self
-            .detail_icons
-            .entry(command.clone())
-            .or_insert_with(|| {
-                crate::icons::load(&command).map(|icon| {
-                    if icon.width() > big {
-                        crate::apps::downscale(&icon, big)
-                    } else {
-                        icon
-                    }
+        // Un resultado que no es un programa: su icono de la fuente (los archivos, el
+        // suyo), qué es en lugar de "Aplicación", y ni opciones ni jump list.
+        let extra = self
+            .extra(Hit::DetailOpen)
+            .map(|e| (e.kind, e.detail.clone()));
+        let glyph = extra.as_ref().and_then(|(kind, _)| kind.glyph());
+        let icon = if glyph.is_some() {
+            None
+        } else {
+            self.detail_icons
+                .entry(command.clone())
+                .or_insert_with(|| {
+                    crate::icons::load(&command).map(|icon| {
+                        if icon.width() > big {
+                            crate::apps::downscale(&icon, big)
+                        } else {
+                            icon
+                        }
+                    })
                 })
-            })
-            .clone();
+                .clone()
+        };
         self.jumps.entry(command.clone()).or_insert_with(|| {
+            if extra.is_some() {
+                return Vec::new();
+            }
             crate::jumplist::app_id(&command, &[])
                 .map(|id| crate::jumplist::sections(&id))
                 .unwrap_or_default()
@@ -1950,7 +2055,11 @@ impl LauncherState {
         );
         let name = fit_text(&entry.name, s(16.0), s(w - 40.0));
         draw_text_semibold(image, &name, s(x + 20.0), s(y + 18.0), s(16.0), 0.95);
-        self.text(image, "Aplicación", x + 20.0, y + 42.0, 12.0, scale, 0.55);
+        let what = match &extra {
+            Some((_, detail)) => detail.as_str(),
+            None => "Aplicación",
+        };
+        self.text(image, what, x + 20.0, y + 42.0, 12.0, scale, 0.55);
 
         // Tarjeta con el icono grande.
         let (cx, cy, cw, ch) = (x + 20.0, y + 70.0, w - 40.0, 112.0);
@@ -1982,12 +2091,25 @@ impl LauncherState {
                 s(DETAIL_ICON),
             );
         }
+        if let Some(glyph) = glyph {
+            draw_icon(
+                image,
+                glyph,
+                s(cx + cw / 2.0),
+                s(cy + ch / 2.0),
+                s(DETAIL_ICON * 0.7),
+                0.9,
+            );
+        }
 
         // "Abrir" y "Opciones", con el resaltado al pasar el cursor.
         for (hit, (bx, by, bw, bh)) in [
             (Hit::DetailOpen, Self::detail_open_rect()),
             (Hit::DetailOptions, Self::detail_options_rect()),
         ] {
+            if hit == Hit::DetailOptions && extra.is_some() {
+                continue;
+            }
             let active =
                 self.hovered == Some(hit) || (hit == Hit::DetailOptions && self.context.is_some());
             fill_rounded(
@@ -1999,10 +2121,10 @@ impl LauncherState {
                 s(bh),
                 s(4.0),
             );
-            let label = if hit == Hit::DetailOpen {
-                "Abrir"
-            } else {
-                "Opciones"
+            let label = match (hit, &extra) {
+                (Hit::DetailOpen, Some((crate::extras::Kind::Calc, _))) => "Copiar",
+                (Hit::DetailOpen, _) => "Abrir",
+                _ => "Opciones",
             };
             let size = 13.0;
             let label_w = text_width(label, s(size)) / scale;
@@ -2604,6 +2726,8 @@ mod tests {
             detail_icons: HashMap::new(),
             jumps: HashMap::new(),
             admin: HashMap::new(),
+            files: Vec::new(),
+            extras: Vec::new(),
         };
         state.regroup(&HashMap::new());
         state
@@ -2653,14 +2777,14 @@ mod tests {
         );
         let (x, y) = point_of(&menu, Hit::Recent(0));
         assert_eq!(menu.hit_test(x, y), Some(Hit::Recent(0)));
-        // Al buscar solo quedan los resultados.
+        // Al buscar solo quedan los resultados: las apps y, al final, la web.
         menu.insert_text("editor 24");
         assert!(menu
             .layout()
             .slots
             .iter()
-            .all(|s| matches!(s.hit, Hit::App(_))));
-        assert_eq!(menu.layout().slots.len(), 1);
+            .all(|s| matches!(s.hit, Hit::App(_) | Hit::Extra(_))));
+        assert_eq!(menu.layout().slots.len(), 2);
     }
 
     #[test]
@@ -3222,7 +3346,7 @@ mod tests {
         menu.insert_text("editor");
         let layout = menu.layout();
         let titles: Vec<_> = layout.headers.iter().map(|(t, _)| t.as_str()).collect();
-        assert_eq!(titles, ["Mejor coincidencia", "Aplicaciones"]);
+        assert_eq!(titles, ["Mejor coincidencia", "Aplicaciones", "Web"]);
         // Los resultados dejan sitio al detalle, a su derecha.
         assert!(layout.slots.iter().all(|s| PAD + s.x + s.w < DETAIL_X));
         let best = menu.first_match().unwrap();
@@ -3257,5 +3381,75 @@ mod tests {
             menu.first_match().and_then(|hit| menu.activate(hit)),
             Some(Action::Launch(_))
         ));
+    }
+
+    #[test]
+    fn search_also_offers_results_that_are_not_apps() {
+        let mut menu = state();
+        menu.files = vec![entry("Editor de notas.txt", r"C:\notas.txt")];
+        let titles = |menu: &LauncherState| -> Vec<String> {
+            menu.layout().headers.into_iter().map(|(t, _)| t).collect()
+        };
+
+        // Una operación: su resultado es lo primero, y Enter lo copia.
+        menu.insert_text("12*12");
+        assert_eq!(titles(&menu), ["Calculadora", "Web"]);
+        let first = menu.first_match().unwrap();
+        assert!(matches!(first, Hit::Extra(_)));
+        assert_eq!(menu.entry(first).unwrap().name, "= 144");
+        assert!(matches!(menu.activate(first), Some(Action::Copy(text)) if text == "144"));
+        // En el detalle, "Copiar" hace lo mismo y no hay "Opciones" ni menú.
+        assert!(matches!(
+            menu.activate(Hit::DetailOpen),
+            Some(Action::Copy(_))
+        ));
+        let (x, y, w, h) = LauncherState::detail_options_rect();
+        assert_eq!(menu.hit_test(x + w / 2.0, y + h / 2.0), None);
+        assert!(!menu.open_context_from_keyboard());
+        assert!(menu.context.is_none());
+
+        // Una página de Configuración se abre por su dirección.
+        menu.activate(Hit::ClearSearch);
+        assert!(menu.extras.is_empty());
+        menu.insert_text("bluetooth");
+        assert_eq!(titles(&menu), ["Configuración", "Web"]);
+        let setting = menu.first_match().unwrap();
+        assert!(matches!(
+            menu.activate(setting),
+            Some(Action::OpenFile(e)) if e.command == "ms-settings:bluetooth"
+        ));
+
+        // Con apps que coinciden, estas van delante y los archivos y la web detrás.
+        menu.activate(Hit::ClearSearch);
+        menu.insert_text("editor");
+        assert_eq!(
+            titles(&menu),
+            ["Mejor coincidencia", "Aplicaciones", "Archivos", "Web"]
+        );
+        assert!(matches!(menu.first_match(), Some(Hit::App(_))));
+        let layout = menu.layout();
+        let file = layout
+            .slots
+            .iter()
+            .find(|s| {
+                menu.extra(s.hit)
+                    .is_some_and(|e| e.kind == crate::extras::Kind::File)
+            })
+            .unwrap();
+        assert!(matches!(
+            menu.activate(file.hit),
+            Some(Action::OpenFile(e)) if e.command == r"C:\notas.txt"
+        ));
+        // La web es siempre lo último.
+        let last = layout.slots.last().unwrap().hit;
+        assert!(matches!(
+            menu.activate(last),
+            Some(Action::OpenFile(e)) if e.command.starts_with("https://")
+        ));
+
+        // Sin nada que coincida queda el aviso, y la web.
+        menu.activate(Hit::ClearSearch);
+        menu.insert_text("zzzz");
+        assert_eq!(titles(&menu), ["Sin resultados", "Web"]);
     }
 }
