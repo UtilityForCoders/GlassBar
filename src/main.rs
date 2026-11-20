@@ -3049,13 +3049,14 @@ impl App {
             self.settings_updates(),
         );
         if self.settings.is_none() {
-            match SettingsWindow::new(self.hwnd, model.clone()) {
+            match SettingsWindow::new(model.clone()) {
                 Ok(window) => self.settings = Some(window),
                 Err(_) => return,
             }
         }
         if let Some(window) = &mut self.settings {
             if window.visible {
+                window.restore();
                 take_focus(window.hwnd);
                 return;
             }
@@ -6198,7 +6199,9 @@ unsafe extern "system" fn topbar_wndproc(
     }
 }
 
-/// Ventana de configuración (ver `settings`), centrada en el monitor del dock.
+/// Ventana de configuración (ver `settings`), centrada en el monitor del dock. A
+/// diferencia de los paneles, es una ventana de aplicación: sale en el dock, se
+/// minimiza y sigue abierta al pasar a otra ventana.
 struct SettingsWindow {
     hwnd: HWND,
     backdrop: Option<style::Backdrop>,
@@ -6214,18 +6217,22 @@ struct SettingsWindow {
     placed: Option<POINT>,
 }
 impl SettingsWindow {
-    fn new(owner: HWND, model: settings::SettingsState) -> Result<Self> {
+    fn new(model: settings::SettingsState) -> Result<Self> {
+        use windows::Win32::UI::WindowsAndMessaging::{
+            WS_EX_APPWINDOW, WS_MINIMIZEBOX, WS_SYSMENU,
+        };
+        // Sin dueño: una ventana con dueño no sale en la barra ni se minimiza sola.
         let hwnd = unsafe {
             CreateWindowExW(
-                WS_EX_LAYERED | WS_EX_TOPMOST | WS_EX_TOOLWINDOW,
+                WS_EX_LAYERED | WS_EX_APPWINDOW,
                 w!("GlassBarSettings"),
                 w!("GlassBar — Configuración"),
-                WS_POPUP,
+                WS_POPUP | WS_MINIMIZEBOX | WS_SYSMENU,
                 0,
                 0,
                 1,
                 1,
-                Some(owner),
+                None,
                 None,
                 Some(GetModuleHandleW(None)?.into()),
                 None,
@@ -6269,9 +6276,30 @@ impl SettingsWindow {
             })
             .unwrap_or(centered);
         self.visible = true;
+        self.restore();
         self.transition.open(Instant::now());
         self.render();
         take_focus(self.hwnd);
+    }
+    fn minimized(&self) -> bool {
+        unsafe { windows::Win32::UI::WindowsAndMessaging::IsIconic(self.hwnd).as_bool() }
+    }
+    fn minimize(&mut self) {
+        use windows::Win32::UI::WindowsAndMessaging::SW_MINIMIZE;
+        self.model.hovered = None;
+        self.grab = None;
+        unsafe {
+            let _ = ShowWindow(self.hwnd, SW_MINIMIZE);
+        }
+    }
+    /// La vuelve a mostrar si estaba minimizada.
+    fn restore(&mut self) {
+        use windows::Win32::UI::WindowsAndMessaging::SW_RESTORE;
+        if self.minimized() {
+            unsafe {
+                let _ = ShowWindow(self.hwnd, SW_RESTORE);
+            }
+        }
     }
     fn render(&mut self) {
         if let Some(surface) = &mut self.surface {
@@ -6283,6 +6311,20 @@ impl SettingsWindow {
         self.present();
     }
     fn present(&mut self) {
+        // Minimizada no se pinta ni se mueve; su desenfoque, que es otra ventana, se
+        // quita. Si se cerró estando así, se esconde sin animación.
+        if self.minimized() {
+            frames::stop(self.hwnd);
+            if let Some(backdrop) = &self.backdrop {
+                backdrop.hide();
+            }
+            if !self.visible {
+                unsafe {
+                    let _ = ShowWindow(self.hwnd, SW_HIDE);
+                }
+            }
+            return;
+        }
         if let Some(surface) = &mut self.surface {
             let shapes = [panel_shape(surface, self.scale, 12.0)];
             present_popup(
@@ -6318,6 +6360,10 @@ impl Drop for SettingsWindow {
     }
 }
 
+/// Pone al día la configuración (y su desenfoque) tras activarse, minimizarse o
+/// restaurarse.
+const WM_SETTINGS_SYNC: u32 = windows::Win32::UI::WindowsAndMessaging::WM_APP + 0x40;
+
 /// Cambia la opacidad de los paneles desde la barra de la configuración.
 fn set_settings_opacity(app: &mut App, x: f32) {
     let value = settings::SettingsState::opacity_at(x);
@@ -6332,7 +6378,9 @@ unsafe extern "system" fn settings_wndproc(
     wparam: WPARAM,
     lparam: LPARAM,
 ) -> LRESULT {
-    use windows::Win32::UI::WindowsAndMessaging::{WA_INACTIVE, WM_ACTIVATE, WM_KEYDOWN};
+    use windows::Win32::UI::WindowsAndMessaging::{
+        SIZE_MINIMIZED, SIZE_RESTORED, WA_INACTIVE, WM_ACTIVATE, WM_CLOSE, WM_KEYDOWN, WM_SIZE,
+    };
     let point = |scale: f32| {
         (
             (lparam.0 & 0xffff) as i16 as f32 / scale,
@@ -6340,7 +6388,32 @@ unsafe extern "system" fn settings_wndproc(
         )
     };
     match msg {
-        WM_ACTIVATE if (wparam.0 & 0xffff) as u32 == WA_INACTIVE => {
+        // Al activarse pasa delante de las demás, y al minimizarla o restaurarla
+        // aparece o desaparece: su desenfoque, que es otra ventana, se pone o se quita.
+        // Se hace después, en cola: estos avisos llegan también mientras GlassBar la
+        // minimiza o la restaura (desde el dock), y entonces no se podría atender.
+        WM_ACTIVATE | WM_SIZE
+            if (msg == WM_ACTIVATE && (wparam.0 & 0xffff) as u32 != WA_INACTIVE)
+                || (msg == WM_SIZE
+                    && matches!(wparam.0 as u32, SIZE_MINIMIZED | SIZE_RESTORED)) =>
+        {
+            let _ = windows::Win32::UI::WindowsAndMessaging::PostMessageW(
+                Some(hwnd),
+                WM_SETTINGS_SYNC,
+                WPARAM(0),
+                LPARAM(0),
+            );
+        }
+        WM_SETTINGS_SYNC => {
+            with_app(|app| {
+                if let Some(panel) = app.settings.as_mut().filter(|p| p.visible) {
+                    panel.render();
+                }
+            });
+        }
+        // Alt+F4, o "Cerrar ventana" desde el dock: se esconde, como con la ✕. Sin
+        // esto Windows la destruiría y la configuración ya no se podría abrir.
+        WM_CLOSE => {
             with_app(|app| app.settings.as_mut().map(SettingsWindow::hide));
         }
         WM_TIMER if wparam.0 == TIMER_ANIM => {
@@ -6445,6 +6518,10 @@ unsafe extern "system" fn settings_wndproc(
                 };
                 if hit == settings::Hit::Close {
                     panel.hide();
+                    return;
+                }
+                if hit == settings::Hit::Minimize {
+                    panel.minimize();
                     return;
                 }
                 if let Some(command) = panel.model.command(hit) {
@@ -6819,6 +6896,8 @@ fn main() -> Result<()> {
             lpfnWndProc: Some(settings_wndproc),
             hInstance: instance.into(),
             hCursor: LoadCursorW(None, IDC_ARROW)?,
+            // Es una ventana de aplicación: sale en el dock y en Alt+Tab con su icono.
+            hIcon: tray::app_icon(),
             lpszClassName: w!("GlassBarSettings"),
             ..Default::default()
         };

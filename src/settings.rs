@@ -14,8 +14,14 @@ const PAD: f32 = 16.0;
 const TITLE_H: f32 = 58.0;
 const SECTION_H: f32 = 34.0;
 const ROW: f32 = 42.0;
-/// Botón de cerrar, arriba a la derecha.
+/// Botones de minimizar y cerrar, arriba a la derecha.
 const CLOSE: f32 = 32.0;
+const BUTTONS_TOP: f32 = 13.0;
+/// Borde izquierdo de cerrar y de minimizar, que va justo a su izquierda.
+const CLOSE_LEFT: f32 = WIDTH - PAD - CLOSE;
+const MINIMIZE_LEFT: f32 = CLOSE_LEFT - CLOSE - 2.0;
+/// Icono de minimizar (Segoe Fluent Icons / MDL2 Assets).
+const GLYPH_MINIMIZE: char = '\u{E921}';
 /// Interruptor.
 const SWITCH_W: f32 = 38.0;
 const SWITCH_H: f32 = 20.0;
@@ -43,6 +49,7 @@ pub enum Switch {
 /// Lo que hay bajo el cursor.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum Hit {
+    Minimize,
     Close,
     Switch(Switch),
     /// Activar o quitar una situación (todas menos el escritorio).
@@ -178,8 +185,13 @@ impl SettingsState {
     }
 
     pub fn hit_test(&self, x: f32, y: f32) -> Option<Hit> {
-        if (WIDTH - PAD - CLOSE..WIDTH - PAD).contains(&x) && (13.0..13.0 + CLOSE).contains(&y) {
-            return Some(Hit::Close);
+        if (BUTTONS_TOP..BUTTONS_TOP + CLOSE).contains(&y) {
+            if (CLOSE_LEFT..CLOSE_LEFT + CLOSE).contains(&x) {
+                return Some(Hit::Close);
+            }
+            if (MINIMIZE_LEFT..MINIMIZE_LEFT + CLOSE).contains(&x) {
+                return Some(Hit::Minimize);
+            }
         }
         let (line, top) = layout()
             .into_iter()
@@ -227,9 +239,10 @@ impl SettingsState {
         }
     }
 
-    /// El cursor está en la cabecera (fuera de la ✕): desde ahí se arrastra la ventana.
+    /// El cursor está en la cabecera (fuera de minimizar y de la ✕): desde ahí se
+    /// arrastra la ventana.
     pub fn in_title(x: f32, y: f32) -> bool {
-        (0.0..TITLE_H).contains(&y) && (0.0..WIDTH - PAD - CLOSE).contains(&x)
+        (0.0..TITLE_H).contains(&y) && (0.0..MINIMIZE_LEFT).contains(&x)
     }
 
     /// Valor de la opacidad (0 a 1) para el cursor en `x`.
@@ -269,7 +282,7 @@ impl SettingsState {
             Hit::Export => CMD_EXPORT,
             Hit::Import => CMD_IMPORT,
             Hit::Exit => CMD_EXIT,
-            Hit::Close | Hit::Opacity => return None,
+            Hit::Minimize | Hit::Close | Hit::Opacity => return None,
         })
     }
 
@@ -298,27 +311,31 @@ impl SettingsState {
         );
         let version = format!("Versión {}", env!("CARGO_PKG_VERSION"));
         draw_text_on_baseline(image, &version, s(PAD + 2.0), s(48.0), s(11.5), 0.6);
-        // Cerrar.
-        let close_x = WIDTH - PAD - CLOSE / 2.0;
-        if self.hovered == Some(Hit::Close) {
-            fill_rounded(
+        // Minimizar y cerrar.
+        for (hit, left, glyph) in [
+            (Hit::Minimize, MINIMIZE_LEFT, GLYPH_MINIMIZE),
+            (Hit::Close, CLOSE_LEFT, crate::appmenu::GLYPH_CLOSE),
+        ] {
+            if self.hovered == Some(hit) {
+                fill_rounded(
+                    image,
+                    [255, 255, 255, 22],
+                    s(left),
+                    s(BUTTONS_TOP),
+                    s(CLOSE),
+                    s(CLOSE),
+                    s(6.0),
+                );
+            }
+            crate::clock::draw_icon_aligned(
                 image,
-                [255, 255, 255, 22],
-                s(close_x - CLOSE / 2.0),
-                s(13.0),
-                s(CLOSE),
-                s(CLOSE),
-                s(6.0),
+                glyph,
+                s(left + CLOSE / 2.0),
+                s(BUTTONS_TOP + CLOSE / 2.0),
+                s(12.0),
+                0.9,
             );
         }
-        crate::clock::draw_icon_aligned(
-            image,
-            crate::appmenu::GLYPH_CLOSE,
-            s(close_x),
-            s(13.0 + CLOSE / 2.0),
-            s(12.0),
-            0.9,
-        );
 
         let size = s(TEXT);
         let (ascent, descent) = line_metrics(size);
@@ -705,20 +722,26 @@ mod tests {
     }
 
     #[test]
-    fn the_header_moves_the_window_but_not_the_close_button() {
+    fn the_header_moves_the_window_but_not_its_buttons() {
         assert!(SettingsState::in_title(40.0, 20.0));
-        assert!(SettingsState::in_title(WIDTH - PAD - CLOSE - 1.0, 50.0));
+        assert!(SettingsState::in_title(MINIMIZE_LEFT - 1.0, 50.0));
+        assert!(!SettingsState::in_title(MINIMIZE_LEFT + 10.0, 25.0));
         assert!(!SettingsState::in_title(WIDTH - PAD - 10.0, 25.0));
         assert!(!SettingsState::in_title(40.0, TITLE_H + 1.0));
     }
 
     #[test]
-    fn close_and_opacity() {
+    fn minimize_close_and_opacity() {
         let settings = state();
         assert_eq!(
             settings.hit_test(WIDTH - PAD - 10.0, 25.0),
             Some(Hit::Close)
         );
+        assert_eq!(
+            settings.hit_test(MINIMIZE_LEFT + 10.0, 25.0),
+            Some(Hit::Minimize)
+        );
+        assert_eq!(settings.command(Hit::Minimize), None);
         let y = row_center(Line::Opacity);
         assert_eq!(
             settings.hit_test(right_edge() - 60.0, y),

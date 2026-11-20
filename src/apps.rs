@@ -730,7 +730,8 @@ unsafe fn taskbar_window_process(hwnd: HWND) -> Option<(String, Option<String>)>
         return None;
     }
     let (pid, exe, app_id) = window_process(hwnd)?;
-    if pid == GetCurrentProcessId() {
+    // De GlassBar solo sale la configuración, la única ventana de aplicación suya.
+    if pid == GetCurrentProcessId() && ex & WS_EX_APPWINDOW.0 == 0 {
         return None;
     }
     Some((exe, app_id))
