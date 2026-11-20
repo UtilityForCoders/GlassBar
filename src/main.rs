@@ -2477,12 +2477,12 @@ impl App {
         self.screen_right = rc.right;
         self.y_hidden = rc.bottom;
         self.relayout();
-        self.check_priority(false);
         self.update_style();
         self.sync_appbar();
         if let Some(top) = &mut self.top {
             top.place();
         }
+        self.check_priority(false);
     }
 
     /// Marca las apps con alguna ventana que pide atención; `true` si cambió alguna.
@@ -2950,6 +2950,8 @@ impl App {
                 Ok(mut top) => {
                     top.place();
                     self.top = Some(top);
+                    // Se muestra ya, salvo que haya una app a pantalla completa.
+                    self.check_priority(true);
                 }
                 Err(_) => return,
             }
@@ -6072,7 +6074,9 @@ impl TopBarWindow {
         (topbar::HEIGHT * self.scale).ceil() as i32
     }
 
-    /// Se coloca arriba del monitor principal, reserva su sitio y se muestra.
+    /// Se coloca arriba del monitor principal y reserva su sitio. No se muestra:
+    /// eso lo decide `check_priority`, que la deja apartada si hay una app a
+    /// pantalla completa (Windows avisa de `ABN_POSCHANGED` también durante un juego).
     fn place(&mut self) {
         self.monitor = monitors::primary();
         let (rect, dpi) = monitors::get_info(self.monitor);
@@ -6096,12 +6100,11 @@ impl TopBarWindow {
         }
         self.drawn = None;
         self.render();
-        if self.hidden {
-            self.set_hidden(false);
+        // Encima de todo, salvo de una isla como Notch Isla, que tiene que seguir
+        // encima de ella.
+        if !self.hidden {
+            priority::raise_below_overlapping(self.hwnd, self.rect);
         }
-        // Al crearse queda encima de todo; una isla como Notch Isla tiene que
-        // seguir encima de ella.
-        priority::raise_below_overlapping(self.hwnd, self.rect);
     }
 
     fn render(&mut self) {
@@ -6225,6 +6228,7 @@ unsafe extern "system" fn topbar_wndproc(
                         if let Some(top) = &mut app.top {
                             top.place();
                         }
+                        app.check_priority(false);
                     });
                 }
                 appbar::ABN_FULLSCREENAPP => {
