@@ -77,8 +77,22 @@ pub fn display_name(path: &str) -> Option<String> {
     }
 }
 
+/// Las rutas se escriben con `\`, pero un elemento del Shell (`shell:AppsFolder\…`)
+/// se queda como está: su nombre puede ser una dirección (`steam://rungameid/730`,
+/// `https://…`) y con `\` el Shell ya no lo encuentra.
+fn normalize(path: &str) -> String {
+    if path
+        .get(..6)
+        .is_some_and(|p| p.eq_ignore_ascii_case("shell:"))
+    {
+        path.to_string()
+    } else {
+        path.replace('/', "\\")
+    }
+}
+
 fn load_inner(path: &str) -> Option<Pixmap> {
-    let normalized = path.replace('/', "\\");
+    let normalized = normalize(path);
     let wide: Vec<u16> = normalized.encode_utf16().chain(Some(0)).collect();
     unsafe {
         let resource = crate::pins::shortcut_icon_source(&normalized).or_else(|| {
@@ -279,6 +293,18 @@ unsafe fn rasterize_at(
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn shell_items_keep_their_slashes() {
+        assert_eq!(
+            super::normalize("shell:AppsFolder\\steam://rungameid/730"),
+            "shell:AppsFolder\\steam://rungameid/730"
+        );
+        assert_eq!(
+            super::normalize("C:/Program Files/App/app.exe"),
+            "C:\\Program Files\\App\\app.exe"
+        );
+    }
+
     #[test]
     fn shell_icons_have_visible_and_transparent_pixels() {
         let path = format!("{}\\explorer.exe", std::env::var("WINDIR").unwrap());

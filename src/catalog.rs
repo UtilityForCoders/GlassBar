@@ -2,10 +2,19 @@
 use crate::apps::AppEntry;
 use std::path::{Path, PathBuf};
 
+/// Las apps de Inicio de Windows (AppsFolder) y las ancladas. Las carpetas del menú
+/// Inicio solo se leen si AppsFolder no responde: AppsFolder ya incluye sus accesos,
+/// con el nombre traducido (las carpetas añadirían "Magnify" junto a "Lupa") y sin
+/// los que Windows esconde, como los desinstaladores.
 pub fn installed(pinned: &[AppEntry]) -> Vec<AppEntry> {
     let mut result = windows_apps();
+    let folders: &[&str] = if result.is_empty() {
+        &["APPDATA", "PROGRAMDATA"]
+    } else {
+        &[]
+    };
     result.extend_from_slice(pinned);
-    for variable in ["APPDATA", "PROGRAMDATA"] {
+    for variable in folders {
         if let Some(root) = std::env::var_os(variable) {
             scan(
                 &PathBuf::from(root)
