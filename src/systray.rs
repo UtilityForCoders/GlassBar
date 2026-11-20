@@ -288,9 +288,10 @@ fn process_name(window: HWND) -> String {
     unsafe {
         GetWindowThreadProcessId(window, Some(&mut pid));
     }
-    crate::apps::process_info(pid)
-        .map(|(exe, _)| exe.rsplit('\\').next().unwrap_or_default().to_string())
-        .unwrap_or_else(|| format!("pid {pid}"))
+    match process_name_of(pid) {
+        name if name.is_empty() => format!("pid {pid}"),
+        name => name,
+    }
 }
 
 /// Iconos recibidos. Los escribe el hilo de la bandeja y los lee el del dock.
@@ -379,7 +380,7 @@ impl Host {
             return None;
         }
         log(|| "Bandeja propia lista; se pide a los programas sus iconos".into());
-        announce();
+        announce(true);
         Some(host)
     }
 
@@ -435,7 +436,7 @@ impl Host {
     pub fn announce_again(&self) {
         self.announced.set(std::time::Instant::now());
         log(|| "Se vuelven a pedir los iconos a los programas".into());
-        announce();
+        announce(false);
     }
 }
 
@@ -448,7 +449,7 @@ impl Drop for Host {
             let _ = handle.join();
         }
         // Que vuelvan a registrarlos con Explorer, por si alguno no le llegó.
-        announce();
+        announce(false);
         icons().clear();
     }
 }
@@ -483,17 +484,108 @@ unsafe fn create_window() -> Option<HWND> {
     .ok()
 }
 
-/// Avisa a todos los programas de que la barra se creó: vuelven a registrar sus
-/// iconos (como cuando Explorer se reinicia).
-fn announce() {
+/// Avisa a los programas de que la barra se creó: vuelven a registrar sus iconos
+/// (como cuando Explorer se reinicia).
+///
+/// Los fondos animados (Wallpaper Engine, Lively) también lo escuchan y, creyendo
+/// que Explorer se reinició, quitan el fondo y lo vuelven a poner. Solo se les
+/// avisa con `everyone`, al crear la bandeja propia: hace falta para que su icono
+/// llegue a GlassBar. En las demás peticiones se les salta; su icono ya está aquí
+/// o en Explorer, al que se le reenvía todo.
+fn announce(everyone: bool) {
     unsafe {
         let message = RegisterWindowMessageW(w!("TaskbarCreated"));
-        if message != 0 {
-            // En cola: las ventanas de GlassBar también lo reciben, y si se les
-            // entregase en el acto lo harían mientras GlassBar está ocupado avisando.
+        if message == 0 {
+            return;
+        }
+        // En cola: las ventanas de GlassBar también lo reciben, y si se les
+        // entregase en el acto lo harían mientras GlassBar está ocupado avisando.
+        if everyone {
             let _ = PostMessageW(Some(HWND_BROADCAST), message, WPARAM(0), LPARAM(0));
+            return;
+        }
+        let windows = top_level_windows();
+        let skip = wallpaper_processes(&windows);
+        for (window, pid) in windows {
+            // Como `HWND_BROADCAST`: solo las ventanas sin dueño.
+            if !skip.contains(&pid) && GetWindow(window, GW_OWNER).is_err() {
+                let _ = PostMessageW(Some(window), message, WPARAM(0), LPARAM(0));
+            }
         }
     }
+}
+
+/// Ejecutables de fondos animados, por si la ventana pegada al escritorio es de
+/// otro proceso suyo (los fondos web van en un proceso aparte).
+const WALLPAPER_EXES: &[&str] = &["wallpaper32.exe", "wallpaper64.exe", "lively.exe"];
+
+/// Ventanas de primer nivel con el proceso de cada una.
+fn top_level_windows() -> Vec<(HWND, u32)> {
+    unsafe extern "system" fn visit(hwnd: HWND, lparam: LPARAM) -> windows::core::BOOL {
+        let list = &mut *(lparam.0 as *mut Vec<(HWND, u32)>);
+        let mut pid = 0;
+        GetWindowThreadProcessId(hwnd, Some(&mut pid));
+        list.push((hwnd, pid));
+        true.into()
+    }
+    let mut list = Vec::new();
+    unsafe {
+        let _ = EnumWindows(Some(visit), LPARAM(&mut list as *mut Vec<_> as isize));
+    }
+    list
+}
+
+/// Procesos que pintan un fondo animado: los que tienen ventanas dentro de las del
+/// escritorio (`Progman`, `WorkerW`) sin ser Explorer, y los de `WALLPAPER_EXES`.
+fn wallpaper_processes(windows: &[(HWND, u32)]) -> Vec<u32> {
+    unsafe extern "system" fn visit(hwnd: HWND, lparam: LPARAM) -> windows::core::BOOL {
+        let list = &mut *(lparam.0 as *mut Vec<u32>);
+        let mut pid = 0;
+        GetWindowThreadProcessId(hwnd, Some(&mut pid));
+        list.push(pid);
+        true.into()
+    }
+    let mut found = Vec::new();
+    for &(window, desktop) in windows {
+        let mut name = [0u16; 16];
+        let len = unsafe { GetClassNameW(window, &mut name) }.max(0) as usize;
+        let class = String::from_utf16_lossy(&name[..len]);
+        if class != "Progman" && class != "WorkerW" {
+            continue;
+        }
+        let mut inside: Vec<u32> = Vec::new();
+        unsafe {
+            let _ = EnumChildWindows(
+                Some(window),
+                Some(visit),
+                LPARAM(&mut inside as *mut Vec<u32> as isize),
+            );
+        }
+        found.extend(inside.into_iter().filter(|&pid| pid != 0 && pid != desktop));
+    }
+    let mut seen = Vec::new();
+    for &(_, pid) in windows {
+        if pid == 0 || seen.contains(&pid) || found.contains(&pid) {
+            continue;
+        }
+        seen.push(pid);
+        if WALLPAPER_EXES
+            .iter()
+            .any(|exe| process_name_of(pid).eq_ignore_ascii_case(exe))
+        {
+            found.push(pid);
+        }
+    }
+    found.sort_unstable();
+    found.dedup();
+    found
+}
+
+/// Nombre del ejecutable de un proceso, sin la ruta.
+fn process_name_of(pid: u32) -> String {
+    crate::apps::process_info(pid)
+        .map(|(exe, _)| exe.rsplit('\\').next().unwrap_or_default().to_string())
+        .unwrap_or_default()
 }
 
 /// Imagen de un icono que manda otro programa. Los iconos son objetos compartidos
