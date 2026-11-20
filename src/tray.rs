@@ -30,15 +30,19 @@ pub struct Tray {
     icon: HICON,
 }
 
+/// El icono de GlassBar, o el genérico de Windows si no se puede cargar.
+pub fn app_icon() -> HICON {
+    unsafe {
+        let instance = GetModuleHandleW(None).unwrap_or_default();
+        LoadIconW(Some(instance.into()), resource(ICON_RESOURCE))
+            .or_else(|_| LoadIconW(None, IDI_APPLICATION))
+            .unwrap_or_default()
+    }
+}
+
 impl Tray {
     pub fn new(hwnd: HWND) -> Self {
-        let icon = unsafe {
-            let instance = GetModuleHandleW(None).unwrap_or_default();
-            LoadIconW(Some(instance.into()), resource(ICON_RESOURCE))
-                .or_else(|_| LoadIconW(None, IDI_APPLICATION))
-                .unwrap_or_default()
-        };
-
+        let icon = app_icon();
         let tray = Self { hwnd, icon };
         tray.register();
         tray
