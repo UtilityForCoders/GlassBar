@@ -4025,6 +4025,11 @@ unsafe extern "system" fn wndproc(hwnd: HWND, msg: u32, wparam: WPARAM, lparam: 
             }
             DefWindowProcW(hwnd, msg, wparam, lparam)
         }
+        // Alt+F4 con el dock activo (tras recorrerlo con el teclado, o porque Windows
+        // le pasó la activación al cerrarse un panel suyo) cerraría GlassBar. Se
+        // ignora: se sale desde la configuración o el menú. El `WM_CLOSE` que manda
+        // `--replace` no pasa por aquí y sigue cerrándolo.
+        windows::Win32::UI::WindowsAndMessaging::WM_SYSCOMMAND if is_sc_close(wparam) => LRESULT(0),
         WM_DESTROY => {
             with_app(|app| {
                 app.release_shell();
@@ -4035,6 +4040,45 @@ unsafe extern "system" fn wndproc(hwnd: HWND, msg: u32, wparam: WPARAM, lparam: 
 
         _ => DefWindowProcW(hwnd, msg, wparam, lparam),
     }
+}
+
+/// Qué hacer con una pulsación de Alt+F4 en una ventana de GlassBar.
+#[derive(Debug, PartialEq)]
+enum AltF4 {
+    /// Lo de Windows: no es Alt+F4, o es la configuración (que se esconde) o una
+    /// ventana ajena (un diálogo de archivos).
+    Default,
+    /// En el dock: no se hace nada, en vez de cerrar GlassBar.
+    Ignore,
+    /// En un panel: como Esc, que lo cierra. Windows lo destruiría y ya no se
+    /// podría volver a abrir.
+    Escape,
+}
+
+fn alt_f4(msg: &MSG) -> AltF4 {
+    use windows::Win32::UI::WindowsAndMessaging::{GetClassNameW, WM_SYSKEYDOWN};
+    if msg.message != WM_SYSKEYDOWN || msg.wParam.0 != 0x73 {
+        return AltF4::Default;
+    }
+    let mut name = [0u16; 64];
+    let len = unsafe { GetClassNameW(msg.hwnd, &mut name) }.max(0) as usize;
+    alt_f4_for(&String::from_utf16_lossy(&name[..len]))
+}
+
+/// `alt_f4` según la clase de la ventana.
+fn alt_f4_for(class: &str) -> AltF4 {
+    match class {
+        "GlassBarWindow" => AltF4::Ignore,
+        "GlassBarSettings" => AltF4::Default,
+        class if class.starts_with("GlassBar") => AltF4::Escape,
+        _ => AltF4::Default,
+    }
+}
+
+/// `WM_SYSCOMMAND` con `SC_CLOSE`: Alt+F4 o "Cerrar" del menú de la ventana. Los
+/// cuatro bits bajos los usa Windows por su cuenta.
+fn is_sc_close(wparam: WPARAM) -> bool {
+    wparam.0 & 0xFFF0 == windows::Win32::UI::WindowsAndMessaging::SC_CLOSE as usize
 }
 
 /// Panel de idioma del teclado sobre el indicador del dock.
@@ -6967,6 +7011,17 @@ fn main() -> Result<()> {
         let mut msg = MSG::default();
         while GetMessageW(&mut msg, None, 0, 0).as_bool() {
             frames::delivered(msg.hwnd, msg.message, msg.wParam.0);
+            match alt_f4(&msg) {
+                AltF4::Default => {}
+                AltF4::Ignore => continue,
+                AltF4::Escape => {
+                    msg.message = windows::Win32::UI::WindowsAndMessaging::WM_KEYDOWN;
+                    msg.wParam = WPARAM(0x1B);
+                    // Sin `TranslateMessage`: no hace falta el carácter de Esc.
+                    DispatchMessageW(&msg);
+                    continue;
+                }
+            }
             let _ = TranslateMessage(&msg);
             DispatchMessageW(&msg);
         }
@@ -6981,6 +7036,20 @@ fn main() -> Result<()> {
 #[cfg(test)]
 mod menu_tests {
     use super::*;
+    #[test]
+    fn alt_f4_never_closes_glassbar_or_destroys_its_panels() {
+        assert_eq!(alt_f4_for("GlassBarWindow"), AltF4::Ignore);
+        assert_eq!(alt_f4_for("GlassBarSettings"), AltF4::Default);
+        assert_eq!(alt_f4_for("GlassBarCalendar"), AltF4::Escape);
+        assert_eq!(alt_f4_for("GlassBarLauncher"), AltF4::Escape);
+        assert_eq!(alt_f4_for("#32770"), AltF4::Default);
+        let sc_close = windows::Win32::UI::WindowsAndMessaging::SC_CLOSE as usize;
+        assert!(is_sc_close(WPARAM(sc_close)));
+        assert!(is_sc_close(WPARAM(sc_close | 0x2)));
+        assert!(!is_sc_close(WPARAM(
+            windows::Win32::UI::WindowsAndMessaging::SC_MINIMIZE as usize
+        )));
+    }
     #[test]
     fn left_and_right_follow_the_bar_and_wrap() {
         let next = |open, step, language| neighbor_menu(open, step, language);
