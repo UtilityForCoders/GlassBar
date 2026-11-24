@@ -43,6 +43,7 @@ pub enum Switch {
     AutoHide,
     TopBar,
     ClockSeconds,
+    Notifications,
     Autostart,
 }
 
@@ -105,6 +106,7 @@ fn lines() -> Vec<Line> {
         Line::DockSize,
         Line::Switch(Switch::TopBar),
         Line::Switch(Switch::ClockSeconds),
+        Line::Switch(Switch::Notifications),
         Line::Switch(Switch::Autostart),
         Line::Section("Apariencia según lo que hay en pantalla"),
     ];
@@ -146,6 +148,7 @@ fn switch_label(switch: Switch) -> &'static str {
         Switch::AutoHide => "Ocultar el dock automáticamente",
         Switch::TopBar => "Controles en una barra superior",
         Switch::ClockSeconds => "Mostrar los segundos en el reloj",
+        Switch::Notifications => "Notificaciones arriba a la derecha",
         Switch::Autostart => "Iniciar con Windows",
     }
 }
@@ -180,6 +183,7 @@ impl SettingsState {
             Switch::AutoHide => !self.styles.always_visible(),
             Switch::TopBar => self.styles.top_bar(),
             Switch::ClockSeconds => self.styles.clock_seconds(),
+            Switch::Notifications => self.styles.notifications(),
             Switch::Autostart => self.autostart,
         }
     }
@@ -256,12 +260,13 @@ impl SettingsState {
     pub fn command(&self, hit: Hit) -> Option<u32> {
         use crate::appmenu::{
             CMD_AUTOHIDE, CMD_AUTOSTART, CMD_CLOCK_SECONDS, CMD_EXIT, CMD_EXPORT, CMD_IMPORT,
-            CMD_TOP_BAR, CMD_UPDATE,
+            CMD_NOTIFICATIONS, CMD_TOP_BAR, CMD_UPDATE,
         };
         Some(match hit {
             Hit::Switch(Switch::AutoHide) => CMD_AUTOHIDE,
             Hit::Switch(Switch::TopBar) => CMD_TOP_BAR,
             Hit::Switch(Switch::ClockSeconds) => CMD_CLOCK_SECONDS,
+            Hit::Switch(Switch::Notifications) => CMD_NOTIFICATIONS,
             Hit::Switch(Switch::Autostart) => CMD_AUTOSTART,
             Hit::Enabled(state) => Choice::Toggle(state).command(),
             Hit::Appearance(state, next) => {

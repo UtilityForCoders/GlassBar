@@ -32,6 +32,7 @@ mod keyboard;
 mod language;
 mod launcher;
 mod monitors;
+mod notifications;
 mod pins;
 mod preview;
 mod priority;
@@ -86,8 +87,8 @@ use windows::Win32::UI::WindowsAndMessaging::{
 
 use crate::appmenu::{
     CMD_APP_CLOSE, CMD_APP_END_TASK, CMD_APP_OPEN, CMD_APP_PIN, CMD_APP_UNPIN, CMD_AUTOHIDE,
-    CMD_AUTOSTART, CMD_CLOCK_SECONDS, CMD_EXIT, CMD_JUMP, CMD_SETTINGS, CMD_TOP_BAR, CMD_UPDATE,
-    CMD_UPDATE_CHECK,
+    CMD_AUTOSTART, CMD_CLOCK_SECONDS, CMD_EXIT, CMD_JUMP, CMD_NOTIFICATIONS, CMD_SETTINGS,
+    CMD_TOP_BAR, CMD_UPDATE, CMD_UPDATE_CHECK,
 };
 use crate::autohide::AutoHide;
 use crate::bar::{BarState, HoverTarget, BOTTOM_MARGIN};
@@ -119,6 +120,8 @@ const WM_TRAY_MENU: u32 = windows::Win32::UI::WindowsAndMessaging::WM_APP + 12;
 const WM_TOP_APPBAR: u32 = windows::Win32::UI::WindowsAndMessaging::WM_APP + 11;
 /// El hilo de iconos del lanzador cargó alguno nuevo.
 const WM_LAUNCHER_ICONS: u32 = windows::Win32::UI::WindowsAndMessaging::WM_APP + 5;
+/// El hilo de los avisos de Windows tiene algo nuevo (ver `notifications`).
+const WM_NOTIFICATIONS: u32 = windows::Win32::UI::WindowsAndMessaging::WM_APP + 13;
 
 const TIMER_ANIM: usize = 1;
 const TIMER_TICK: usize = 2;
@@ -1874,6 +1877,8 @@ struct App {
     panels_from_top: bool,
     /// Ventana de configuración (ver `settings`).
     settings: Option<SettingsWindow>,
+    /// Avisos de Windows como tarjetas arriba a la derecha, si está activado.
+    notifications: Option<Notifications>,
 }
 
 /// Cómo abrir una app del dock.
@@ -2004,6 +2009,7 @@ impl App {
             top: None,
             panels_from_top: false,
             settings: None,
+            notifications: None,
         })
     }
 
@@ -2528,6 +2534,31 @@ impl App {
             self.visibility
                 .defer_hide(Instant::now(), Duration::from_millis(3000));
             self.start_animating();
+        }
+    }
+
+    /// Arranca o para los avisos propios según el ajuste. Al pararlos, los de
+    /// Windows vuelven a verse.
+    fn sync_notifications(&mut self) {
+        if !self.styles.notifications() {
+            self.notifications = None;
+            return;
+        }
+        if self.notifications.is_none() {
+            self.notifications = Notifications::start(self.hwnd);
+        }
+    }
+
+    fn handle_notifications(&mut self) {
+        // Bajo la barra superior, si está en el monitor de los avisos.
+        let below = self
+            .top
+            .as_ref()
+            .filter(|top| top.monitor == monitors::primary())
+            .map(|top| top.rect.top + top.height());
+        if let Some(notifications) = &mut self.notifications {
+            notifications.window.below = below;
+            notifications.handle_events();
         }
     }
 
@@ -3496,6 +3527,10 @@ unsafe extern "system" fn wndproc(hwnd: HWND, msg: u32, wparam: WPARAM, lparam: 
             with_app(|app| app.handle_update_events());
             LRESULT(0)
         }
+        WM_NOTIFICATIONS => {
+            with_app(|app| app.handle_notifications());
+            LRESULT(0)
+        }
         // Se conectó o desconectó un monitor, o cambió su resolución.
         windows::Win32::UI::WindowsAndMessaging::WM_DISPLAYCHANGE => {
             with_app(|app| app.fit_monitor());
@@ -4323,6 +4358,293 @@ unsafe extern "system" fn language_wndproc(
                         }
                     }
                     _ => {}
+                }
+            });
+        }
+        _ => return DefWindowProcW(hwnd, msg, wparam, lparam),
+    }
+    LRESULT(0)
+}
+
+/// Avisos de Windows mostrados como tarjetas propias (ver `notifications`): el hilo
+/// que los lee y la ventana que los dibuja.
+struct Notifications {
+    watcher: notifications::Watcher,
+    window: NotificationWindow,
+}
+impl Notifications {
+    fn start(owner: HWND) -> Option<Self> {
+        let window = NotificationWindow::new(owner).ok()?;
+        let watcher = notifications::Watcher::start(owner, WM_NOTIFICATIONS)?;
+        notifications::warm_icons();
+        Some(Self { watcher, window })
+    }
+
+    fn handle_events(&mut self) {
+        let mut latest = None;
+        let mut changed = false;
+        for event in self.watcher.events() {
+            match event {
+                notifications::Event::Toasts(toasts) => latest = Some(toasts),
+                notifications::Event::Icon(sender, icon) => {
+                    self.window.stack.set_icon(sender, icon);
+                    changed = true;
+                }
+            }
+        }
+        if let Some(toasts) = latest {
+            for sender in self.window.stack.update(toasts) {
+                self.window.stack.mark_icon_pending(&sender);
+                self.watcher.find_icon(sender);
+            }
+            changed = true;
+        }
+        if changed {
+            self.window.refresh();
+        }
+    }
+
+    /// Clic en una tarjeta: se pulsa lo mismo en el aviso de Windows.
+    fn click(&mut self, x: f32, y: f32) {
+        let Some((key, part)) = self.window.stack.hit_test(x, y) else {
+            return;
+        };
+        if self.window.stack.take(&key) {
+            self.watcher.send(match part {
+                notifications::Part::Body => notifications::Command::Open(key),
+                notifications::Part::Close => notifications::Command::Dismiss(key),
+                notifications::Part::Action(n) => notifications::Command::Action(key, n),
+            });
+        }
+        self.window.stack.hovered = None;
+        self.window.refresh();
+    }
+}
+
+/// Ventana transparente arriba a la derecha donde se dibujan las tarjetas. No toma
+/// el foco: aparece sin quitárselo a la ventana en la que se está escribiendo.
+struct NotificationWindow {
+    hwnd: HWND,
+    backdrop: Option<style::Backdrop>,
+    surface: Option<Surface>,
+    pos: POINT,
+    scale: f32,
+    stack: notifications::Stack,
+    last_frame: Instant,
+    shown: bool,
+    /// Borde inferior de la barra superior, si está: las tarjetas salen debajo.
+    below: Option<i32>,
+}
+impl NotificationWindow {
+    fn new(owner: HWND) -> Result<Self> {
+        let hwnd = unsafe {
+            CreateWindowExW(
+                WS_EX_LAYERED | WS_EX_TOPMOST | WS_EX_TOOLWINDOW | WS_EX_NOACTIVATE,
+                w!("GlassBarNotifications"),
+                w!("GlassBar — Notificaciones"),
+                WS_POPUP,
+                0,
+                0,
+                1,
+                1,
+                Some(owner),
+                None,
+                Some(GetModuleHandleW(None)?.into()),
+                None,
+            )?
+        };
+        Ok(Self {
+            hwnd,
+            backdrop: style::Backdrop::new(),
+            surface: None,
+            pos: POINT::default(),
+            scale: 1.0,
+            stack: notifications::Stack::default(),
+            last_frame: Instant::now(),
+            shown: false,
+            below: None,
+        })
+    }
+
+    /// En la esquina de arriba a la derecha del monitor principal, bajo la barra
+    /// superior si está.
+    fn place(&mut self) {
+        let monitor = monitors::primary();
+        let (_, dpi) = monitors::get_info(monitor);
+        let work = monitors::work_area(monitor);
+        self.scale = dpi.max(0.3);
+        let width = (notifications::WIDTH * self.scale).ceil() as u32;
+        let height = (notifications::max_height() * self.scale).ceil() as u32;
+        if !self
+            .surface
+            .as_ref()
+            .is_some_and(|s| s.width == width && s.height == height)
+        {
+            self.surface = Surface::new(width, height).ok();
+        }
+        self.pos = POINT {
+            x: work.right - width as i32,
+            y: work.top.max(self.below.unwrap_or(work.top)),
+        };
+    }
+
+    /// Algo cambió: se redibuja y se anima hasta que todo quede quieto.
+    fn refresh(&mut self) {
+        if !self.shown {
+            self.place();
+        }
+        self.last_frame = Instant::now();
+        frames::start(self.hwnd);
+        self.frame();
+    }
+
+    fn frame(&mut self) {
+        let now = Instant::now();
+        let dt = now.duration_since(self.last_frame).as_secs_f32();
+        self.last_frame = now;
+        if !self.stack.step(dt) {
+            frames::stop(self.hwnd);
+        }
+        if self.stack.is_empty() {
+            self.hide();
+            return;
+        }
+        self.render();
+    }
+
+    fn render(&mut self) {
+        let Some(surface) = &mut self.surface else {
+            return;
+        };
+        if let Some(pixmap) = surface.pixmap() {
+            self.stack.draw(pixmap, self.scale);
+        }
+        surface.copy_to_dib();
+        let blend = BLENDFUNCTION {
+            BlendOp: AC_SRC_OVER as u8,
+            SourceConstantAlpha: 255,
+            AlphaFormat: AC_SRC_ALPHA as u8,
+            ..Default::default()
+        };
+        unsafe {
+            let _ = UpdateLayeredWindow(
+                self.hwnd,
+                None,
+                Some(&self.pos),
+                Some(&SIZE {
+                    cx: surface.width as i32,
+                    cy: surface.height as i32,
+                }),
+                Some(surface.dc()),
+                Some(&POINT { x: 0, y: 0 }),
+                COLORREF(0),
+                Some(&blend),
+                ULW_ALPHA,
+            );
+            if !self.shown {
+                use windows::Win32::UI::WindowsAndMessaging::{
+                    SetWindowPos, HWND_TOPMOST, SWP_NOACTIVATE, SWP_NOMOVE, SWP_NOSIZE,
+                };
+                let _ = ShowWindow(self.hwnd, SW_SHOWNOACTIVATE);
+                let _ = SetWindowPos(
+                    self.hwnd,
+                    Some(HWND_TOPMOST),
+                    0,
+                    0,
+                    0,
+                    0,
+                    SWP_NOACTIVATE | SWP_NOMOVE | SWP_NOSIZE,
+                );
+                self.shown = true;
+            }
+        }
+        if let Some(backdrop) = &self.backdrop {
+            let shapes = self.stack.shapes(self.scale);
+            backdrop.under(self.hwnd, surface_rect(self.pos, surface), &shapes, 1.0);
+        }
+    }
+
+    fn hide(&mut self) {
+        frames::stop(self.hwnd);
+        if !self.shown {
+            return;
+        }
+        self.shown = false;
+        unsafe {
+            let _ = ShowWindow(self.hwnd, SW_HIDE);
+        }
+        if let Some(backdrop) = &self.backdrop {
+            backdrop.hide();
+        }
+        if let Some(surface) = &mut self.surface {
+            surface.release();
+        }
+    }
+}
+impl Drop for NotificationWindow {
+    fn drop(&mut self) {
+        frames::stop(self.hwnd);
+        unsafe {
+            let _ = windows::Win32::UI::WindowsAndMessaging::DestroyWindow(self.hwnd);
+        }
+    }
+}
+
+unsafe extern "system" fn notifications_wndproc(
+    hwnd: HWND,
+    msg: u32,
+    wparam: WPARAM,
+    lparam: LPARAM,
+) -> LRESULT {
+    let point = |scale: f32| {
+        (
+            (lparam.0 & 0xffff) as i16 as f32 / scale,
+            ((lparam.0 >> 16) & 0xffff) as i16 as f32 / scale,
+        )
+    };
+    match msg {
+        WM_MOUSEACTIVATE => return LRESULT(MA_NOACTIVATE as isize),
+        WM_TIMER if wparam.0 == TIMER_ANIM => {
+            with_app(|app| {
+                if let Some(n) = &mut app.notifications {
+                    n.window.frame();
+                }
+            });
+        }
+        WM_MOUSEMOVE => {
+            with_app(|app| {
+                let Some(n) = &mut app.notifications else {
+                    return;
+                };
+                let mut track = TRACKMOUSEEVENT {
+                    cbSize: std::mem::size_of::<TRACKMOUSEEVENT>() as u32,
+                    dwFlags: TME_LEAVE,
+                    hwndTrack: hwnd,
+                    dwHoverTime: 0,
+                };
+                let _ = TrackMouseEvent(&mut track);
+                let (x, y) = point(n.window.scale);
+                let hit = n.window.stack.hit_test(x, y);
+                if hit != n.window.stack.hovered {
+                    n.window.stack.hovered = hit;
+                    n.window.refresh();
+                }
+            });
+        }
+        WM_MOUSELEAVE => {
+            with_app(|app| {
+                if let Some(n) = &mut app.notifications {
+                    if n.window.stack.mouse_left() {
+                        n.window.refresh();
+                    }
+                }
+            });
+        }
+        WM_LBUTTONUP => {
+            with_app(|app| {
+                if let Some(n) = &mut app.notifications {
+                    let (x, y) = point(n.window.scale);
+                    n.click(x, y);
                 }
             });
         }
@@ -6699,6 +7021,12 @@ fn handle_menu_command(app: &mut App, cmd: u32) {
             let _ = app.styles.save();
             app.sync_top_bar();
         }
+        CMD_NOTIFICATIONS => {
+            let on = !app.styles.notifications();
+            app.styles.set_notifications(on);
+            let _ = app.styles.save();
+            app.sync_notifications();
+        }
         CMD_CLOCK_SECONDS => {
             let on = !app.styles.clock_seconds();
             app.styles.set_clock_seconds(on);
@@ -6956,6 +7284,18 @@ fn main() -> Result<()> {
             return Err(windows::core::Error::from_thread());
         }
 
+        let notifications_class = WNDCLASSEXW {
+            cbSize: std::mem::size_of::<WNDCLASSEXW>() as u32,
+            lpfnWndProc: Some(notifications_wndproc),
+            hInstance: instance.into(),
+            hCursor: LoadCursorW(None, IDC_ARROW)?,
+            lpszClassName: w!("GlassBarNotifications"),
+            ..Default::default()
+        };
+        if RegisterClassExW(&notifications_class) == 0 {
+            return Err(windows::core::Error::from_thread());
+        }
+
         let preview_class = WNDCLASSEXW {
             cbSize: std::mem::size_of::<WNDCLASSEXW>() as u32,
             lpfnWndProc: Some(preview_wndproc),
@@ -7025,6 +7365,7 @@ fn main() -> Result<()> {
         let mut app = App::new(hwnd)?;
         app.sync_appbar();
         app.sync_top_bar();
+        app.sync_notifications();
         app.render();
 
         let _ = ShowWindow(hwnd, SW_SHOWNOACTIVATE);

@@ -132,6 +132,10 @@ pub struct Styles {
     /// El reloj muestra también los segundos.
     #[serde(default)]
     clock_seconds: bool,
+    /// Los avisos de Windows salen como tarjetas propias arriba a la derecha (ver
+    /// `notifications`).
+    #[serde(default)]
+    notifications: bool,
     /// Tamaño del dock respecto al normal, en tanto por ciento (ver `DOCK_SIZES`).
     #[serde(default = "default_dock_size")]
     dock_size: u8,
@@ -164,6 +168,7 @@ impl Default for Styles {
             always_visible: false,
             top_bar: false,
             clock_seconds: false,
+            notifications: false,
             dock_size: default_dock_size(),
         }
     }
@@ -197,6 +202,13 @@ impl Styles {
     }
     pub fn set_clock_seconds(&mut self, on: bool) {
         self.clock_seconds = on;
+    }
+    /// Los avisos de Windows como tarjetas arriba a la derecha, al estilo de macOS.
+    pub fn notifications(&self) -> bool {
+        self.notifications
+    }
+    pub fn set_notifications(&mut self, on: bool) {
+        self.notifications = on;
     }
     /// Posición del tamaño del dock en `DOCK_SIZES` (uno desconocido cuenta como Normal).
     fn dock_size_index(&self) -> usize {

@@ -57,6 +57,11 @@ impl Font {
         size / self.units_per_em
     }
 
+    /// La fuente tiene la letra `c`.
+    pub fn has(&self, c: char) -> bool {
+        self.face.charmap().map(c).is_some()
+    }
+
     fn glyph(&self, c: char) -> GlyphId {
         self.face.charmap().map(c).unwrap_or(GlyphId::NOTDEF)
     }
