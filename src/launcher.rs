@@ -893,9 +893,12 @@ impl LauncherState {
         let Some(first) = slots.first() else {
             return;
         };
+        // Al buscar, el primer resultado ya se ve marcado: las flechas parten de él,
+        // en lugar de gastar la primera pulsación en elegirlo.
         let current = self
             .selection
-            .and_then(|hit| slots.iter().position(|s| s.hit == hit));
+            .and_then(|hit| slots.iter().position(|s| s.hit == hit))
+            .or_else(|| self.searching().then_some(0));
         let next = match current {
             None => first.hit,
             Some(i) if dy == 0 => {
@@ -3361,7 +3364,7 @@ mod tests {
         };
         let first = launched(&mut menu);
         // Con las flechas el detalle pasa al resultado elegido.
-        menu.move_selection(0, 1);
+        // Una sola pulsación basta: parte del resultado ya marcado.
         menu.move_selection(0, 1);
         assert_ne!(menu.detail_hit(), Some(best));
         assert_ne!(launched(&mut menu), first);
