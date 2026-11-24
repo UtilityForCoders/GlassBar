@@ -785,6 +785,60 @@ fn matching(
     exact.or_else(close).map(|(_, entry)| entry.clone())
 }
 
+/// Apaga en Windows los avisos de la app que se llama `sender`, como el interruptor
+/// de Configuración > Sistema > Notificaciones: ya no suenan ni quedan en el centro
+/// de notificaciones, aunque GlassBar esté cerrado. Devuelve si se pudo.
+///
+/// Solo con una app de Inicio que se llame igual (para no apagar otra) y del catálogo
+/// ya leído, sin esperar (se llama desde el hilo de la interfaz). Windows se entera
+/// del registro al apagar, pero no al volver a encender: eso se hace desde su
+/// Configuración (ver `apps::open_notification_settings`).
+pub fn disable_in_windows(sender: &str) -> bool {
+    use windows::core::HSTRING;
+    use windows::Win32::System::Registry::{RegSetKeyValueW, HKEY_CURRENT_USER, REG_DWORD};
+    let Some(id) = windows_app_id(sender) else {
+        return false;
+    };
+    let key = HSTRING::from(format!("{NOTIFICATION_SETTINGS}\\{id}"));
+    let value = HSTRING::from("Enabled");
+    let off: u32 = 0;
+    unsafe {
+        RegSetKeyValueW(
+            HKEY_CURRENT_USER,
+            &key,
+            &value,
+            REG_DWORD.0,
+            Some((&off as *const u32).cast()),
+            std::mem::size_of::<u32>() as u32,
+        )
+        .is_ok()
+    }
+}
+
+/// Ajustes de notificaciones de cada app, por su AppUserModelID.
+const NOTIFICATION_SETTINGS: &str =
+    r"Software\Microsoft\Windows\CurrentVersion\Notifications\Settings";
+
+/// AppUserModelID de la app de Inicio que se llama exactamente `sender`, si el
+/// catálogo ya está leído y libre.
+fn windows_app_id(sender: &str) -> Option<String> {
+    let wanted = crate::catalog::search_key(sender);
+    let catalog = CATALOG.try_lock().ok()?;
+    let (_, apps) = catalog.as_ref()?;
+    exact_app_id(apps, &wanted)
+}
+
+fn exact_app_id(apps: &[(String, crate::apps::AppEntry)], wanted: &str) -> Option<String> {
+    let (_, entry) = apps
+        .iter()
+        .find(|(k, _)| !wanted.is_empty() && k == wanted)?;
+    entry
+        .command
+        .strip_prefix("shell:AppsFolder\\")
+        .filter(|id| !id.is_empty())
+        .map(str::to_string)
+}
+
 /// El icono de la app que se llama `sender`, buscándola entre las de Inicio. Puede
 /// tardar (lee el catálogo): hay que llamarla fuera del hilo de la interfaz.
 pub fn find_icon(sender: &str) -> Option<Pixmap> {
@@ -821,6 +875,13 @@ const ACTION_SIZE: f32 = 12.5;
 const CLOSE_R: f32 = 10.0;
 const CLOSE_AT: f32 = 4.0;
 const GLYPH_CLOSE: char = '\u{E8BB}';
+/// Botón de silenciar la app, en lugar de "ahora" al pasar el cursor: una campana
+/// con unas "z".
+const MUTE_R: f32 = 10.0;
+/// Centro del botón respecto a la esquina de arriba a la derecha de la tarjeta.
+const MUTE_DX: f32 = PAD + MUTE_R - 3.0;
+const MUTE_DY: f32 = PAD + 6.0;
+const GLYPH_BELL: char = '\u{EA8F}';
 const NOW: &str = "ahora";
 /// Distintivo de Enlace Móvil sobre el icono de la app.
 const BADGE: f32 = 16.0;
@@ -837,6 +898,8 @@ pub fn max_height() -> f32 {
 pub enum Part {
     Body,
     Close,
+    /// Silenciar las notificaciones de esa app.
+    Mute,
     Action(usize),
 }
 
@@ -1073,6 +1136,27 @@ impl Stack {
         alive
     }
 
+    /// El aviso de la tarjeta `key`.
+    pub fn toast(&self, key: &Key) -> Option<&Toast> {
+        self.cards.iter().find(|c| &c.key == key).map(|c| &c.toast)
+    }
+
+    /// Quita todas las tarjetas de `sender` (se silenció la app). Devuelve las que
+    /// Windows aún tenía, para cerrarlas allí.
+    pub fn take_sender(&mut self, sender: &str) -> Vec<Key> {
+        let mut alive = Vec::new();
+        for card in &mut self.cards {
+            if card.toast.sender == sender && !card.leaving {
+                if !card.gone {
+                    alive.push(card.key.clone());
+                }
+                card.leave();
+            }
+        }
+        self.relayout();
+        alive
+    }
+
     /// Qué hay en `(x, y)` (unidades lógicas de la ventana).
     pub fn hit_test(&self, x: f32, y: f32) -> Option<(Key, Part)> {
         for card in self.cards.iter().filter(|c| !c.leaving) {
@@ -1088,6 +1172,11 @@ impl Stack {
                 continue;
             }
             let (rx, ry) = (x - left, y - top);
+            if hovered
+                && (rx - (CARD_W - MUTE_DX)).powi(2) + (ry - MUTE_DY).powi(2) <= MUTE_R.powi(2)
+            {
+                return Some((card.key.clone(), Part::Mute));
+            }
             let actions_top = card.actions_top();
             if (actions_top..actions_top + ACTION_H).contains(&ry) {
                 for (i, (at, width)) in card.action_slots().into_iter().enumerate() {
@@ -1181,14 +1270,33 @@ impl Stack {
             s(TEXT_W) - now_w - s(8.0),
         );
         draw_text_on_baseline(image, &sender, s(tx), baseline, s(SENDER_SIZE), 0.62);
-        draw_text_on_baseline(
-            image,
-            NOW,
-            s(x + CARD_W - PAD) - now_w,
-            baseline,
-            s(SENDER_SIZE),
-            0.5,
-        );
+        if hovered.is_some() {
+            // Al pasar el cursor, "ahora" deja su sitio a silenciar la app.
+            let (cx, cy) = (x + CARD_W - MUTE_DX, y + MUTE_DY);
+            let over = hovered == Some(Part::Mute);
+            fill_rounded(
+                image,
+                [255, 255, 255, if over { 44 } else { 22 }],
+                s(cx - MUTE_R),
+                s(cy - MUTE_R),
+                s(MUTE_R * 2.0),
+                s(MUTE_R * 2.0),
+                s(MUTE_R),
+            );
+            draw_icon(image, GLYPH_BELL, s(cx - 1.5), s(cy + 1.0), s(10.0), 0.95);
+            let z = s(6.0);
+            draw_text_semibold_on_baseline(image, "z", s(cx + 2.0), s(cy - 1.5), z, 0.95);
+            draw_text_semibold_on_baseline(image, "z", s(cx + 4.5), s(cy - 4.5), z * 0.8, 0.8);
+        } else {
+            draw_text_on_baseline(
+                image,
+                NOW,
+                s(x + CARD_W - PAD) - now_w,
+                baseline,
+                s(SENDER_SIZE),
+                0.5,
+            );
+        }
 
         // Título y texto.
         let mut line_top = y + PAD + 18.0;
@@ -1442,6 +1550,58 @@ mod tests {
         stack.update(Vec::new());
         assert!(!stack.take(&key));
         assert!(stack.cards[0].leaving);
+    }
+
+    #[test]
+    fn the_bell_shows_on_hover_and_mutes_every_card_of_the_app() {
+        let mut stack = Stack::default();
+        stack.update(vec![
+            toast("Chat", "Ana", "Hola"),
+            toast("Correo", "Factura", "Ya está"),
+            toast("Chat", "Luis", "Adiós"),
+        ]);
+        for _ in 0..200 {
+            stack.step(1.0 / 60.0);
+        }
+        let card = &stack.cards[0];
+        let key = card.key.clone();
+        let (bx, by) = (card.left() + CARD_W - MUTE_DX, card.top.value + MUTE_DY);
+        // Sin el cursor encima no hay campana: es la tarjeta.
+        assert_eq!(stack.hit_test(bx, by), Some((key.clone(), Part::Body)));
+        stack.hovered = Some((key.clone(), Part::Body));
+        assert_eq!(stack.hit_test(bx, by), Some((key.clone(), Part::Mute)));
+
+        let sender = stack.toast(&key).unwrap().sender.clone();
+        assert_eq!(stack.take_sender(&sender).len(), 2);
+        let left: Vec<_> = stack.cards.iter().filter(|c| !c.leaving).collect();
+        assert_eq!(left.len(), 1);
+        assert_ne!(left[0].toast.sender, sender);
+    }
+
+    #[test]
+    fn only_an_app_with_the_same_name_is_turned_off_in_windows() {
+        let entry = |name: &str, command: &str| {
+            (
+                crate::catalog::search_key(name),
+                crate::apps::AppEntry {
+                    name: name.into(),
+                    command: command.into(),
+                },
+            )
+        };
+        let apps = [
+            entry("WhatsApp Beta", r"shell:AppsFolder\Beta!App"),
+            entry("WhatsApp", r"shell:AppsFolder\5319275A.WhatsAppDesktop!App"),
+            entry("Notas", r"C:\Programas\notas.exe"),
+        ];
+        assert_eq!(
+            exact_app_id(&apps, "whatsapp").as_deref(),
+            Some("5319275A.WhatsAppDesktop!App")
+        );
+        // Ni parecidos ni apps sin AppUserModelID.
+        assert_eq!(exact_app_id(&apps, "whatsapp b"), None);
+        assert_eq!(exact_app_id(&apps, "notas"), None);
+        assert_eq!(exact_app_id(&apps, ""), None);
     }
 
     #[test]

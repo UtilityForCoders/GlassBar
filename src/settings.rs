@@ -36,6 +36,44 @@ const BUTTON_W: f32 = 150.0;
 const BACKUP_W: f32 = 72.0;
 const BACKUP_GAP: f32 = 6.0;
 const TEXT: f32 = 13.0;
+/// Pestañas de las páginas, bajo el título.
+const TABS_TOP: f32 = TITLE_H + 4.0;
+const TABS_H: f32 = 32.0;
+const TAB_SIZE: f32 = 12.5;
+/// Borde superior de las filas de la página.
+const CONTENT_TOP: f32 = TABS_TOP + TABS_H + 8.0;
+
+/// Páginas de la configuración, en el orden de las pestañas.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub enum Page {
+    #[default]
+    Dock,
+    Appearance,
+    Notifications,
+    GlassBar,
+}
+
+impl Page {
+    pub const ALL: [Page; 4] = [
+        Page::Dock,
+        Page::Appearance,
+        Page::Notifications,
+        Page::GlassBar,
+    ];
+    fn name(self) -> &'static str {
+        match self {
+            Page::Dock => "Dock",
+            Page::Appearance => "Apariencia",
+            Page::Notifications => "Notificaciones",
+            Page::GlassBar => "GlassBar",
+        }
+    }
+}
+
+/// Ancho de cada pestaña.
+fn tab_width() -> f32 {
+    (WIDTH - PAD * 2.0) / Page::ALL.len() as f32
+}
 
 /// Interruptores de la sección del dock.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -52,6 +90,8 @@ pub enum Switch {
 pub enum Hit {
     Minimize,
     Close,
+    /// Pestaña de una página.
+    Page(Page),
     Switch(Switch),
     /// Activar o quitar una situación (todas menos el escritorio).
     Enabled(State),
@@ -60,6 +100,8 @@ pub enum Hit {
     /// Tamaño del dock: el anterior (`false`) o el siguiente.
     DockSize(bool),
     Opacity,
+    /// Reactivar las apps silenciadas desde las notificaciones.
+    Unmute,
     Update,
     /// Guardar la configuración en un archivo, o sustituirla por la de uno.
     Export,
@@ -80,6 +122,8 @@ pub struct SettingsState {
     pub styles: Styles,
     pub autostart: bool,
     pub updates: Updates,
+    /// Página que se ve.
+    pub page: Page,
     pub hovered: Option<Hit>,
     /// Arrastrando la barra de la opacidad.
     pub dragging: bool,
@@ -93,30 +137,33 @@ enum Line {
     DockSize,
     Look(State),
     Opacity,
+    /// Apps silenciadas desde las notificaciones y el botón para reactivarlas.
+    Muted,
     Update,
     /// Copia de la configuración: "Exportar" e "Importar".
     Backup,
     Exit,
 }
 
-fn lines() -> Vec<Line> {
-    let mut lines = vec![
-        Line::Section("Dock"),
-        Line::Switch(Switch::AutoHide),
-        Line::DockSize,
-        Line::Switch(Switch::TopBar),
-        Line::Switch(Switch::ClockSeconds),
-        Line::Switch(Switch::Notifications),
-        Line::Switch(Switch::Autostart),
-        Line::Section("Apariencia según lo que hay en pantalla"),
-    ];
-    lines.extend(State::ALL.iter().map(|&state| Line::Look(state)));
-    lines.push(Line::Opacity);
-    lines.push(Line::Section("GlassBar"));
-    lines.push(Line::Update);
-    lines.push(Line::Backup);
-    lines.push(Line::Exit);
-    lines
+/// Filas de cada página.
+fn lines(page: Page) -> Vec<Line> {
+    match page {
+        Page::Dock => vec![
+            Line::Switch(Switch::AutoHide),
+            Line::DockSize,
+            Line::Switch(Switch::TopBar),
+            Line::Switch(Switch::ClockSeconds),
+            Line::Switch(Switch::Autostart),
+        ],
+        Page::Appearance => {
+            let mut lines = vec![Line::Section("Según lo que hay en pantalla")];
+            lines.extend(State::ALL.iter().map(|&state| Line::Look(state)));
+            lines.push(Line::Opacity);
+            lines
+        }
+        Page::Notifications => vec![Line::Switch(Switch::Notifications), Line::Muted],
+        Page::GlassBar => vec![Line::Update, Line::Backup, Line::Exit],
+    }
 }
 
 fn line_height(line: Line) -> f32 {
@@ -126,10 +173,10 @@ fn line_height(line: Line) -> f32 {
     }
 }
 
-/// Cada fila con su borde superior.
-fn layout() -> Vec<(Line, f32)> {
-    let mut top = TITLE_H;
-    lines()
+/// Cada fila de `page` con su borde superior.
+fn layout(page: Page) -> Vec<(Line, f32)> {
+    let mut top = CONTENT_TOP;
+    lines(page)
         .into_iter()
         .map(|line| {
             let at = top;
@@ -139,8 +186,14 @@ fn layout() -> Vec<(Line, f32)> {
         .collect()
 }
 
+/// Alto de la ventana: el de la página más larga, para que no cambie de tamaño al
+/// pasar de una a otra.
 pub fn height() -> f32 {
-    TITLE_H + lines().into_iter().map(line_height).sum::<f32>() + PAD / 2.0
+    let longest = Page::ALL
+        .iter()
+        .map(|&page| lines(page).into_iter().map(line_height).sum::<f32>())
+        .fold(0.0, f32::max);
+    CONTENT_TOP + longest + PAD / 2.0
 }
 
 fn switch_label(switch: Switch) -> &'static str {
@@ -173,6 +226,7 @@ impl SettingsState {
             styles,
             autostart,
             updates,
+            page: Page::default(),
             hovered: None,
             dragging: false,
         }
@@ -197,7 +251,12 @@ impl SettingsState {
                 return Some(Hit::Minimize);
             }
         }
-        let (line, top) = layout()
+        if (TABS_TOP..TABS_TOP + TABS_H).contains(&y) {
+            let at = ((x - PAD) / tab_width()).floor();
+            let inside = x >= PAD && at < Page::ALL.len() as f32;
+            return inside.then(|| Hit::Page(Page::ALL[at as usize]));
+        }
+        let (line, top) = layout(self.page)
             .into_iter()
             .find(|(line, top)| (*top..*top + line_height(*line)).contains(&y))?;
         let right = right_edge();
@@ -226,6 +285,10 @@ impl SettingsState {
             Line::Opacity => {
                 let left = right - SLIDER_W - 44.0;
                 ((left - 6.0..right).contains(&x)).then_some(Hit::Opacity)
+            }
+            Line::Muted => {
+                let inside = (right - BUTTON_W..right).contains(&x);
+                (inside && self.styles.muted_count() > 0).then_some(Hit::Unmute)
             }
             Line::Update => {
                 let busy = self.updates.busy || self.updates.checking;
@@ -260,7 +323,7 @@ impl SettingsState {
     pub fn command(&self, hit: Hit) -> Option<u32> {
         use crate::appmenu::{
             CMD_AUTOHIDE, CMD_AUTOSTART, CMD_CLOCK_SECONDS, CMD_EXIT, CMD_EXPORT, CMD_IMPORT,
-            CMD_NOTIFICATIONS, CMD_TOP_BAR, CMD_UPDATE,
+            CMD_NOTIFICATIONS, CMD_TOP_BAR, CMD_UNMUTE_APPS, CMD_UPDATE,
         };
         Some(match hit {
             Hit::Switch(Switch::AutoHide) => CMD_AUTOHIDE,
@@ -284,10 +347,11 @@ impl SettingsState {
             Hit::DockSize(false) => crate::appmenu::CMD_DOCK_SMALLER,
             Hit::Update if self.updates.available.is_some() => CMD_UPDATE,
             Hit::Update => crate::appmenu::CMD_UPDATE_CHECK,
+            Hit::Unmute => CMD_UNMUTE_APPS,
             Hit::Export => CMD_EXPORT,
             Hit::Import => CMD_IMPORT,
             Hit::Exit => CMD_EXIT,
-            Hit::Minimize | Hit::Close | Hit::Opacity => return None,
+            Hit::Minimize | Hit::Close | Hit::Opacity | Hit::Page(_) => return None,
         })
     }
 
@@ -342,10 +406,12 @@ impl SettingsState {
             );
         }
 
+        self.draw_tabs(image, scale);
+
         let size = s(TEXT);
         let (ascent, descent) = line_metrics(size);
         let right = right_edge();
-        for (line, top) in layout() {
+        for (line, top) in layout(self.page) {
             let cy = top + line_height(line) / 2.0;
             let baseline = s(cy) + (ascent - descent) / 2.0;
             let row_hover = |hit: Hit| self.hovered == Some(hit);
@@ -440,6 +506,36 @@ impl SettingsState {
                     let tx = s(right) - text_width(&label, size);
                     draw_text_on_baseline(image, &label, tx, baseline, size, 0.8);
                 }
+                Line::Muted => {
+                    draw_text_on_baseline(
+                        image,
+                        "Apps silenciadas",
+                        s(PAD + 2.0),
+                        baseline,
+                        size,
+                        0.95,
+                    );
+                    let count = self.styles.muted_count();
+                    let label = match count {
+                        0 => "Ninguna".to_string(),
+                        1 => "Reactivar 1 app".to_string(),
+                        n => format!("Reactivar {n} apps"),
+                    };
+                    let left = right - BUTTON_W;
+                    let alpha = if row_hover(Hit::Unmute) { 34 } else { 18 };
+                    fill_rounded(
+                        image,
+                        [255, 255, 255, alpha],
+                        s(left),
+                        s(cy - PICKER_H / 2.0),
+                        s(BUTTON_W),
+                        s(PICKER_H),
+                        s(6.0),
+                    );
+                    let tx = s(left + BUTTON_W / 2.0) - text_width(&label, size) / 2.0;
+                    let opacity = if count > 0 { 0.95 } else { 0.5 };
+                    draw_text_on_baseline(image, &label, tx, baseline, size, opacity);
+                }
                 Line::Update => {
                     draw_text_on_baseline(
                         image,
@@ -522,6 +618,44 @@ impl SettingsState {
                     );
                 }
             }
+        }
+    }
+
+    /// Pestañas de las páginas: un carril con la de la página que se ve resaltada.
+    fn draw_tabs(&self, image: &mut Pixmap, scale: f32) {
+        let s = |v: f32| v * scale;
+        fill_rounded(
+            image,
+            [255, 255, 255, 12],
+            s(PAD),
+            s(TABS_TOP),
+            s(WIDTH - PAD * 2.0),
+            s(TABS_H),
+            s(8.0),
+        );
+        let size = s(TAB_SIZE);
+        let (ascent, descent) = line_metrics(size);
+        let baseline = s(TABS_TOP + TABS_H / 2.0) + (ascent - descent) / 2.0;
+        let width = tab_width();
+        for (i, page) in Page::ALL.into_iter().enumerate() {
+            let left = PAD + i as f32 * width;
+            let selected = page == self.page;
+            let hovered = self.hovered == Some(Hit::Page(page));
+            if selected || hovered {
+                fill_rounded(
+                    image,
+                    [255, 255, 255, if selected { 34 } else { 16 }],
+                    s(left + 3.0),
+                    s(TABS_TOP + 3.0),
+                    s(width - 6.0),
+                    s(TABS_H - 6.0),
+                    s(6.0),
+                );
+            }
+            let name = page.name();
+            let tx = s(left + width / 2.0) - text_width(name, size) / 2.0;
+            let opacity = if selected { 1.0 } else { 0.7 };
+            draw_text_on_baseline(image, name, tx, baseline, size, opacity);
         }
     }
 
@@ -676,17 +810,33 @@ mod tests {
         SettingsState::new(Styles::default(), false, Updates::default())
     }
 
+    /// La página de `wanted` y el centro de su fila.
+    fn find(wanted: Line) -> (Page, f32) {
+        Page::ALL
+            .into_iter()
+            .find_map(|page| {
+                let (line, top) = layout(page).into_iter().find(|(l, _)| *l == wanted)?;
+                Some((page, top + line_height(line) / 2.0))
+            })
+            .unwrap()
+    }
+
     fn row_center(wanted: Line) -> f32 {
-        let (line, top) = layout().into_iter().find(|(l, _)| *l == wanted).unwrap();
-        top + line_height(line) / 2.0
+        find(wanted).1
+    }
+
+    /// La configuración abierta en la página de `line`.
+    fn on(line: Line) -> SettingsState {
+        let mut settings = state();
+        settings.page = find(line).0;
+        settings
     }
 
     #[test]
     fn rows_map_to_the_old_menu_commands() {
         use crate::appmenu::{CMD_AUTOHIDE, CMD_EXIT, CMD_TOP_BAR, CMD_UPDATE_CHECK};
-        let settings = state();
-        let hit = |line, x| settings.hit_test(x, row_center(line));
-        let at = |line, x| hit(line, x).and_then(|h| settings.command(h));
+        let hit = |line, x| on(line).hit_test(x, row_center(line));
+        let at = |line, x| hit(line, x).and_then(|h| state().command(h));
         assert_eq!(at(Line::Switch(Switch::AutoHide), 40.0), Some(CMD_AUTOHIDE));
         assert_eq!(
             at(Line::Switch(Switch::TopBar), WIDTH - 30.0),
@@ -695,12 +845,48 @@ mod tests {
         assert_eq!(at(Line::Exit, 60.0), Some(CMD_EXIT));
         assert_eq!(at(Line::Update, WIDTH - PAD - 10.0), Some(CMD_UPDATE_CHECK));
         assert_eq!(hit(Line::Update, 40.0), None);
-        assert_eq!(hit(Line::Section("Dock"), 40.0), None);
+        assert_eq!(
+            hit(Line::Section("Según lo que hay en pantalla"), 40.0),
+            None
+        );
+    }
+
+    #[test]
+    fn every_row_is_on_one_page_and_the_tabs_switch_them() {
+        let all: Vec<Line> = Page::ALL.into_iter().flat_map(lines).collect();
+        for line in &all {
+            assert_eq!(all.iter().filter(|l| *l == line).count(), 1);
+        }
+        // Debajo de la última fila de la página no hay nada que pulsar.
+        let y = row_center(Line::Opacity);
+        assert_eq!(state().hit_test(60.0, y), None);
+        let settings = state();
+        let tab_y = TABS_TOP + TABS_H / 2.0;
+        for (i, page) in Page::ALL.into_iter().enumerate() {
+            let x = PAD + tab_width() * (i as f32 + 0.5);
+            assert_eq!(settings.hit_test(x, tab_y), Some(Hit::Page(page)));
+        }
+        assert_eq!(settings.command(Hit::Page(Page::GlassBar)), None);
+        assert!(height() < 500.0);
+    }
+
+    #[test]
+    fn muted_apps_can_be_unmuted_only_when_there_are_some() {
+        let mut settings = on(Line::Muted);
+        let x = WIDTH - PAD - 10.0;
+        let y = row_center(Line::Muted);
+        assert_eq!(settings.hit_test(x, y), None);
+        settings.styles.mute_app("Chat", false);
+        assert_eq!(settings.hit_test(x, y), Some(Hit::Unmute));
+        assert_eq!(
+            settings.command(Hit::Unmute),
+            Some(crate::appmenu::CMD_UNMUTE_APPS)
+        );
     }
 
     #[test]
     fn the_picker_cycles_through_the_appearances() {
-        let settings = state();
+        let settings = on(Line::Look(State::Maximized));
         let y = row_center(Line::Look(State::Maximized));
         let right = right_edge();
         let next = settings.hit_test(right - 10.0, y);
@@ -737,7 +923,7 @@ mod tests {
 
     #[test]
     fn minimize_close_and_opacity() {
-        let settings = state();
+        let settings = on(Line::Opacity);
         assert_eq!(
             settings.hit_test(WIDTH - PAD - 10.0, 25.0),
             Some(Hit::Close)
