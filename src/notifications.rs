@@ -52,6 +52,32 @@ pub struct Toast {
     pub body: String,
     /// Texto de sus botones, en orden.
     pub actions: Vec<String>,
+    /// De dónde viene, si Windows lo indica: "a través de Enlace Móvil" en los
+    /// avisos de las apps del móvil.
+    pub attribution: String,
+}
+
+/// Cómo se llama Enlace Móvil (antes "Tu teléfono") en el texto de origen de sus
+/// avisos, en minúsculas.
+const PHONE_LINK_NAMES: [&str; 5] = [
+    "enlace móvil",
+    "phone link",
+    "tu teléfono",
+    "your phone",
+    "vínculo móvil",
+];
+
+/// Clave del icono de Enlace Móvil entre los de las apps (ver `Stack::icons`).
+pub const PHONE_LINK: &str = "\u{0}Enlace Móvil";
+/// Enlace Móvil en el menú Inicio, igual en todos los idiomas.
+const PHONE_LINK_APP: &str = "shell:AppsFolder\\Microsoft.YourPhone_8wekyb3d8bbwe!App";
+
+impl Toast {
+    /// Llega del móvil a través de Enlace Móvil (no de la app del PC).
+    pub fn is_from_phone(&self) -> bool {
+        let text = self.attribution.to_lowercase();
+        PHONE_LINK_NAMES.iter().any(|name| text.contains(name))
+    }
 }
 
 /// Con qué se reconoce un aviso entre dos lecturas: su contenido y, si hay varios
@@ -61,20 +87,25 @@ pub struct Key {
     sender: String,
     title: String,
     body: String,
+    phone: bool,
     nth: usize,
 }
 
 /// La clave de cada aviso de la lista.
 pub fn keys(toasts: &[Toast]) -> Vec<Key> {
-    let mut seen: HashMap<(&str, &str, &str), usize> = HashMap::new();
+    let mut seen: HashMap<(&str, &str, &str, bool), usize> = HashMap::new();
     toasts
         .iter()
         .map(|t| {
-            let count = seen.entry((&t.sender, &t.title, &t.body)).or_default();
+            let phone = t.is_from_phone();
+            let count = seen
+                .entry((&t.sender, &t.title, &t.body, phone))
+                .or_default();
             let key = Key {
                 sender: t.sender.clone(),
                 title: t.title.clone(),
                 body: t.body.clone(),
+                phone,
                 nth: *count,
             };
             *count += 1;
@@ -563,6 +594,7 @@ fn entries(
                     entry.actions.push(element.clone());
                 }
                 "DismissButton" => entry.dismiss = Some(element.clone()),
+                "Attribution" => entry.toast.attribution = clean(&text()),
                 _ => {}
             }
         }
@@ -720,6 +752,9 @@ fn matching(
 /// El icono de la app que se llama `sender`, buscándola entre las de Inicio. Puede
 /// tardar (lee el catálogo): hay que llamarla fuera del hilo de la interfaz.
 pub fn find_icon(sender: &str) -> Option<Pixmap> {
+    if sender == PHONE_LINK {
+        return crate::icons::load(PHONE_LINK_APP);
+    }
     let entry = catalog_entry(&crate::catalog::search_key(sender), true)?;
     crate::icons::load(&entry.command)
 }
@@ -751,6 +786,9 @@ const CLOSE_R: f32 = 10.0;
 const CLOSE_AT: f32 = 4.0;
 const GLYPH_CLOSE: char = '\u{E8BB}';
 const NOW: &str = "ahora";
+/// Distintivo de Enlace Móvil sobre el icono de la app.
+const BADGE: f32 = 16.0;
+const GLYPH_PHONE: char = '\u{E8EA}';
 
 /// Alto más grande que puede necesitar la pila: el de la ventana.
 pub fn max_height() -> f32 {
@@ -904,9 +942,14 @@ impl Stack {
         let mut missing = Vec::new();
         for mut card in fresh.into_iter().rev() {
             card.enter.set_target(1.0);
-            if !self.icons.contains_key(&card.toast.sender) && !missing.contains(&card.toast.sender)
-            {
-                missing.push(card.toast.sender.clone());
+            let mut wanted = vec![card.toast.sender.clone()];
+            if card.toast.is_from_phone() {
+                wanted.push(PHONE_LINK.to_string());
+            }
+            for name in wanted {
+                if !self.icons.contains_key(&name) && !missing.contains(&name) {
+                    missing.push(name);
+                }
             }
             self.cards.insert(0, card);
         }
@@ -1087,6 +1130,9 @@ impl Stack {
         // Icono de la app.
         let (ix, iy) = (x + PAD, y + PAD + 2.0);
         self.draw_icon(image, &card.toast.sender, s(ix), s(iy), s(ICON));
+        if card.toast.is_from_phone() {
+            self.draw_phone_badge(image, s(ix + ICON), s(iy + ICON), scale);
+        }
 
         // Remitente y "ahora", en la primera línea.
         let tx = x + TEXT_X;
@@ -1184,6 +1230,29 @@ impl Stack {
         }
     }
 
+    /// El icono de Enlace Móvil en la esquina de abajo a la derecha del de la app
+    /// (centrado cerca de `(x, y)`), con un borde del color de la tarjeta para que
+    /// se separe de él. Sin su icono, un móvil de la fuente de iconos.
+    fn draw_phone_badge(&self, image: &mut Pixmap, x: f32, y: f32, scale: f32) {
+        let side = BADGE * scale;
+        let ring = side + 4.0 * scale;
+        let (cx, cy) = (x - 2.0 * scale, y - 2.0 * scale);
+        fill_rounded(
+            image,
+            [44, 44, 46, 255],
+            cx - ring / 2.0,
+            cy - ring / 2.0,
+            ring,
+            ring,
+            ring * 0.3,
+        );
+        if matches!(self.icons.get(PHONE_LINK), Some(Some(_))) {
+            self.draw_icon(image, PHONE_LINK, cx - side / 2.0, cy - side / 2.0, side);
+        } else {
+            draw_icon(image, GLYPH_PHONE, cx, cy, side * 0.7, 0.95);
+        }
+    }
+
     fn draw_icon(&self, image: &mut Pixmap, sender: &str, x: f32, y: f32, side: f32) {
         let px = side.round().max(1.0) as u32;
         if let Some(Some(icon)) = self.icons.get(sender) {
@@ -1234,7 +1303,31 @@ mod tests {
             title: title.into(),
             body: body.into(),
             actions: Vec::new(),
+            attribution: String::new(),
         }
+    }
+
+    #[test]
+    fn phone_link_toasts_are_told_apart_from_the_pc_ones() {
+        let pc = toast("WhatsApp", "Ana", "Hola");
+        let mut phone = pc.clone();
+        phone.attribution = "a través de Enlace Móvil".into();
+        assert!(!pc.is_from_phone());
+        assert!(phone.is_from_phone());
+        let mut english = pc.clone();
+        english.attribution = "via Phone Link".into();
+        assert!(english.is_from_phone());
+        // El mismo mensaje en el PC y en el móvil son dos tarjetas distintas.
+        let keys = keys(&[pc, phone.clone()]);
+        assert_ne!(keys[0], keys[1]);
+        assert_eq!(keys[1].nth, 0);
+        // Y la del móvil pide también el icono de Enlace Móvil.
+        let mut stack = Stack::default();
+        let missing = stack.update(vec![phone]);
+        assert_eq!(
+            missing,
+            vec!["WhatsApp".to_string(), PHONE_LINK.to_string()]
+        );
     }
 
     #[test]
