@@ -40,6 +40,10 @@ const IDLE_TITLES: [&str; 2] = ["Nueva notificación", "New notification"];
 const READ_DELAY: Duration = Duration::from_millis(40);
 /// Mientras hay avisos se vuelve a leer cada tanto, por si cambian sin avisar.
 const REREAD: Duration = Duration::from_millis(500);
+/// Tras el último aviso visto se sigue releyendo este rato. Con varios en cola,
+/// Windows deja la ventana vacía un momento (unos 0,6 s) y enseña el siguiente sin
+/// moverla ni ocultarla, así que no llega ningún evento que lo cuente.
+const LINGER: Duration = Duration::from_secs(2);
 /// Sin `ShellExperienceHost` (se reinicia con Explorer), cada cuánto se busca.
 const RETRY_MS: u32 = 5000;
 
@@ -355,6 +359,8 @@ impl Watch {
         use windows::Win32::Foundation::WAIT_OBJECT_0;
         use windows::Win32::System::Threading::INFINITE;
         let mut due: Option<Instant> = None;
+        // Cuándo se leyó por última vez algún aviso.
+        let mut seen: Option<Instant> = None;
         loop {
             if self.host.is_none() {
                 self.host = Host::attach();
@@ -410,7 +416,13 @@ impl Watch {
             }
             if due.is_some_and(|at| at <= Instant::now()) {
                 let toasts = self.read();
-                due = (!toasts.is_empty()).then(|| Instant::now() + REREAD);
+                let now = Instant::now();
+                if !toasts.is_empty() {
+                    seen = Some(now);
+                }
+                due = seen
+                    .is_some_and(|at| now.duration_since(at) < LINGER)
+                    .then(|| now + REREAD);
                 self.publish(toasts);
             }
         }
@@ -604,9 +616,33 @@ fn entries(
     result
 }
 
-/// Texto en una línea, sin espacios de sobra.
+/// Texto en una línea, sin espacios de sobra ni caracteres de formato invisibles.
 fn clean(text: &str) -> String {
-    text.split_whitespace().collect::<Vec<_>>().join(" ")
+    text.chars()
+        .filter(|&c| !is_invisible_format(c))
+        .collect::<String>()
+        .split_whitespace()
+        .collect::<Vec<_>>()
+        .join(" ")
+}
+
+/// Marcas de dirección y espacios de ancho cero que no se ven pero la fuente
+/// pinta como un recuadro. WhatsApp, por ejemplo, rodea el nombre de quien
+/// escribe en un grupo con U+2068 y U+2069. La unión de emojis (U+200D) se queda.
+fn is_invisible_format(c: char) -> bool {
+    matches!(
+        c,
+        '\u{00AD}'
+            | '\u{061C}'
+            | '\u{180E}'
+            | '\u{200B}'
+            | '\u{200E}'
+            | '\u{200F}'
+            | '\u{202A}'..='\u{202E}'
+            | '\u{2060}'..='\u{2064}'
+            | '\u{2066}'..='\u{2069}'
+            | '\u{FEFF}'
+    )
 }
 
 fn invoke(element: &windows::Win32::UI::Accessibility::IUIAutomationElement) {
@@ -1305,6 +1341,20 @@ mod tests {
             actions: Vec::new(),
             attribution: String::new(),
         }
+    }
+
+    #[test]
+    fn clean_drops_invisible_format_characters() {
+        assert_eq!(
+            clean("\u{2068}Johan\u{2069}: \u{1F4F7} Foto\u{200E}"),
+            "Johan: \u{1F4F7} Foto"
+        );
+        // La unión de un emoji compuesto se conserva.
+        assert_eq!(
+            clean("\u{1F469}\u{200D}\u{1F4BB}"),
+            "\u{1F469}\u{200D}\u{1F4BB}"
+        );
+        assert_eq!(clean("  a \n b \u{FEFF} "), "a b");
     }
 
     #[test]
