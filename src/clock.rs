@@ -311,7 +311,8 @@ fn glyph(font: &Font, c: char, size: f32) -> Glyph {
         static CACHE: RefCell<std::collections::HashMap<(usize, char, u32), Glyph>> =
             RefCell::new(std::collections::HashMap::new());
     }
-    let font = font_for(font, c);
+    let main = font;
+    let font = font_for(main, c);
     let key = (font as *const Font as usize, c, size.to_bits());
     CACHE.with(|cache| {
         let mut cache = cache.borrow_mut();
@@ -321,10 +322,24 @@ fn glyph(font: &Font, c: char, size: f32) -> Glyph {
         if cache.len() > 8192 {
             cache.clear();
         }
-        let glyph = Glyph::new(font.rasterize(c, size));
+        let (mut metrics, coverage) = font.rasterize(c, size);
+        if !std::ptr::eq(font, main) {
+            metrics.ymin += centering_shift(main, &metrics, size);
+        }
+        let glyph = Glyph::new((metrics, coverage));
         cache.insert(key, glyph.clone());
         glyph
     })
+}
+
+/// Cuánto subir un glifo de una fuente de respaldo (un emoji, un símbolo) para que
+/// quede centrado en la altura de las mayúsculas de `main`, como un icono junto al
+/// texto. Sin esto se apoya en la línea base y se ve más bajo que las letras.
+fn centering_shift(main: &Font, glyph: &crate::font::Metrics, size: f32) -> i32 {
+    let cap = main.metrics('H', size);
+    let cap_center = (cap.ymin as f32 + cap.height as f32) / 2.0;
+    let center = glyph.ymin as f32 + glyph.height as f32 / 2.0;
+    (cap_center - center).round() as i32
 }
 
 fn rasterize_with(font: &Font, text: &str, size: f32) -> Pixmap {
@@ -486,6 +501,17 @@ mod tests {
             super::text_width(toned, 16.0)
         );
         assert_eq!(super::fit_text(toned, 16.0, 200.0), toned);
+    }
+
+    #[test]
+    fn emojis_are_centered_on_the_capitals() {
+        // El emoji de la cámara (como en "📷 Foto") queda a media altura de la "F".
+        let size = 12.5;
+        let main = super::system_font();
+        let camera = super::glyph(main, '\u{1F4F7}', size);
+        let letter = super::glyph(main, 'F', size);
+        let middle = |m: &crate::font::Metrics| m.ymin as f32 + m.height as f32 / 2.0;
+        assert!((middle(&camera.0) - middle(&letter.0)).abs() <= 1.0);
     }
 
     #[test]
