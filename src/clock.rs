@@ -64,6 +64,40 @@ pub fn draw_icon_aligned(
     );
 }
 
+/// Para lo que Segoe UI no tiene (emojis y símbolos, p. ej. en el texto de los
+/// avisos): Segoe UI Emoji, en su versión de un solo color, y Segoe UI Symbol. Se
+/// cargan la primera vez que hacen falta.
+fn fallback_fonts() -> &'static [Font] {
+    static FONTS: OnceLock<Vec<Font>> = OnceLock::new();
+    FONTS.get_or_init(|| {
+        ["seguiemj.ttf", "seguisym.ttf"]
+            .into_iter()
+            .filter_map(font_file)
+            .collect()
+    })
+}
+
+/// La fuente con la que se dibuja `c`: `font` o, si no la tiene, una de respaldo.
+fn font_for(font: &Font, c: char) -> &Font {
+    if font.has(c) {
+        return font;
+    }
+    fallback_fonts().iter().find(|f| f.has(c)).unwrap_or(font)
+}
+
+/// Caracteres que no se dibujan solos: unen o modifican el emoji anterior (unión
+/// de ancho cero, selectores de variante, tonos de piel, etiquetas de banderas).
+/// Sin ellos el emoji sale en su forma básica, sin una caja vacía al lado.
+fn invisible(c: char) -> bool {
+    matches!(c,
+        '\u{200D}' | '\u{FE00}'..='\u{FE0F}' | '\u{1F3FB}'..='\u{1F3FF}' | '\u{E0020}'..='\u{E007F}')
+}
+
+/// Las letras de `text` que se dibujan.
+fn shown(text: &str) -> impl Iterator<Item = char> + '_ {
+    text.chars().filter(|&c| !invisible(c))
+}
+
 /// Segoe UI Semibold para encabezados; si falta, la normal.
 fn semibold_font() -> &'static Font {
     static FONT: OnceLock<Font> = OnceLock::new();
@@ -277,6 +311,7 @@ fn glyph(font: &Font, c: char, size: f32) -> Glyph {
         static CACHE: RefCell<std::collections::HashMap<(usize, char, u32), Glyph>> =
             RefCell::new(std::collections::HashMap::new());
     }
+    let font = font_for(font, c);
     let key = (font as *const Font as usize, c, size.to_bits());
     CACHE.with(|cache| {
         let mut cache = cache.borrow_mut();
@@ -299,7 +334,7 @@ fn rasterize_with(font: &Font, text: &str, size: f32) -> Pixmap {
 /// Texto rasterizado y cuántos píxeles sube su glifo más alto sobre la línea base
 /// (la primera fila de la imagen).
 fn rasterize_line(font: &Font, text: &str, size: f32) -> (Pixmap, i32) {
-    let glyphs: Vec<Glyph> = text.chars().map(|c| glyph(font, c, size)).collect();
+    let glyphs: Vec<Glyph> = shown(text).map(|c| glyph(font, c, size)).collect();
     let width = glyphs.iter().map(|g| g.0.advance_width).sum::<f32>().ceil() as u32 + 2;
     let top = glyphs
         .iter()
@@ -402,13 +437,19 @@ fn blit_text(target: &mut Pixmap, image: Pixmap, x: f32, y: f32, opacity: f32) {
     );
 }
 pub fn text_width(text: &str, size: f32) -> f32 {
-    text.chars()
-        .map(|c| system_font().metrics(c, size).advance_width)
+    shown(text)
+        .map(|c| font_for(system_font(), c).metrics(c, size).advance_width)
         .sum()
 }
 pub fn fit_text(text: &str, size: f32, width: f32) -> String {
     let font = system_font();
-    let advance = |c: char| font.metrics(c, size).advance_width;
+    let advance = |c: char| {
+        if invisible(c) {
+            0.0
+        } else {
+            font_for(font, c).metrics(c, size).advance_width
+        }
+    };
     if text.chars().map(advance).sum::<f32>() <= width {
         return text.into();
     }
@@ -428,6 +469,25 @@ pub fn fit_text(text: &str, size: f32, width: f32) -> String {
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn emojis_are_drawn_with_a_fallback_font() {
+        // Un emoji que Segoe UI no tiene: se dibuja con Segoe UI Emoji, no como caja.
+        let face = '\u{1F600}';
+        assert!(!super::system_font().has(face));
+        let font = super::font_for(super::system_font(), face);
+        assert!(font.has(face));
+        let (metrics, coverage) = font.rasterize(face, 16.0);
+        assert!(metrics.width > 0 && coverage.iter().any(|&a| a > 0));
+        // Los modificadores no ocupan sitio: "pulgar + tono + variante" mide un pulgar.
+        let thumb = "\u{1F44D}";
+        let toned = "\u{1F44D}\u{1F3FD}\u{FE0F}";
+        assert_eq!(
+            super::text_width(thumb, 16.0),
+            super::text_width(toned, 16.0)
+        );
+        assert_eq!(super::fit_text(toned, 16.0, 200.0), toned);
+    }
+
     #[test]
     fn time_follows_the_regional_format_and_the_seconds_setting() {
         use windows::Win32::Foundation::SYSTEMTIME;

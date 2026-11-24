@@ -473,6 +473,8 @@ pub const CMD_IMPORT: u32 = 12;
 /// Dock más pequeño o más grande.
 pub const CMD_DOCK_SMALLER: u32 = 13;
 pub const CMD_DOCK_BIGGER: u32 = 14;
+/// Avisos de Windows como tarjetas arriba a la derecha.
+pub const CMD_NOTIFICATIONS: u32 = 15;
 
 /// Menú del icono de GlassBar en la bandeja (clic derecho): configuración y salir.
 pub fn tray() -> AppMenu {

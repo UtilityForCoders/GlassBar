@@ -35,6 +35,7 @@ pub fn run(args: &[String]) -> bool {
     }
     // Tras un cierre normal ya está visible y esto no cambia nada.
     crate::shell::restore_native();
+    crate::notifications::restore_native();
     true
 }
 
