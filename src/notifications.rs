@@ -745,6 +745,7 @@ const LINE: f32 = 17.0;
 const BODY_LINES: usize = 3;
 const ACTION_H: f32 = 28.0;
 const ACTION_GAP: f32 = 6.0;
+const ACTION_SIZE: f32 = 12.5;
 /// Botón de cerrar, en la esquina de arriba a la izquierda al pasar el cursor.
 const CLOSE_R: f32 = 10.0;
 const CLOSE_AT: f32 = 4.0;
@@ -1141,16 +1142,16 @@ impl Stack {
                 s(ACTION_H),
                 s(8.0),
             );
-            let label = fit_text(&card.toast.actions[i], s(12.0), s(width - 12.0));
-            let label_w = text_width(&label, s(12.0));
-            let (ascent, descent) = line_metrics(s(12.0));
+            let label = fit_text(&card.toast.actions[i], s(ACTION_SIZE), s(width - 12.0));
+            let label_w = text_width(&label, s(ACTION_SIZE));
+            let (ascent, descent) = line_metrics(s(ACTION_SIZE));
             let baseline = s(actions_top + ACTION_H / 2.0) + (ascent - descent) / 2.0;
             draw_text_on_baseline(
                 image,
                 &label,
                 s(x + at + width / 2.0) - label_w / 2.0,
                 baseline,
-                s(12.0),
+                s(ACTION_SIZE),
                 0.95,
             );
         }
