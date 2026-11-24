@@ -456,6 +456,78 @@ pub fn text_width(text: &str, size: f32) -> f32 {
         .map(|c| font_for(system_font(), c).metrics(c, size).advance_width)
         .sum()
 }
+/// Fondo gris de la pastilla de avisos sin leer.
+const BADGE_FILL: [u8; 4] = [92, 92, 96, 255];
+
+/// Número de avisos sin leer del centro de notificaciones, en una pastilla gris
+/// centrada en `(cx, cy)` (píxeles). Devuelve su ancho.
+pub fn draw_badge(image: &mut Pixmap, count: usize, cx: f32, cy: f32, scale: f32) -> f32 {
+    let text = badge_text(count);
+    let size = 10.0 * scale;
+    let height = 15.0 * scale;
+    let width = (text_width(&text, size) + 8.0 * scale).max(height);
+    crate::apps::fill_rounded(
+        image,
+        BADGE_FILL,
+        cx - width / 2.0,
+        cy - height / 2.0,
+        width,
+        height,
+        height / 2.0,
+    );
+    draw_ink_centered(image, rasterize_with(semibold_font(), &text, size), cx, cy);
+    width
+}
+
+/// Pega el texto ya rasterizado con el centro de lo que se ve (no de su caja, que
+/// lleva el margen de los lados y la altura de la letra más alta) en `(cx, cy)`.
+fn draw_ink_centered(target: &mut Pixmap, image: Pixmap, cx: f32, cy: f32) {
+    let Some((left, top, right, bottom)) = ink_bounds(&image) else {
+        return;
+    };
+    let x = cx - (left + right) as f32 / 2.0;
+    let y = cy - (top + bottom) as f32 / 2.0;
+    target.draw_pixmap(
+        x.round() as i32,
+        y.round() as i32,
+        image.as_ref(),
+        &PixmapPaint::default(),
+        Transform::identity(),
+        None,
+    );
+}
+
+/// Caja de los píxeles con tinta de `image`: izquierda, arriba y los bordes
+/// derecho e inferior (exclusivos).
+fn ink_bounds(image: &Pixmap) -> Option<(u32, u32, u32, u32)> {
+    let width = image.width();
+    let mut bounds: Option<(u32, u32, u32, u32)> = None;
+    for (i, pixel) in image.pixels().iter().enumerate() {
+        if pixel.alpha() == 0 {
+            continue;
+        }
+        let (x, y) = (i as u32 % width, i as u32 / width);
+        bounds = Some(match bounds {
+            None => (x, y, x + 1, y + 1),
+            Some((l, t, r, b)) => (l.min(x), t.min(y), r.max(x + 1), b.max(y + 1)),
+        });
+    }
+    bounds
+}
+
+/// Ancho lógico de la pastilla de `count` avisos.
+pub fn badge_width(count: usize) -> f32 {
+    (text_width(&badge_text(count), 10.0) + 8.0).max(15.0)
+}
+
+fn badge_text(count: usize) -> String {
+    if count > 9 {
+        "9+".into()
+    } else {
+        count.to_string()
+    }
+}
+
 pub fn fit_text(text: &str, size: f32, width: f32) -> String {
     let font = system_font();
     let advance = |c: char| {
@@ -484,6 +556,20 @@ pub fn fit_text(text: &str, size: f32, width: f32) -> String {
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn ink_bounds_ignore_the_empty_margin() {
+        let mut image = tiny_skia::Pixmap::new(6, 5).unwrap();
+        assert_eq!(super::ink_bounds(&image), None);
+        let white = tiny_skia::PremultipliedColorU8::from_rgba(255, 255, 255, 255).unwrap();
+        image.pixels_mut()[6 + 2] = white;
+        image.pixels_mut()[6 * 3 + 4] = white;
+        assert_eq!(super::ink_bounds(&image), Some((2, 1, 5, 4)));
+        // Un dígito queda centrado igual que su caja de tinta.
+        let digit = super::rasterize_with(super::semibold_font(), "3", 20.0);
+        let (l, t, r, b) = super::ink_bounds(&digit).unwrap();
+        assert!(r > l && b > t);
+    }
+
     #[test]
     fn emojis_are_drawn_with_a_fallback_font() {
         // Un emoji que Segoe UI no tiene: se dibuja con Segoe UI Emoji, no como caja.

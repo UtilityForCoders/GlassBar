@@ -87,6 +87,8 @@ pub struct BarState {
     /// Solo los programas: Inicio, la bandeja, el estado y la hora van en la barra
     /// superior (ver `topbar`).
     pub compact: bool,
+    /// Avisos sin leer del centro de notificaciones: su número sale sobre la hora.
+    pub unread: usize,
     clock: ClockRenderer,
     /// Lo que no se mueve al pasar el cursor por los iconos (fondo, flecha, idioma,
     /// estado y reloj), ya dibujado. Cada fotograma lo copia en vez de repintarlo.
@@ -103,6 +105,7 @@ struct FixedKey {
     keyboard: Option<crate::keyboard::Layout>,
     items: usize,
     compact: bool,
+    unread: usize,
     /// Resaltado de la flecha, el idioma o el estado: se dibuja debajo de su icono.
     hovered: Option<HoverTarget>,
     minute: u64,
@@ -123,6 +126,7 @@ impl BarState {
             keyboard: None,
             appearance: Default::default(),
             compact: false,
+            unread: 0,
             clock: ClockRenderer::new(),
             fixed: std::cell::RefCell::new(None),
         }
@@ -506,6 +510,7 @@ impl BarState {
             keyboard: self.keyboard.clone(),
             items: self.item_count(),
             compact: self.compact,
+            unread: self.unread,
             hovered: self.hovered.filter(|h| {
                 matches!(
                     h,
@@ -646,6 +651,16 @@ impl BarState {
         }
         self.clock
             .draw(pixmap, self.clock_center(scale), cy, scale, CLOCK_W * scale);
+        if self.unread > 0 {
+            // Arriba a la derecha de la hora, como en los iconos de las apps.
+            crate::clock::draw_badge(
+                pixmap,
+                self.unread,
+                self.clock_center(scale) + (CLOCK_W / 2.0 - 9.0) * scale,
+                cy - 12.0 * scale,
+                scale,
+            );
+        }
         // Mostrar escritorio: una línea fina en el extremo, resaltada al pasar por ella.
         let desktop_x = self.show_desktop_center(scale);
         if self.hovered == Some(HoverTarget::ShowDesktop) {
