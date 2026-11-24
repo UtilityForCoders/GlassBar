@@ -291,12 +291,22 @@ fn order_path() -> Option<std::path::PathBuf> {
     )
 }
 
+/// Orden guardado, leído del disco una sola vez: el panel se vuelve a ordenar cada
+/// vez que un programa cambia su icono.
+static ORDER: std::sync::Mutex<Option<Vec<String>>> = std::sync::Mutex::new(None);
+
 /// Orden guardado de los iconos (sus identidades); vacío si no hay.
 pub fn load_order() -> Vec<String> {
-    order_path()
-        .and_then(|path| std::fs::read(path).ok())
-        .and_then(|bytes| serde_json::from_slice(&bytes).ok())
-        .unwrap_or_default()
+    ORDER
+        .lock()
+        .unwrap_or_else(|e| e.into_inner())
+        .get_or_insert_with(|| {
+            order_path()
+                .and_then(|path| std::fs::read(path).ok())
+                .and_then(|bytes| serde_json::from_slice(&bytes).ok())
+                .unwrap_or_default()
+        })
+        .clone()
 }
 
 /// Guarda `shown` (el orden actual del panel) seguido de los iconos guardados que
@@ -307,7 +317,9 @@ pub fn save_order(shown: &[String]) -> std::io::Result<()> {
     std::fs::create_dir_all(path.parent().unwrap())?;
     let pending = path.with_extension("tmp");
     std::fs::write(&pending, serde_json::to_vec_pretty(&order)?)?;
-    std::fs::rename(pending, path)
+    std::fs::rename(pending, path)?;
+    *ORDER.lock().unwrap_or_else(|e| e.into_inner()) = Some(order);
+    Ok(())
 }
 
 fn merge_order(shown: &[String], saved: &[String]) -> Vec<String> {
