@@ -3526,6 +3526,12 @@ unsafe extern "system" fn wndproc(hwnd: HWND, msg: u32, wparam: WPARAM, lparam: 
                         .tray_clicked
                         .is_some_and(|at| at.elapsed() < Duration::from_millis(1500));
                 app.check_priority(!tray_menu);
+                // Una ventana que se abre o se activa con la parte de arriba debajo
+                // de la barra superior se baja para que se vea su título.
+                if let Some(top) = app.top.as_ref().filter(|top| !top.hidden) {
+                    let strip = appbar::strip(top.rect, top.height(), true);
+                    priority::keep_below(strip, top.rect);
+                }
                 app.update_keyboard();
                 app.update_style();
                 app.update_active_app();

@@ -148,6 +148,81 @@ pub fn raise_below_overlapping(hwnd: HWND, area: RECT) {
     }
 }
 
+/// La franja reservada de una barra solo aparta a las ventanas maximizadas: una
+/// ventana normal que se abre donde la dejó el usuario sin la barra (o donde la
+/// pone la app) puede quedar con su barra de título debajo de ella. Si la ventana
+/// activa está así, se baja justo debajo de `strip` (arriba de `monitor`), sin
+/// cambiar su tamaño.
+pub fn keep_below(strip: RECT, monitor: RECT) {
+    use windows::Win32::Graphics::Dwm::{DwmGetWindowAttribute, DWMWA_EXTENDED_FRAME_BOUNDS};
+    use windows::Win32::UI::WindowsAndMessaging::{
+        IsIconic, IsWindowVisible, IsZoomed, GWL_EXSTYLE, WS_CHILD, WS_EX_TOOLWINDOW,
+        WS_EX_TOPMOST, WS_THICKFRAME,
+    };
+    unsafe {
+        let window = GetForegroundWindow();
+        if window.is_invalid()
+            || !IsWindowVisible(window).as_bool()
+            || IsIconic(window).as_bool()
+            || IsZoomed(window).as_bool()
+            || is_desktop(window)
+        {
+            return;
+        }
+        let mut process = 0;
+        GetWindowThreadProcessId(window, Some(&mut process));
+        if process == std::process::id() {
+            return;
+        }
+        let style = GetWindowLongW(window, GWL_STYLE) as u32;
+        let ex_style = GetWindowLongW(window, GWL_EXSTYLE) as u32;
+        // Solo ventanas de app normales: con título o borde para redimensionar
+        // (también las de título propio, como Chrome o VS Code). Los menús,
+        // avisos y ventanas "siempre encima" se dejan donde están.
+        let framed = style & WS_CAPTION.0 == WS_CAPTION.0 || style & WS_THICKFRAME.0 != 0;
+        if !framed
+            || style & WS_CHILD.0 != 0
+            || ex_style & (WS_EX_TOOLWINDOW.0 | WS_EX_TOPMOST.0) != 0
+        {
+            return;
+        }
+        let mut rect = RECT::default();
+        if GetWindowRect(window, &mut rect).is_err() {
+            return;
+        }
+        // El marco visible: `GetWindowRect` incluye los bordes invisibles.
+        let mut frame = rect;
+        let _ = DwmGetWindowAttribute(
+            window,
+            DWMWA_EXTENDED_FRAME_BOUNDS,
+            &mut frame as *mut RECT as *mut _,
+            std::mem::size_of::<RECT>() as u32,
+        );
+        if let Some(dy) = push_down(frame, strip, monitor) {
+            let _ = SetWindowPos(
+                window,
+                None,
+                rect.left,
+                rect.top + dy,
+                0,
+                0,
+                SWP_NOSIZE | SWP_NOZORDER | SWP_NOACTIVATE,
+            );
+        }
+    }
+}
+
+/// Cuánto hay que bajar una ventana con marco visible `frame` para que su parte
+/// de arriba no quede debajo de `strip`, o `None` si no la tapa. Una que cubre
+/// todo `monitor` (pantalla completa) no se toca.
+fn push_down(frame: RECT, strip: RECT, monitor: RECT) -> Option<i32> {
+    let fullscreen = frame.left <= monitor.left
+        && frame.top <= monitor.top
+        && frame.right >= monitor.right
+        && frame.bottom >= monitor.bottom;
+    (overlaps(frame, strip) && !fullscreen).then_some(strip.bottom - frame.top)
+}
+
 /// Los dos rectángulos comparten algún píxel (y ninguno está vacío).
 fn overlaps(a: RECT, b: RECT) -> bool {
     a.right > a.left
@@ -363,6 +438,29 @@ mod tests {
         // En un segundo monitor a la izquierda.
         let left = rect(-1920, 0, 0, 1080);
         assert!(shifted_fullscreen(rect(-1920, 56, 0, 1136), left, false));
+    }
+
+    #[test]
+    fn windows_under_the_top_bar_are_pushed_below_it() {
+        let rect = |left, top, right, bottom| RECT {
+            left,
+            top,
+            right,
+            bottom,
+        };
+        let monitor = rect(0, 0, 1920, 1080);
+        let strip = rect(0, 0, 1920, 28);
+        // Abierta arriba del todo: baja lo justo para asomar bajo la barra.
+        assert_eq!(push_down(rect(200, 0, 1000, 600), strip, monitor), Some(28));
+        assert_eq!(
+            push_down(rect(200, 10, 1000, 600), strip, monitor),
+            Some(18)
+        );
+        // Ya debajo de la barra, o en otro monitor: no se mueve.
+        assert_eq!(push_down(rect(200, 28, 1000, 600), strip, monitor), None);
+        assert_eq!(push_down(rect(2000, 0, 2800, 600), strip, monitor), None);
+        // A pantalla completa tapa la barra a propósito.
+        assert_eq!(push_down(monitor, strip, monitor), None);
     }
 
     #[test]
