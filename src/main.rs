@@ -2558,7 +2558,7 @@ impl App {
             .map(|top| top.rect.top + top.height());
         if let Some(notifications) = &mut self.notifications {
             notifications.window.below = below;
-            notifications.handle_events();
+            notifications.handle_events(&self.styles);
         }
     }
 
@@ -4380,7 +4380,8 @@ impl Notifications {
         Some(Self { watcher, window })
     }
 
-    fn handle_events(&mut self) {
+    /// Lee lo que mandó el hilo de los avisos. Los de las apps silenciadas no salen.
+    fn handle_events(&mut self, styles: &style::Styles) {
         let mut latest = None;
         let mut changed = false;
         for event in self.watcher.events() {
@@ -4392,7 +4393,8 @@ impl Notifications {
                 }
             }
         }
-        if let Some(toasts) = latest {
+        if let Some(mut toasts) = latest {
+            toasts.retain(|t| !styles.is_muted(&t.sender));
             for sender in self.window.stack.update(toasts) {
                 self.window.stack.mark_icon_pending(&sender);
                 self.watcher.find_icon(sender);
@@ -4404,20 +4406,36 @@ impl Notifications {
         }
     }
 
-    /// Clic en una tarjeta: se pulsa lo mismo en el aviso de Windows.
-    fn click(&mut self, x: f32, y: f32) {
-        let Some((key, part)) = self.window.stack.hit_test(x, y) else {
-            return;
-        };
-        if self.window.stack.take(&key) {
+    /// Clic en una tarjeta: se pulsa lo mismo en el aviso de Windows. Con la
+    /// campana se cierran todos los avisos de esa app y se devuelve su nombre, para
+    /// silenciarla, y si también se apagó en Windows.
+    fn click(&mut self, x: f32, y: f32) -> Option<(String, bool)> {
+        let (key, part) = self.window.stack.hit_test(x, y)?;
+        let mut muted = None;
+        if part == notifications::Part::Mute {
+            if let Some(toast) = self.window.stack.toast(&key) {
+                let sender = toast.sender.clone();
+                // Lo que llega del móvil lo manda Enlace Móvil: apagarlo en Windows
+                // callaría todo el móvil.
+                let in_windows =
+                    !toast.is_from_phone() && notifications::disable_in_windows(&sender);
+                for key in self.window.stack.take_sender(&sender) {
+                    self.watcher.send(notifications::Command::Dismiss(key));
+                }
+                muted = Some((sender, in_windows));
+            }
+        } else if self.window.stack.take(&key) {
             self.watcher.send(match part {
                 notifications::Part::Body => notifications::Command::Open(key),
-                notifications::Part::Close => notifications::Command::Dismiss(key),
+                notifications::Part::Close | notifications::Part::Mute => {
+                    notifications::Command::Dismiss(key)
+                }
                 notifications::Part::Action(n) => notifications::Command::Action(key, n),
             });
         }
         self.window.stack.hovered = None;
         self.window.refresh();
+        muted
     }
 }
 
@@ -4642,9 +4660,14 @@ unsafe extern "system" fn notifications_wndproc(
         }
         WM_LBUTTONUP => {
             with_app(|app| {
-                if let Some(n) = &mut app.notifications {
-                    let (x, y) = point(n.window.scale);
-                    n.click(x, y);
+                let Some(n) = &mut app.notifications else {
+                    return;
+                };
+                let (x, y) = point(n.window.scale);
+                if let Some((sender, in_windows)) = n.click(x, y) {
+                    app.styles.mute_app(&sender, in_windows);
+                    let _ = app.styles.save();
+                    app.refresh_settings();
                 }
             });
         }
@@ -6935,6 +6958,13 @@ unsafe extern "system" fn settings_wndproc(
                     panel.minimize();
                     return;
                 }
+                if let settings::Hit::Page(page) = hit {
+                    if panel.model.page != page {
+                        panel.model.page = page;
+                        panel.render();
+                    }
+                    return;
+                }
                 if let Some(command) = panel.model.command(hit) {
                     if matches!(command, appmenu::CMD_EXPORT | appmenu::CMD_IMPORT) {
                         backup = Some((app.hwnd, command == appmenu::CMD_EXPORT));
@@ -7026,6 +7056,15 @@ fn handle_menu_command(app: &mut App, cmd: u32) {
             app.styles.set_notifications(on);
             let _ = app.styles.save();
             app.sync_notifications();
+        }
+        appmenu::CMD_UNMUTE_APPS => {
+            let in_windows = app.styles.unmute_apps();
+            let _ = app.styles.save();
+            // Windows no vuelve a encender una app desde el registro: se enciende en
+            // su Configuración.
+            if in_windows {
+                apps::open_notification_settings();
+            }
         }
         CMD_CLOCK_SECONDS => {
             let on = !app.styles.clock_seconds();
