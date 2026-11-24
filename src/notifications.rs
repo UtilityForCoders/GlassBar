@@ -40,6 +40,10 @@ const IDLE_TITLES: [&str; 2] = ["Nueva notificación", "New notification"];
 const READ_DELAY: Duration = Duration::from_millis(40);
 /// Mientras hay avisos se vuelve a leer cada tanto, por si cambian sin avisar.
 const REREAD: Duration = Duration::from_millis(500);
+/// Tras el último aviso visto se sigue releyendo este rato. Con varios en cola,
+/// Windows deja la ventana vacía un momento (unos 0,6 s) y enseña el siguiente sin
+/// moverla ni ocultarla, así que no llega ningún evento que lo cuente.
+const LINGER: Duration = Duration::from_secs(2);
 /// Sin `ShellExperienceHost` (se reinicia con Explorer), cada cuánto se busca.
 const RETRY_MS: u32 = 5000;
 
@@ -355,6 +359,8 @@ impl Watch {
         use windows::Win32::Foundation::WAIT_OBJECT_0;
         use windows::Win32::System::Threading::INFINITE;
         let mut due: Option<Instant> = None;
+        // Cuándo se leyó por última vez algún aviso.
+        let mut seen: Option<Instant> = None;
         loop {
             if self.host.is_none() {
                 self.host = Host::attach();
@@ -410,7 +416,13 @@ impl Watch {
             }
             if due.is_some_and(|at| at <= Instant::now()) {
                 let toasts = self.read();
-                due = (!toasts.is_empty()).then(|| Instant::now() + REREAD);
+                let now = Instant::now();
+                if !toasts.is_empty() {
+                    seen = Some(now);
+                }
+                due = seen
+                    .is_some_and(|at| now.duration_since(at) < LINGER)
+                    .then(|| now + REREAD);
                 self.publish(toasts);
             }
         }
