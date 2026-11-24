@@ -139,6 +139,24 @@ pub struct Styles {
     /// Tamaño del dock respecto al normal, en tanto por ciento (ver `DOCK_SIZES`).
     #[serde(default = "default_dock_size")]
     dock_size: u8,
+    /// Apps silenciadas desde la campana de una tarjeta (ver `MutedApp`).
+    #[serde(default)]
+    muted_apps: Vec<MutedApp>,
+    /// No molestar: los avisos no salen como tarjetas, solo quedan en el centro de
+    /// notificaciones.
+    #[serde(default)]
+    do_not_disturb: bool,
+}
+
+/// App silenciada desde la campana de una tarjeta.
+#[derive(Clone, Debug, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+pub struct MutedApp {
+    /// Nombre con el que firma sus avisos: los suyos no salen como tarjetas.
+    pub name: String,
+    /// También se apagaron sus avisos en Windows (ver `notifications::disable_in_windows`).
+    /// Esos solo se vuelven a encender desde la Configuración de Windows.
+    #[serde(default)]
+    pub in_windows: bool,
 }
 
 /// Tamaños del dock que se pueden elegir, con su nombre, en tanto por ciento.
@@ -170,6 +188,8 @@ impl Default for Styles {
             clock_seconds: false,
             notifications: false,
             dock_size: default_dock_size(),
+            muted_apps: Vec::new(),
+            do_not_disturb: false,
         }
     }
 }
@@ -209,6 +229,41 @@ impl Styles {
     }
     pub fn set_notifications(&mut self, on: bool) {
         self.notifications = on;
+    }
+    /// No molestar: los avisos solo van al centro de notificaciones.
+    pub fn do_not_disturb(&self) -> bool {
+        self.do_not_disturb
+    }
+    pub fn set_do_not_disturb(&mut self, on: bool) {
+        self.do_not_disturb = on;
+    }
+    /// Cuántas apps hay silenciadas.
+    pub fn muted_count(&self) -> usize {
+        self.muted_apps.len()
+    }
+    /// Los avisos de `sender` no salen como tarjetas.
+    pub fn is_muted(&self, sender: &str) -> bool {
+        self.muted_apps.iter().any(|a| a.name == sender)
+    }
+    /// Silencia `sender`; `in_windows` si también se apagaron sus avisos en Windows.
+    pub fn mute_app(&mut self, sender: &str, in_windows: bool) {
+        if sender.is_empty() {
+            return;
+        }
+        match self.muted_apps.iter_mut().find(|a| a.name == sender) {
+            Some(app) => app.in_windows |= in_windows,
+            None => self.muted_apps.push(MutedApp {
+                name: sender.to_string(),
+                in_windows,
+            }),
+        }
+    }
+    /// Vuelven a salir como tarjetas los avisos de todas las apps. Devuelve si alguna
+    /// estaba apagada también en Windows: esas hay que encenderlas allí.
+    pub fn unmute_apps(&mut self) -> bool {
+        let in_windows = self.muted_apps.iter().any(|a| a.in_windows);
+        self.muted_apps.clear();
+        in_windows
     }
     /// Posición del tamaño del dock en `DOCK_SIZES` (uno desconocido cuenta como Normal).
     fn dock_size_index(&self) -> usize {
@@ -1031,6 +1086,26 @@ mod menu_opacity_tests {
         let styles: Styles = serde_json::from_str(old).unwrap();
         assert_eq!(styles.menu_opacity(), crate::glass::DEFAULT_MENU_OPACITY);
         assert_eq!(styles.look(State::Desktop).appearance, Appearance::Blur);
+    }
+
+    #[test]
+    fn muted_apps_are_kept_once_and_can_be_cleared() {
+        let old = r#"{"looks":[{"enabled":true,"appearance":"Blur"}]}"#;
+        let mut styles: Styles = serde_json::from_str(old).unwrap();
+        assert_eq!(styles.muted_count(), 0);
+        styles.mute_app("Chat", false);
+        styles.mute_app("Chat", false);
+        styles.mute_app("", true);
+        assert_eq!(styles.muted_count(), 1);
+        assert!(styles.is_muted("Chat"));
+        assert!(!styles.is_muted("Correo"));
+        // Sin ninguna apagada en Windows no hace falta abrir su Configuración.
+        assert!(!styles.unmute_apps());
+        assert_eq!(styles.muted_count(), 0);
+        styles.mute_app("Chat", false);
+        styles.mute_app("Correo", true);
+        assert!(styles.unmute_apps());
+        assert!(!styles.is_muted("Correo"));
     }
 
     #[test]

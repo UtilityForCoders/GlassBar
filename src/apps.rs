@@ -405,6 +405,11 @@ pub fn open_entry_location(entry: &AppEntry) -> bool {
     )
 }
 
+/// Abre la página de notificaciones de la Configuración de Windows.
+pub fn open_notification_settings() -> bool {
+    shell_execute("open", "ms-settings:notifications", None)
+}
+
 /// Abre "Aplicaciones instaladas" de Configuración, desde donde se desinstala.
 pub fn open_uninstall() -> bool {
     shell_execute("open", "ms-settings:appsfeatures", None)

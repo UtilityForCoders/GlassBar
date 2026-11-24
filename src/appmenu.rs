@@ -475,6 +475,8 @@ pub const CMD_DOCK_SMALLER: u32 = 13;
 pub const CMD_DOCK_BIGGER: u32 = 14;
 /// Avisos de Windows como tarjetas arriba a la derecha.
 pub const CMD_NOTIFICATIONS: u32 = 15;
+/// Volver a mostrar los avisos de las apps silenciadas.
+pub const CMD_UNMUTE_APPS: u32 = 16;
 
 /// Menú del icono de GlassBar en la bandeja (clic derecho): configuración y salir.
 pub fn tray() -> AppMenu {

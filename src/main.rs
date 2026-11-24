@@ -32,6 +32,7 @@ mod keyboard;
 mod language;
 mod launcher;
 mod monitors;
+mod notifcenter;
 mod notifications;
 mod pins;
 mod preview;
@@ -2541,11 +2542,16 @@ impl App {
     /// Windows vuelven a verse.
     fn sync_notifications(&mut self) {
         if !self.styles.notifications() {
-            self.notifications = None;
+            if self.notifications.take().is_some() {
+                self.sync_center();
+            }
             return;
         }
         if self.notifications.is_none() {
             self.notifications = Notifications::start(self.hwnd);
+            if let Some(n) = &mut self.notifications {
+                n.dnd = self.styles.do_not_disturb();
+            }
         }
     }
 
@@ -2556,10 +2562,76 @@ impl App {
             .as_ref()
             .filter(|top| top.monitor == monitors::primary())
             .map(|top| top.rect.top + top.height());
+        let mut changed = false;
         if let Some(notifications) = &mut self.notifications {
             notifications.window.below = below;
-            notifications.handle_events();
+            changed = notifications.handle_events(&self.styles);
         }
+        if changed {
+            self.sync_center();
+        }
+    }
+
+    /// Algo cambió en el centro de notificaciones: se ponen al día el panel de la
+    /// hora, si está abierto (y entonces no queda nada sin leer), y el número de
+    /// avisos sin leer sobre la hora.
+    fn sync_center(&mut self) {
+        let open = self.calendar.as_ref().is_some_and(|p| p.visible);
+        if let Some(n) = &mut self.notifications {
+            if open {
+                n.center.unread = 0;
+            }
+        }
+        if let Some(panel) = &mut self.calendar {
+            panel.refresh(self.notifications.as_mut());
+        }
+        let unread = self.notifications.as_ref().map_or(0, |n| n.center.unread);
+        if self.bar.unread != unread {
+            self.bar.unread = unread;
+            self.render();
+        }
+        if let Some(top) = &mut self.top {
+            if top.model.unread != unread {
+                top.model.unread = unread;
+                top.render();
+            }
+        }
+    }
+
+    /// Clic en el centro de notificaciones.
+    fn center_click(&mut self, hit: notifcenter::Hit) {
+        use notifcenter::{Hit, Part};
+        let Some(n) = &mut self.notifications else {
+            return;
+        };
+        match hit {
+            Hit::ClearAll => {
+                let live = n.center.clear();
+                n.dismiss(live);
+            }
+            Hit::Group(sender, true) => {
+                let live = n.center.remove_sender(&sender);
+                n.dismiss(live);
+            }
+            Hit::Entry(id, Part::Close) => {
+                let live = n.center.remove(id);
+                n.dismiss(live);
+            }
+            Hit::Entry(id, Part::Body) => {
+                n.open_entry(id);
+                if let Some(panel) = &mut self.calendar {
+                    panel.hide();
+                }
+            }
+            Hit::DoNotDisturb => {
+                let on = !self.styles.do_not_disturb();
+                self.styles.set_do_not_disturb(on);
+                let _ = self.styles.save();
+                n.show_cards(&self.styles);
+            }
+            Hit::Group(_, false) | Hit::Panel => return,
+        }
+        self.sync_center();
     }
 
     /// Abre o cierra el calendario sobre la hora.
@@ -2577,9 +2649,11 @@ impl App {
         }
         let (anchor, edge, bounds) = self.panel_edge(HoverTarget::Clock);
         if let Some(panel) = &mut self.calendar {
-            panel.show(anchor, edge, bounds);
+            panel.show(anchor, edge, bounds, self.notifications.as_mut());
         }
         self.opened_from(edge);
+        // Abierto, ya no queda nada sin leer.
+        self.sync_center();
     }
 
     /// Lo que hace un clic (o Enter con el teclado) sobre `target`; `launch` dice
@@ -4371,16 +4445,32 @@ unsafe extern "system" fn language_wndproc(
 struct Notifications {
     watcher: notifications::Watcher,
     window: NotificationWindow,
+    /// Historial de los avisos (ver `notifcenter`), en el panel de la hora.
+    center: notifcenter::Center,
+    /// Los últimos avisos en pantalla, ya sin los de apps silenciadas: al quitar No
+    /// molestar vuelven a salir como tarjetas.
+    last: Vec<notifications::Toast>,
+    /// No molestar está puesto (copia del ajuste, para dibujar su botón).
+    dnd: bool,
 }
 impl Notifications {
     fn start(owner: HWND) -> Option<Self> {
         let window = NotificationWindow::new(owner).ok()?;
         let watcher = notifications::Watcher::start(owner, WM_NOTIFICATIONS)?;
         notifications::warm_icons();
-        Some(Self { watcher, window })
+        Some(Self {
+            watcher,
+            window,
+            center: notifcenter::Center::default(),
+            last: Vec::new(),
+            dnd: false,
+        })
     }
 
-    fn handle_events(&mut self) {
+    /// Lee lo que mandó el hilo de los avisos. Los de las apps silenciadas no salen;
+    /// con No molestar, solo van al centro de notificaciones. Devuelve si cambió
+    /// algo del centro (un aviso nuevo o un icono).
+    fn handle_events(&mut self, styles: &style::Styles) -> bool {
         let mut latest = None;
         let mut changed = false;
         for event in self.watcher.events() {
@@ -4392,32 +4482,110 @@ impl Notifications {
                 }
             }
         }
-        if let Some(toasts) = latest {
-            for sender in self.window.stack.update(toasts) {
-                self.window.stack.mark_icon_pending(&sender);
-                self.watcher.find_icon(sender);
+        let mut center = changed;
+        if let Some(mut toasts) = latest {
+            toasts.retain(|t| !styles.is_muted(&t.sender));
+            for sender in self.center.record(&toasts) {
+                // Con No molestar no hay tarjeta que pida el icono.
+                if !self.window.stack.has_icon(&sender) {
+                    self.window.stack.mark_icon_pending(&sender);
+                    self.watcher.find_icon(sender);
+                }
+                center = true;
             }
+            self.last = toasts;
+            self.show_cards(styles);
             changed = true;
         }
         if changed {
             self.window.refresh();
         }
+        center
     }
 
-    /// Clic en una tarjeta: se pulsa lo mismo en el aviso de Windows.
-    fn click(&mut self, x: f32, y: f32) {
-        let Some((key, part)) = self.window.stack.hit_test(x, y) else {
+    /// Pone las tarjetas al día con los últimos avisos (ninguna con No molestar).
+    fn show_cards(&mut self, styles: &style::Styles) {
+        self.dnd = styles.do_not_disturb();
+        let toasts = if self.dnd {
+            Vec::new()
+        } else {
+            self.last.clone()
+        };
+        for sender in self.window.stack.update(toasts) {
+            self.window.stack.mark_icon_pending(&sender);
+            self.watcher.find_icon(sender);
+        }
+        self.window.refresh();
+    }
+
+    /// Cierra en Windows (y en las tarjetas) los avisos de `keys`, que se quitaron
+    /// del centro de notificaciones.
+    fn dismiss(&mut self, keys: Vec<notifications::Key>) {
+        if keys.is_empty() {
+            return;
+        }
+        for key in keys {
+            self.window.stack.take(&key);
+            self.watcher.send(notifications::Command::Dismiss(key));
+        }
+        self.window.refresh();
+    }
+
+    /// Se pulsó un aviso del centro: si Windows aún lo enseña, se pulsa allí;
+    /// si no, se abre su app. En los dos casos sale del historial.
+    fn open_entry(&mut self, id: u64) {
+        let Some(entry) = self.center.entry(id) else {
             return;
         };
-        if self.window.stack.take(&key) {
+        let (key, sender) = (entry.key.clone(), entry.toast.sender.clone());
+        let live = self.center.is_live(&key);
+        self.center.remove(id);
+        if live {
+            self.window.stack.take(&key);
+            self.watcher.send(notifications::Command::Open(key));
+            self.window.refresh();
+        } else {
+            notifications::open_app(&sender);
+        }
+    }
+
+    /// Clic en una tarjeta: se pulsa lo mismo en el aviso de Windows. Con la
+    /// campana se cierran todos los avisos de esa app y se devuelve su nombre, para
+    /// silenciarla, y si también se apagó en Windows.
+    fn click(&mut self, x: f32, y: f32) -> Option<(String, bool)> {
+        let (key, part) = self.window.stack.hit_test(x, y)?;
+        let mut muted = None;
+        if part == notifications::Part::Mute {
+            if let Some(toast) = self.window.stack.toast(&key) {
+                let sender = toast.sender.clone();
+                // Lo que llega del móvil lo manda Enlace Móvil: apagarlo en Windows
+                // callaría todo el móvil.
+                let in_windows =
+                    !toast.is_from_phone() && notifications::disable_in_windows(&sender);
+                for key in self.window.stack.take_sender(&sender) {
+                    self.watcher.send(notifications::Command::Dismiss(key));
+                }
+                muted = Some((sender, in_windows));
+            }
+        } else if self.window.stack.take(&key) {
+            // Pulsado o con un botón, ya está atendido: sale del historial.
+            if matches!(
+                part,
+                notifications::Part::Body | notifications::Part::Action(_)
+            ) {
+                self.center.forget(&key);
+            }
             self.watcher.send(match part {
                 notifications::Part::Body => notifications::Command::Open(key),
-                notifications::Part::Close => notifications::Command::Dismiss(key),
+                notifications::Part::Close | notifications::Part::Mute => {
+                    notifications::Command::Dismiss(key)
+                }
                 notifications::Part::Action(n) => notifications::Command::Action(key, n),
             });
         }
         self.window.stack.hovered = None;
         self.window.refresh();
+        muted
     }
 }
 
@@ -4642,10 +4810,17 @@ unsafe extern "system" fn notifications_wndproc(
         }
         WM_LBUTTONUP => {
             with_app(|app| {
-                if let Some(n) = &mut app.notifications {
-                    let (x, y) = point(n.window.scale);
-                    n.click(x, y);
+                let Some(n) = &mut app.notifications else {
+                    return;
+                };
+                let (x, y) = point(n.window.scale);
+                if let Some((sender, in_windows)) = n.click(x, y) {
+                    app.styles.mute_app(&sender, in_windows);
+                    let _ = app.styles.save();
+                    app.refresh_settings();
                 }
+                // Una tarjeta pulsada sale también del historial.
+                app.sync_center();
             });
         }
         _ => return DefWindowProcW(hwnd, msg, wparam, lparam),
@@ -4653,7 +4828,9 @@ unsafe extern "system" fn notifications_wndproc(
     LRESULT(0)
 }
 
-/// Calendario que se abre sobre la hora del dock.
+/// Panel de la hora: el calendario y, con las notificaciones de GlassBar, el
+/// centro de notificaciones al otro lado (encima con el dock, debajo con la barra
+/// superior), como dos paneles de cristal en la misma ventana.
 struct CalendarWindow {
     hwnd: HWND,
     backdrop: Option<style::Backdrop>,
@@ -4663,7 +4840,25 @@ struct CalendarWindow {
     model: calendar::CalendarState,
     visible: bool,
     transition: launcher::Transition,
+    /// Sobre qué se abrió: la hora, el borde de la barra y los límites a los lados.
+    anchor: Option<(i32, Edge, (i32, i32))>,
+    /// Alto del centro de notificaciones (0 sin él) y borde superior de cada
+    /// panel, en unidades lógicas.
+    center_h: f32,
+    center_top: f32,
+    calendar_top: f32,
 }
+
+/// Separación entre el centro de notificaciones y el calendario.
+const CENTER_GAP: f32 = 12.0;
+
+/// Parte del panel de la hora bajo el cursor.
+#[derive(Clone, Debug, PartialEq)]
+enum ClockPanelHit {
+    Calendar(calendar::Hit),
+    Center(notifcenter::Hit),
+}
+
 impl CalendarWindow {
     fn new(owner: HWND) -> Result<Self> {
         let hwnd = unsafe {
@@ -4691,21 +4886,78 @@ impl CalendarWindow {
             model: calendar::CalendarState::new(calendar::today(), calendar::Names::default()),
             visible: false,
             transition: launcher::Transition::hidden(),
+            anchor: None,
+            center_h: 0.0,
+            center_top: 0.0,
+            calendar_top: 0.0,
         })
     }
-    /// Lo abre sobre `anchor_x`, encima del dock, en el mes de hoy.
-    fn show(&mut self, anchor_x: i32, edge: Edge, (left, right): (i32, i32)) {
+    /// Lo abre sobre `anchor_x`, junto a la barra, en el mes de hoy; con `n`, con
+    /// el centro de notificaciones.
+    fn show(
+        &mut self,
+        anchor_x: i32,
+        edge: Edge,
+        bounds: (i32, i32),
+        mut n: Option<&mut Notifications>,
+    ) {
         let today = calendar::today();
         self.model = calendar::CalendarState::new(today, calendar::names(today));
+        self.anchor = Some((anchor_x, edge, bounds));
+        if !self.layout(n.as_deref_mut()) {
+            return;
+        }
+        self.visible = true;
+        self.transition.open(Instant::now());
+        self.render(n.as_deref());
+        take_focus(self.hwnd);
+    }
+    /// Calcula el tamaño y el sitio de la ventana (el centro de notificaciones
+    /// crece o mengua con sus avisos) y prepara la superficie. Devuelve si la hay.
+    fn layout(&mut self, n: Option<&mut Notifications>) -> bool {
+        let Some((anchor_x, edge, (left, right))) = self.anchor else {
+            return false;
+        };
         let (_, dpi) = monitors::get_info(edge.monitor);
         self.scale = dpi.max(0.3);
-        let width = (calendar::WIDTH * self.scale).ceil() as u32;
-        let height = (calendar::HEIGHT * self.scale).ceil() as u32;
-        let Ok(surface) = Surface::new(width, height) else {
-            return;
-        };
-        self.surface = Some(surface);
         let margin = (12.0 * self.scale).round() as i32;
+        self.center_h = match n {
+            Some(n) => {
+                // El sitio que queda entre la barra y el otro borde de la pantalla.
+                let work = monitors::work_area(edge.monitor);
+                let free = if edge.below {
+                    work.bottom - edge.y
+                } else {
+                    edge.y - work.top
+                };
+                let room = (free - margin * 2) as f32 / self.scale - calendar::HEIGHT - CENTER_GAP;
+                n.center.fit(room)
+            }
+            None => 0.0,
+        };
+        let extra = if self.center_h > 0.0 {
+            self.center_h + CENTER_GAP
+        } else {
+            0.0
+        };
+        // El calendario, junto a la barra; el centro, al otro lado.
+        (self.calendar_top, self.center_top) = if edge.below {
+            (0.0, calendar::HEIGHT + CENTER_GAP)
+        } else {
+            (extra, 0.0)
+        };
+        let width = (calendar::WIDTH * self.scale).ceil() as u32;
+        let height = ((calendar::HEIGHT + extra) * self.scale).ceil() as u32;
+        if !self
+            .surface
+            .as_ref()
+            .is_some_and(|s| s.width == width && s.height == height)
+        {
+            match Surface::new(width, height) {
+                Ok(surface) => self.surface = Some(surface),
+                Err(_) => return false,
+            }
+        }
         self.pos = POINT {
             x: (anchor_x - width as i32 / 2).clamp(
                 left + margin,
@@ -4713,23 +4965,77 @@ impl CalendarWindow {
             ),
             y: edge.panel_top(height as i32, margin),
         };
-        self.visible = true;
-        self.transition.open(Instant::now());
-        self.render();
-        take_focus(self.hwnd);
+        true
     }
-    fn render(&mut self) {
-        if let Some(surface) = &mut self.surface {
-            if let Some(pixmap) = surface.pixmap() {
-                self.model.draw(pixmap, self.scale);
-            }
-            surface.copy_to_dib();
+    /// Lo vuelve a colocar y a dibujar tras un cambio en el centro de notificaciones.
+    fn refresh(&mut self, mut n: Option<&mut Notifications>) {
+        if self.visible && self.layout(n.as_deref_mut()) {
+            self.render(n.as_deref());
         }
+    }
+    fn render(&mut self, n: Option<&Notifications>) {
+        let scale = self.scale;
+        let Some(surface) = &mut self.surface else {
+            return;
+        };
+        if let Some(pixmap) = surface.pixmap() {
+            pixmap.fill(tiny_skia::Color::TRANSPARENT);
+            let width = (calendar::WIDTH * scale).ceil() as u32;
+            let mut parts = Vec::new();
+            if let Some(mut part) = Pixmap::new(width, (calendar::HEIGHT * scale).ceil() as u32) {
+                self.model.draw(&mut part, scale);
+                parts.push((part, self.calendar_top));
+            }
+            if let Some(n) = n.filter(|_| self.center_h > 0.0) {
+                if let Some(mut part) = Pixmap::new(width, (self.center_h * scale).ceil() as u32) {
+                    n.center.draw(&mut part, scale, &n.window.stack, n.dnd);
+                    parts.push((part, self.center_top));
+                }
+            }
+            for (part, top) in parts {
+                pixmap.draw_pixmap(
+                    0,
+                    (top * scale).round() as i32,
+                    part.as_ref(),
+                    &tiny_skia::PixmapPaint::default(),
+                    tiny_skia::Transform::identity(),
+                    None,
+                );
+            }
+        }
+        surface.copy_to_dib();
         self.present();
+    }
+    /// Qué hay en `(x, y)` (unidades lógicas de la ventana).
+    fn hit_test(&self, x: f32, y: f32, n: Option<&Notifications>) -> Option<ClockPanelHit> {
+        if let Some(n) = n.filter(|_| self.over_center(y)) {
+            return n
+                .center
+                .hit_test(x, y - self.center_top)
+                .map(ClockPanelHit::Center);
+        }
+        self.model
+            .hit_test(x, y - self.calendar_top)
+            .map(ClockPanelHit::Calendar)
+    }
+    /// `y` (unidades lógicas de la ventana) cae en el centro de notificaciones.
+    fn over_center(&self, y: f32) -> bool {
+        self.center_h > 0.0 && (self.center_top..self.center_top + self.center_h).contains(&y)
     }
     fn present(&mut self) {
         if let Some(surface) = &mut self.surface {
-            let shapes = [panel_shape(surface, self.scale, 12.0)];
+            let s = self.scale;
+            let shape = |top: f32, height: f32| style::Shape {
+                x: s,
+                y: (top + 1.0) * s,
+                width: (calendar::WIDTH - 2.0) * s,
+                height: (height - 2.0) * s,
+                radius: 12.0 * s,
+            };
+            let mut shapes = vec![shape(self.calendar_top, calendar::HEIGHT)];
+            if self.center_h > 0.0 {
+                shapes.push(shape(self.center_top, self.center_h));
+            }
             present_popup(
                 self.hwnd,
                 surface,
@@ -4753,9 +5059,9 @@ impl CalendarWindow {
         self.present();
     }
     /// Muestra otro mes.
-    fn shift(&mut self, delta: i32) {
+    fn shift(&mut self, delta: i32, n: Option<&Notifications>) {
         self.model.shift(delta);
-        self.render();
+        self.render(n);
     }
 }
 impl Drop for CalendarWindow {
@@ -4783,7 +5089,14 @@ unsafe extern "system" fn calendar_wndproc(
     };
     match msg {
         WM_ACTIVATE if (wparam.0 & 0xffff) as u32 == WA_INACTIVE => {
-            with_app(|app| app.calendar.as_mut().map(CalendarWindow::hide));
+            with_app(|app| {
+                if let Some(panel) = &mut app.calendar {
+                    panel.hide();
+                }
+                if let Some(n) = &mut app.notifications {
+                    n.center.hovered = None;
+                }
+            });
         }
         WM_TIMER if wparam.0 == TIMER_ANIM => {
             with_app(|app| app.calendar.as_mut().map(CalendarWindow::present));
@@ -4801,28 +5114,57 @@ unsafe extern "system" fn calendar_wndproc(
                 };
                 let _ = TrackMouseEvent(&mut track);
                 let (x, y) = point(panel.scale);
-                let hit = panel.model.hit_test(x, y);
-                if hit != panel.model.hovered {
-                    panel.model.hovered = hit;
-                    panel.render();
+                let (on_calendar, on_center) =
+                    match panel.hit_test(x, y, app.notifications.as_ref()) {
+                        Some(ClockPanelHit::Calendar(hit)) => (Some(hit), None),
+                        Some(ClockPanelHit::Center(hit)) => (None, Some(hit)),
+                        None => (None, None),
+                    };
+                let center_changed = app
+                    .notifications
+                    .as_ref()
+                    .is_some_and(|n| n.center.hovered != on_center);
+                if on_calendar != panel.model.hovered || center_changed {
+                    panel.model.hovered = on_calendar;
+                    if let Some(n) = &mut app.notifications {
+                        n.center.hovered = on_center;
+                    }
+                    panel.render(app.notifications.as_ref());
                 }
             });
         }
         WM_MOUSELEAVE => {
             with_app(|app| {
                 if let Some(panel) = app.calendar.as_mut().filter(|p| p.visible) {
-                    if panel.model.hovered.take().is_some() {
-                        panel.render();
+                    let center = app
+                        .notifications
+                        .as_mut()
+                        .is_some_and(|n| n.center.hovered.take().is_some());
+                    if panel.model.hovered.take().is_some() || center {
+                        panel.render(app.notifications.as_ref());
                     }
                 }
             });
         }
-        // La rueda recorre los meses, como en el calendario de Windows.
+        // La rueda desplaza la lista de avisos sobre el centro de notificaciones y,
+        // sobre el calendario, recorre los meses, como en el de Windows.
         WM_MOUSEWHEEL => {
             with_app(|app| {
                 if let Some(panel) = app.calendar.as_mut().filter(|p| p.visible) {
                     let delta = ((wparam.0 >> 16) & 0xffff) as i16;
-                    panel.shift(if delta > 0 { -1 } else { 1 });
+                    // La posición llega en coordenadas de pantalla.
+                    let screen_y = ((lparam.0 >> 16) & 0xffff) as i16 as i32;
+                    let y = (screen_y - panel.pos.y) as f32 / panel.scale;
+                    if panel.over_center(y) {
+                        if let Some(n) = &mut app.notifications {
+                            let step = notifcenter::WHEEL_STEP * f32::from(delta).abs() / 120.0;
+                            if n.center.scroll_by(if delta > 0 { -step } else { step }) {
+                                panel.render(Some(n));
+                            }
+                        }
+                    } else {
+                        panel.shift(if delta > 0 { -1 } else { 1 }, app.notifications.as_ref());
+                    }
                 }
             });
         }
@@ -4832,25 +5174,29 @@ unsafe extern "system" fn calendar_wndproc(
                     return;
                 };
                 let (x, y) = point(panel.scale);
-                match panel.model.hit_test(x, y) {
-                    Some(calendar::Hit::Previous) => panel.shift(-1),
-                    Some(calendar::Hit::Next) => panel.shift(1),
-                    Some(calendar::Hit::Today) => {
-                        if panel.model.go_today() {
-                            panel.render();
+                let n = app.notifications.as_ref();
+                match panel.hit_test(x, y, n) {
+                    Some(ClockPanelHit::Calendar(hit)) => match hit {
+                        calendar::Hit::Previous => panel.shift(-1, n),
+                        calendar::Hit::Next => panel.shift(1, n),
+                        calendar::Hit::Today => {
+                            if panel.model.go_today() {
+                                panel.render(n);
+                            }
                         }
-                    }
-                    Some(calendar::Hit::Day(index)) => {
-                        if panel.model.choose_day(index) {
-                            panel.render();
+                        calendar::Hit::Day(index) => {
+                            if panel.model.choose_day(index) {
+                                panel.render(n);
+                            }
                         }
-                    }
-                    Some(calendar::Hit::Settings) => {
-                        panel.hide();
-                        let _ = std::process::Command::new("explorer.exe")
-                            .arg("ms-settings:dateandtime")
-                            .spawn();
-                    }
+                        calendar::Hit::Settings => {
+                            panel.hide();
+                            let _ = std::process::Command::new("explorer.exe")
+                                .arg("ms-settings:dateandtime")
+                                .spawn();
+                        }
+                    },
+                    Some(ClockPanelHit::Center(hit)) => app.center_click(hit),
                     None => {}
                 }
             });
@@ -4861,14 +5207,15 @@ unsafe extern "system" fn calendar_wndproc(
                 let Some(panel) = app.calendar.as_mut().filter(|p| p.visible) else {
                     return;
                 };
+                let n = app.notifications.as_ref();
                 match wparam.0 {
                     0x1B => panel.hide(),
                     // Arriba y abajo cambian de mes; izquierda y derecha, de panel.
-                    0x21 | 0x26 => panel.shift(-1),
-                    0x22 | 0x28 => panel.shift(1),
+                    0x21 | 0x26 => panel.shift(-1, n),
+                    0x22 | 0x28 => panel.shift(1, n),
                     0x25 | 0x27 => app.step_menu(if wparam.0 == 0x25 { -1 } else { 1 }),
                     0x24 if panel.model.go_today() => {
-                        panel.render();
+                        panel.render(n);
                     }
                     _ => {}
                 }
@@ -6935,6 +7282,13 @@ unsafe extern "system" fn settings_wndproc(
                     panel.minimize();
                     return;
                 }
+                if let settings::Hit::Page(page) = hit {
+                    if panel.model.page != page {
+                        panel.model.page = page;
+                        panel.render();
+                    }
+                    return;
+                }
                 if let Some(command) = panel.model.command(hit) {
                     if matches!(command, appmenu::CMD_EXPORT | appmenu::CMD_IMPORT) {
                         backup = Some((app.hwnd, command == appmenu::CMD_EXPORT));
@@ -7026,6 +7380,15 @@ fn handle_menu_command(app: &mut App, cmd: u32) {
             app.styles.set_notifications(on);
             let _ = app.styles.save();
             app.sync_notifications();
+        }
+        appmenu::CMD_UNMUTE_APPS => {
+            let in_windows = app.styles.unmute_apps();
+            let _ = app.styles.save();
+            // Windows no vuelve a encender una app desde el registro: se enciende en
+            // su Configuración.
+            if in_windows {
+                apps::open_notification_settings();
+            }
         }
         CMD_CLOCK_SECONDS => {
             let on = !app.styles.clock_seconds();
