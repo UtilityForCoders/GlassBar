@@ -785,6 +785,13 @@ fn matching(
     exact.or_else(close).map(|(_, entry)| entry.clone())
 }
 
+/// Abre la app que se llama `sender`, para un aviso que Windows ya quitó (no se
+/// puede pulsar el original). Devuelve si la encontró.
+pub fn open_app(sender: &str) -> bool {
+    catalog_entry(&crate::catalog::search_key(sender), false)
+        .is_some_and(|entry| crate::apps::launch_entry(&entry))
+}
+
 /// Apaga en Windows los avisos de la app que se llama `sender`, como el interruptor
 /// de Configuración > Sistema > Notificaciones: ya no suenan ni quedan en el centro
 /// de notificaciones, aunque GlassBar esté cerrado. Devuelve si se pudo.
@@ -1007,7 +1014,9 @@ pub struct Stack {
     pub hovered: Option<(Key, Part)>,
     /// Iconos originales por app y su copia reducida.
     icons: HashMap<String, Option<Pixmap>>,
-    scaled: RefCell<HashMap<String, Pixmap>>,
+    /// Copias reducidas por app y lado en píxeles (las tarjetas y el centro de
+    /// notificaciones las piden de tamaños distintos).
+    scaled: RefCell<HashMap<(String, u32), Pixmap>>,
     scaled_side: Cell<u32>,
 }
 
@@ -1057,7 +1066,9 @@ impl Stack {
     }
 
     pub fn set_icon(&mut self, sender: String, icon: Option<Pixmap>) {
-        self.scaled.borrow_mut().remove(&sender);
+        self.scaled
+            .borrow_mut()
+            .retain(|(name, _), _| name != &sender);
         self.icons.insert(sender, icon);
     }
 
@@ -1397,12 +1408,19 @@ impl Stack {
         }
     }
 
-    fn draw_icon(&self, image: &mut Pixmap, sender: &str, x: f32, y: f32, side: f32) {
+    /// Ya se tiene (o se pidió) el icono de `sender`.
+    pub fn has_icon(&self, sender: &str) -> bool {
+        self.icons.contains_key(sender)
+    }
+
+    /// El icono de la app `sender` en el cuadrado de lado `side` con la esquina en
+    /// `(x, y)`, en píxeles; sin icono, su inicial.
+    pub fn draw_icon(&self, image: &mut Pixmap, sender: &str, x: f32, y: f32, side: f32) {
         let px = side.round().max(1.0) as u32;
         if let Some(Some(icon)) = self.icons.get(sender) {
             let mut cache = self.scaled.borrow_mut();
             let scaled = cache
-                .entry(sender.to_string())
+                .entry((sender.to_string(), px))
                 .or_insert_with(|| crate::apps::downscale(icon, px));
             image.draw_pixmap(
                 (x + (side - scaled.width() as f32) / 2.0).round() as i32,

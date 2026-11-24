@@ -142,6 +142,10 @@ pub struct Styles {
     /// Apps silenciadas desde la campana de una tarjeta (ver `MutedApp`).
     #[serde(default)]
     muted_apps: Vec<MutedApp>,
+    /// No molestar: los avisos no salen como tarjetas, solo quedan en el centro de
+    /// notificaciones.
+    #[serde(default)]
+    do_not_disturb: bool,
 }
 
 /// App silenciada desde la campana de una tarjeta.
@@ -185,6 +189,7 @@ impl Default for Styles {
             notifications: false,
             dock_size: default_dock_size(),
             muted_apps: Vec::new(),
+            do_not_disturb: false,
         }
     }
 }
@@ -224,6 +229,13 @@ impl Styles {
     }
     pub fn set_notifications(&mut self, on: bool) {
         self.notifications = on;
+    }
+    /// No molestar: los avisos solo van al centro de notificaciones.
+    pub fn do_not_disturb(&self) -> bool {
+        self.do_not_disturb
+    }
+    pub fn set_do_not_disturb(&mut self, on: bool) {
+        self.do_not_disturb = on;
     }
     /// Cuántas apps hay silenciadas.
     pub fn muted_count(&self) -> usize {

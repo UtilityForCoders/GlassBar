@@ -22,6 +22,8 @@ const STATUS_STEP: f32 = 26.0;
 const STATUS_ICON: f32 = 14.0;
 /// Margen dentro de las zonas de texto (idioma y hora).
 const TEXT_PAD: f32 = 9.0;
+/// Separación entre la hora y el número de avisos sin leer.
+const BADGE_GAP: f32 = 6.0;
 /// Franja del extremo derecho que muestra el escritorio.
 const DESKTOP_W: f32 = 10.0;
 /// Alto y radio del resaltado al pasar el cursor.
@@ -39,6 +41,8 @@ pub struct TopBar {
     pub app: String,
     /// Día y hora tal como se muestran (ver `clock::day_and_time`).
     pub clock: String,
+    /// Avisos sin leer del centro de notificaciones: su número sale tras la hora.
+    pub unread: usize,
     pub hovered: Option<HoverTarget>,
     pub appearance: crate::style::Appearance,
 }
@@ -51,6 +55,7 @@ impl TopBar {
             keyboard: None,
             app: String::new(),
             clock: crate::clock::day_and_time(),
+            unread: 0,
             hovered: None,
             appearance: Default::default(),
         }
@@ -67,7 +72,10 @@ impl TopBar {
             *right -= width;
         };
         push(HoverTarget::ShowDesktop, DESKTOP_W, &mut right);
-        let clock = text_width(&self.clock, TEXT) + TEXT_PAD * 2.0;
+        let mut clock = text_width(&self.clock, TEXT) + TEXT_PAD * 2.0;
+        if self.unread > 0 {
+            clock += crate::clock::badge_width(self.unread) + BADGE_GAP;
+        }
         push(HoverTarget::Clock, clock, &mut right);
         // Centro de control: el idioma y los iconos de estado son un solo botón, que
         // abre el panel rápido (y desde él, el de idioma).
@@ -185,6 +193,16 @@ impl TopBar {
                 HoverTarget::Clock => {
                     let x = s(left + TEXT_PAD);
                     draw_text_on_baseline(pixmap, &self.clock, x, baseline, size, 0.95);
+                    if self.unread > 0 {
+                        let width = crate::clock::badge_width(self.unread);
+                        crate::clock::draw_badge(
+                            pixmap,
+                            self.unread,
+                            s(right - TEXT_PAD - width / 2.0),
+                            cy,
+                            scale,
+                        );
+                    }
                 }
                 _ => {}
             }
