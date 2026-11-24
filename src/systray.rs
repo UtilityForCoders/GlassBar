@@ -27,6 +27,10 @@ const NIS_HIDDEN: u32 = 0x01;
 const SIGNATURE: u32 = 0x3475_3423;
 /// `NIN_SELECT`: clic con la versión 4 de los iconos.
 const NIN_SELECT: u32 = WM_USER;
+/// `NIN_POPUPOPEN` y `NIN_POPUPCLOSE`: con la versión 4, el cursor se quedó sobre el
+/// icono (el programa puede abrir su propia ventanita) o se fue de él.
+const NIN_POPUPOPEN: u32 = WM_USER + 6;
+const NIN_POPUPCLOSE: u32 = WM_USER + 7;
 
 /// Un icono tal como lo manda un programa. Los identificadores van en 32 bits para
 /// que valgan entre procesos de 32 y 64 bits.
@@ -48,8 +52,12 @@ fn u32_at(bytes: &[u8], at: usize) -> Option<u32> {
     Some(u32::from_le_bytes(bytes.get(at..at + 4)?.try_into().ok()?))
 }
 
+/// Texto de hasta `chars` caracteres en `at`. Si los datos acaban antes (la
+/// estructura corta de los programas antiguos, con `szTip` de 64 caracteres), se lee
+/// lo que haya.
 fn text_at(bytes: &[u8], at: usize, chars: usize) -> String {
-    let Some(raw) = bytes.get(at..at + chars * 2) else {
+    let end = (at + chars * 2).min(bytes.len());
+    let Some(raw) = bytes.get(at..end) else {
         return String::new();
     };
     let wide: Vec<u16> = raw
@@ -117,6 +125,12 @@ pub struct Icon {
     pub tip: String,
     pub hidden: bool,
     pub image: Option<Pixmap>,
+    /// Ruta del ejecutable dueño (vacía si no se pudo leer). Se lee una vez al
+    /// registrarse el icono o cambiar de ventana, no cada vez que se muestra.
+    pub exe: String,
+    /// Identificador de Windows de su imagen, para recuperarla al volver a abrir
+    /// GlassBar (ver `restore`).
+    pub handle: u32,
 }
 
 impl Icon {
@@ -137,16 +151,22 @@ impl Icon {
             guid: self.guid,
         }
     }
+    /// Nombre del ejecutable, sin la ruta.
+    fn exe_name(&self) -> &str {
+        self.exe.rsplit('\\').next().unwrap_or_default()
+    }
 }
 
 /// Aplica un mensaje de `Shell_NotifyIcon` a la lista. `image` convierte el icono
-/// (su identificador de Windows) en imagen; solo se llama si cambió. Devuelve si
-/// la lista cambió.
+/// (su identificador de Windows) en imagen; solo se llama si cambió. `exe` da el
+/// ejecutable de una ventana; solo se llama con un icono nuevo o que cambió de
+/// ventana. Devuelve si la lista cambió.
 pub fn apply(
     icons: &mut Vec<Icon>,
     message: u32,
     notify: &Notify,
-    image: impl Fn(u32) -> Option<Pixmap>,
+    image: impl FnOnce(u32) -> Option<Pixmap>,
+    exe: impl FnOnce(u32) -> String,
 ) -> bool {
     let index = icons.iter().position(|i| i.matches(notify));
     match message {
@@ -165,7 +185,6 @@ pub fn apply(
         }
         NIM_ADD | NIM_MODIFY => {
             let index = match index {
-                Some(index) => index,
                 // Un cambio de un icono desconocido (registrado antes de abrir
                 // GlassBar) cuenta como nuevo. Su versión no se sabe (la dio antes):
                 // los que no vuelven a registrarse son sobre todo de Windows y apps
@@ -180,9 +199,22 @@ pub fn apply(
                         tip: String::new(),
                         hidden: false,
                         image: None,
+                        exe: exe(notify.owner),
+                        handle: 0,
                     });
                     icons.len() - 1
                 }
+                // Con GUID, el icono puede llegar desde otra ventana (el programa se
+                // reinició sin borrarlo): los clics van a la nueva, y la vieja ya no
+                // existe y haría que se descartase.
+                Some(index) if notify.owner != 0 && icons[index].owner != notify.owner => {
+                    let icon = &mut icons[index];
+                    icon.owner = notify.owner;
+                    icon.id = notify.id;
+                    icon.exe = exe(notify.owner);
+                    index
+                }
+                Some(index) => index,
             };
             let icon = &mut icons[index];
             // Un registro nuevo empieza en la versión 0 aunque el icono ya se conociera
@@ -195,6 +227,7 @@ pub fn apply(
                 icon.callback = notify.callback;
             }
             if notify.flags & NIF_ICON != 0 {
+                icon.handle = notify.icon;
                 icon.image = image(notify.icon);
             }
             if notify.flags & NIF_TIP != 0 {
@@ -209,6 +242,16 @@ pub fn apply(
     }
 }
 
+/// Lo que se responde al programa (lo que le devuelve `Shell_NotifyIcon`). A
+/// Explorer se le reenvía sin esperar, así que no se sabe qué diría él; se responde
+/// como él en lo que importa: cambiar un icono que no se conoce falla. Así los
+/// programas que, si falla, lo vuelven a registrar con `NIM_ADD` (los iconos de antes
+/// de abrir GlassBar), lo hacen, y se sabe su versión. El icono se guarda igualmente,
+/// para los que no lo reintentan.
+pub fn reply(message: u32, known: bool) -> bool {
+    message != NIM_MODIFY || known
+}
+
 /// Botón con el que se pulsó un icono en el panel.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum Click {
@@ -218,15 +261,15 @@ pub enum Click {
 }
 
 /// Mensajes que recibe el programa por cada pulsación, como los de la bandeja de
-/// Windows: botón abajo, arriba y, con la versión 4, el aviso de selección o de
-/// menú contextual.
+/// Windows: botón abajo, arriba y, desde la versión 3 (`NOTIFYICON_VERSION`), el
+/// aviso de selección o de menú contextual.
 pub fn click_messages(click: Click, version: u32) -> Vec<u32> {
     let mut list = match click {
         Click::Left => vec![WM_LBUTTONDOWN, WM_LBUTTONUP],
         Click::Double => vec![WM_LBUTTONDBLCLK, WM_LBUTTONUP],
         Click::Right => vec![WM_RBUTTONDOWN, WM_RBUTTONUP],
     };
-    if version >= 4 {
+    if version >= 3 {
         list.push(match click {
             Click::Right => WM_CONTEXTMENU,
             _ => NIN_SELECT,
@@ -236,8 +279,8 @@ pub fn click_messages(click: Click, version: u32) -> Vec<u32> {
 }
 
 /// Lo que hay que mandar al programa: con la versión 4, la posición en `wparam` y
-/// el evento y el icono en `lparam`; antes, el icono en `wparam` y el evento en
-/// `lparam`.
+/// el evento y el icono en `lparam`; antes (también con la 3), el icono en `wparam`
+/// y el evento en `lparam`.
 pub fn callback_params(version: u32, id: u32, event: u32, at: POINT) -> (usize, isize) {
     if version >= 4 {
         let position = (at.x as u16 as usize) | ((at.y as u16 as usize) << 16);
@@ -281,6 +324,22 @@ fn log(line: impl FnOnce() -> String) {
     {
         let _ = writeln!(file, "{}", line());
     }
+}
+
+/// Ruta del ejecutable dueño de una ventana; vacía si no se puede leer.
+fn exe_of(window: HWND) -> String {
+    let mut pid = 0;
+    unsafe {
+        GetWindowThreadProcessId(window, Some(&mut pid));
+    }
+    crate::apps::process_info(pid)
+        .map(|(exe, _)| exe)
+        .unwrap_or_default()
+}
+
+/// Ventana de un identificador de 32 bits (se extiende con signo).
+fn window_of(owner: u32) -> HWND {
+    HWND(owner as i32 as isize as *mut _)
 }
 
 fn process_name(window: HWND) -> String {
@@ -379,6 +438,9 @@ impl Host {
             log(|| "No se pudo poner la bandeja propia delante de la de Explorer".into());
             return None;
         }
+        // Los iconos de la última vez cuyos programas siguen abiertos: los que no
+        // responden a `TaskbarCreated` no volverían a llegar hasta cambiar.
+        restore();
         log(|| "Bandeja propia lista; se pide a los programas sus iconos".into());
         announce(true);
         Some(host)
@@ -448,6 +510,8 @@ impl Drop for Host {
         if let Some(handle) = self.handle.take() {
             let _ = handle.join();
         }
+        // Para recuperarlos al volver a abrir GlassBar (p. ej. tras actualizarse).
+        save_now();
         // Que vuelvan a registrarlos con Explorer, por si alguno no le llegó.
         announce(false);
         icons().clear();
@@ -467,7 +531,7 @@ unsafe fn create_window() -> Option<HWND> {
     if RegisterClassExW(&class) == 0 {
         return None;
     }
-    CreateWindowExW(
+    let hwnd = CreateWindowExW(
         WS_EX_TOOLWINDOW | WS_EX_TOPMOST,
         w!("Shell_TrayWnd"),
         None,
@@ -481,7 +545,12 @@ unsafe fn create_window() -> Option<HWND> {
         Some(instance.into()),
         None,
     )
-    .ok()
+    .ok()?;
+    // Con GlassBar abierto como administrador, Windows no deja que los programas
+    // normales le manden datos (UIPI) y sus iconos no llegarían ni aquí ni a
+    // Explorer, que va detrás. Explorer también lo permite en la suya.
+    let _ = ChangeWindowMessageFilterEx(hwnd, WM_COPYDATA, MSGFLT_ALLOW, None);
+    Some(hwnd)
 }
 
 /// Avisa a los programas de que la barra se creó: vuelven a registrar sus iconos
@@ -633,6 +702,7 @@ unsafe extern "system" fn host_wndproc(
         // 1: iconos. Los demás (barras de aplicación, posición de iconos) son de Explorer.
         if data.dwData == 1 && !data.lpData.is_null() {
             let bytes = std::slice::from_raw_parts(data.lpData as *const u8, data.cbData as usize);
+            let mut answer = true;
             if let Some((message, notify)) = parse(bytes) {
                 log(|| {
                     format!(
@@ -646,7 +716,24 @@ unsafe extern "system" fn host_wndproc(
                         notify.tip,
                     )
                 });
-                if apply(&mut icons(), message, &notify, image_of) {
+                // La imagen se prepara antes de tomar la lista, para no tener
+                // esperando al dock (ni al programa) mientras se dibuja.
+                let image = (notify.flags & NIF_ICON != 0)
+                    .then(|| image_of(notify.icon))
+                    .flatten();
+                let changed = {
+                    let mut list = icons();
+                    answer = reply(message, list.iter().any(|i| i.matches(&notify)));
+                    apply(
+                        &mut list,
+                        message,
+                        &notify,
+                        move |_| image,
+                        |owner| exe_of(window_of(owner)),
+                    )
+                };
+                if changed {
+                    save_soon();
                     use std::sync::atomic::Ordering;
                     let target = NOTIFY_WINDOW.load(Ordering::Relaxed);
                     let _ = PostMessageW(
@@ -661,7 +748,7 @@ unsafe extern "system" fn host_wndproc(
             // aquí, él podría escribir a la vez a esta bandeja y quedarse los dos
             // esperándose (pasaba con varios iconos seguidos).
             forward_later(wparam.0, bytes.to_vec());
-            return LRESULT(1);
+            return LRESULT(answer as isize);
         }
         return forward();
     }
@@ -716,8 +803,7 @@ fn forward_later(sender: usize, bytes: Vec<u8>) {
 /// Si el icono va en el panel: no oculto, y no uno de Explorer sin a quién avisar
 /// al pulsarlo (el volumen y la red de Windows, que el dock ya muestra).
 fn visible(icon: &Icon) -> bool {
-    !icon.hidden
-        && (icon.callback != 0 || !process_name(icon.window()).eq_ignore_ascii_case("explorer.exe"))
+    !icon.hidden && (icon.callback != 0 || !icon.exe_name().eq_ignore_ascii_case("explorer.exe"))
 }
 
 /// Identidad de un icono que no cambia al reiniciar el programa o Windows: su GUID
@@ -725,11 +811,14 @@ fn visible(icon: &Icon) -> bool {
 fn stable_id(icon: &Icon) -> String {
     match icon.guid {
         Some(guid) => format!("guid:{guid:032x}"),
-        None => format!(
-            "exe:{}:{}",
-            process_name(icon.window()).to_lowercase(),
-            icon.id
-        ),
+        None if icon.exe.is_empty() => {
+            let mut pid = 0;
+            unsafe {
+                GetWindowThreadProcessId(icon.window(), Some(&mut pid));
+            }
+            format!("exe:pid {pid}:{}", icon.id)
+        }
+        None => format!("exe:{}:{}", icon.exe_name().to_lowercase(), icon.id),
     }
 }
 
@@ -743,7 +832,8 @@ pub struct Shown {
 }
 
 /// Iconos visibles, en el orden en que se registraron. Quita los de programas que
-/// ya terminaron sin borrarlos.
+/// ya terminaron sin borrarlos. Solo copia lo guardado, sin leer procesos: el hilo
+/// de la bandeja espera esta lista para responder a los programas.
 pub fn shown() -> Vec<Shown> {
     let mut icons = icons();
     icons.retain(|i| unsafe { IsWindow(Some(i.window())).as_bool() });
@@ -932,15 +1022,173 @@ pub fn menu_of(
         })
 }
 
-/// Avisa al programa de que el cursor pasa por su icono (algunos ponen al día su
-/// nombre entonces).
-pub fn hover(key: Key, at: POINT) {
-    if let Some((window, callback, version, id)) = target(key).filter(|t| t.1 != 0) {
-        let (w, l) = callback_params(version, id, WM_MOUSEMOVE, at);
+/// Manda `event` al programa del icono `key`, sin esperar, si tiene a quién avisar y
+/// usa al menos la versión `min_version`.
+fn post(key: Key, event: u32, at: POINT, min_version: u32) {
+    if let Some((window, callback, version, id)) =
+        target(key).filter(|t| t.1 != 0 && t.2 >= min_version)
+    {
+        let (w, l) = callback_params(version, id, event, at);
         unsafe {
             let _ = PostMessageW(Some(window), callback, WPARAM(w), LPARAM(l));
         }
     }
+}
+
+/// Avisa al programa de que el cursor pasa por su icono (algunos ponen al día su
+/// nombre entonces).
+pub fn hover(key: Key, at: POINT) {
+    post(key, WM_MOUSEMOVE, at, 0);
+}
+
+/// El cursor se quedó sobre el icono: con la versión 4, el programa puede abrir su
+/// propia ventanita (`NIN_POPUPOPEN`), como en la bandeja de Windows.
+pub fn popup_open(key: Key, at: POINT) {
+    post(key, NIN_POPUPOPEN, at, 4);
+}
+
+/// El cursor dejó el icono tras `popup_open`: el programa cierra su ventanita.
+pub fn popup_close(key: Key, at: POINT) {
+    post(key, NIN_POPUPCLOSE, at, 4);
+}
+
+// ---------------------------------------------------------------------------
+// Iconos recordados entre arranques de GlassBar.
+// ---------------------------------------------------------------------------
+
+/// Lo que se guarda de un icono. Sin su nombre, que puede llevar datos personales:
+/// el programa lo vuelve a dar al cambiarlo.
+#[derive(serde::Serialize, serde::Deserialize, Debug, PartialEq)]
+struct Saved {
+    owner: u32,
+    id: u32,
+    guid: Option<String>,
+    callback: u32,
+    version: u32,
+    hidden: bool,
+    exe: String,
+    handle: u32,
+}
+
+impl Saved {
+    fn of(icon: &Icon) -> Self {
+        Self {
+            owner: icon.owner,
+            id: icon.id,
+            guid: icon.guid.map(|g| format!("{g:032x}")),
+            callback: icon.callback,
+            version: icon.version,
+            hidden: icon.hidden,
+            exe: icon.exe.clone(),
+            handle: icon.handle,
+        }
+    }
+    fn icon(self) -> Icon {
+        Icon {
+            owner: self.owner,
+            id: self.id,
+            guid: self
+                .guid
+                .and_then(|g| u128::from_str_radix(&g, 16).ok())
+                .filter(|&g| g != 0),
+            callback: self.callback,
+            version: self.version,
+            tip: String::new(),
+            hidden: self.hidden,
+            image: None,
+            exe: self.exe,
+            handle: self.handle,
+        }
+    }
+}
+
+fn saved_path() -> Option<std::path::PathBuf> {
+    Some(
+        std::path::PathBuf::from(std::env::var_os("LOCALAPPDATA")?)
+            .join("GlassBar")
+            .join("tray-icons.json"),
+    )
+}
+
+/// Guarda ya los iconos conocidos.
+fn save_now() {
+    let saved: Vec<Saved> = icons().iter().map(Saved::of).collect();
+    let Some(path) = saved_path() else {
+        return;
+    };
+    let write = || -> std::io::Result<()> {
+        if let Some(dir) = path.parent() {
+            std::fs::create_dir_all(dir)?;
+        }
+        let pending = path.with_extension("tmp");
+        std::fs::write(&pending, serde_json::to_vec(&saved)?)?;
+        std::fs::rename(pending, &path)
+    };
+    let _ = write();
+}
+
+/// Guarda los iconos unos segundos después de que cambien, desde un hilo propio:
+/// así sobreviven también a un cierre inesperado, sin escribir con cada cambio.
+fn save_soon() {
+    use std::sync::{Condvar, Mutex, Once};
+    static DIRTY: Mutex<bool> = Mutex::new(false);
+    static WAKE: Condvar = Condvar::new();
+    static START: Once = Once::new();
+    START.call_once(|| {
+        std::thread::spawn(|| loop {
+            {
+                let mut dirty = DIRTY.lock().unwrap_or_else(|e| e.into_inner());
+                while !*dirty {
+                    dirty = WAKE.wait(dirty).unwrap_or_else(|e| e.into_inner());
+                }
+            }
+            std::thread::sleep(std::time::Duration::from_secs(5));
+            *DIRTY.lock().unwrap_or_else(|e| e.into_inner()) = false;
+            save_now();
+        });
+    });
+    *DIRTY.lock().unwrap_or_else(|e| e.into_inner()) = true;
+    WAKE.notify_one();
+}
+
+/// Si un icono guardado sigue siendo de una ventana abierta del mismo programa
+/// (Windows puede dar el número de una ventana cerrada a otra).
+fn still_there(icon: &Icon) -> bool {
+    !icon.exe.is_empty()
+        && unsafe { IsWindow(Some(icon.window())).as_bool() }
+        && exe_of(icon.window()).eq_ignore_ascii_case(&icon.exe)
+}
+
+/// Recupera los iconos guardados cuyos programas siguen abiertos. Los que vuelvan
+/// a registrarse al pedírselo los sustituyen.
+fn restore() {
+    let Some(saved) = saved_path()
+        .and_then(|path| std::fs::read(path).ok())
+        .and_then(|bytes| serde_json::from_slice::<Vec<Saved>>(&bytes).ok())
+    else {
+        return;
+    };
+    let found: Vec<Icon> = saved
+        .into_iter()
+        .map(Saved::icon)
+        .filter(still_there)
+        .map(|mut icon| {
+            // La imagen sigue siendo del programa mientras no la destruya; si ya no
+            // vale, la de su ejecutable.
+            icon.image = image_of(icon.handle).or_else(|| crate::icons::load(&icon.exe));
+            icon
+        })
+        .collect();
+    let count = found.len();
+    {
+        let mut list = icons();
+        for icon in found {
+            if !list.iter().any(|i| i.key() == icon.key()) {
+                list.push(icon);
+            }
+        }
+    }
+    log(|| format!("Iconos recuperados de la última vez: {count}"));
 }
 
 #[cfg(test)]
@@ -1003,46 +1251,48 @@ mod tests {
     fn icons_are_added_changed_hidden_and_removed() {
         let mut icons = Vec::new();
         let image = |_| None;
+        let exe = |_| String::from("C:\\app.exe");
         let add = |owner, id, tip: &str| {
             parse(&message(NIM_ADD, owner, id, NIF_MESSAGE | NIF_TIP, tip, 0)).unwrap()
         };
         let (nim, a) = add(1, 1, "Discord");
-        assert!(apply(&mut icons, nim, &a, image));
+        assert!(apply(&mut icons, nim, &a, image, exe));
         let (nim, b) = add(2, 1, "Steam");
-        assert!(apply(&mut icons, nim, &b, image));
+        assert!(apply(&mut icons, nim, &b, image, exe));
         assert_eq!(icons.len(), 2);
         // Cambiar el nombre no crea otro.
         let (_, renamed) = parse(&message(NIM_MODIFY, 1, 1, NIF_TIP, "Discord (3)", 0)).unwrap();
-        assert!(apply(&mut icons, NIM_MODIFY, &renamed, image));
+        assert!(apply(&mut icons, NIM_MODIFY, &renamed, image, exe));
         assert_eq!(icons.len(), 2);
         assert_eq!(icons[0].tip, "Discord (3)");
         // Ocultar con NIF_STATE.
         let (_, hidden) = parse(&message(NIM_MODIFY, 2, 1, NIF_STATE, "", 0)).unwrap();
-        apply(&mut icons, NIM_MODIFY, &hidden, image);
+        apply(&mut icons, NIM_MODIFY, &hidden, image, exe);
         assert!(icons[1].hidden);
         // La versión se guarda para mandar bien los clics.
         let (_, version) = parse(&message(NIM_SETVERSION, 1, 1, 0, "", 0)).unwrap();
-        apply(&mut icons, NIM_SETVERSION, &version, image);
+        apply(&mut icons, NIM_SETVERSION, &version, image, exe);
         assert_eq!(icons[0].version, 4);
         // Borrar.
         let (_, gone) = parse(&message(NIM_DELETE, 1, 1, 0, "", 0)).unwrap();
-        assert!(apply(&mut icons, NIM_DELETE, &gone, image));
+        assert!(apply(&mut icons, NIM_DELETE, &gone, image, exe));
         assert_eq!(icons.len(), 1);
-        assert!(!apply(&mut icons, NIM_DELETE, &gone, image));
+        assert!(!apply(&mut icons, NIM_DELETE, &gone, image, exe));
     }
 
     #[test]
     fn a_new_registration_starts_again_at_version_zero() {
         let mut icons = Vec::new();
         let image = |_| None;
+        let exe = |_| String::from("C:\\app.exe");
         // Cambio de un icono registrado antes de abrir GlassBar: se le supone la 4.
         let (_, early) = parse(&message(NIM_MODIFY, 1, 1, NIF_TIP, "Antiguo", 0)).unwrap();
-        apply(&mut icons, NIM_MODIFY, &early, image);
+        apply(&mut icons, NIM_MODIFY, &early, image, exe);
         assert_eq!(icons[0].version, 4);
         // Al volver a registrarse sin NIM_SETVERSION es de la 0, y el clic derecho le
         // llega en el formato antiguo (WM_RBUTTONUP), con el que abre su menú.
         let (_, again) = parse(&message(NIM_ADD, 1, 1, NIF_MESSAGE, "Antiguo", 0)).unwrap();
-        apply(&mut icons, NIM_ADD, &again, image);
+        apply(&mut icons, NIM_ADD, &again, image, exe);
         assert_eq!(icons.len(), 1);
         assert_eq!(icons[0].version, 0);
         assert_eq!(
@@ -1051,7 +1301,7 @@ mod tests {
         );
         // Si es de la 4, lo dice justo después.
         let (_, version) = parse(&message(NIM_SETVERSION, 1, 1, 0, "", 0)).unwrap();
-        apply(&mut icons, NIM_SETVERSION, &version, image);
+        apply(&mut icons, NIM_SETVERSION, &version, image, exe);
         assert_eq!(icons[0].version, 4);
         assert_eq!(
             icons[0].key(),
@@ -1061,6 +1311,63 @@ mod tests {
                 guid: None
             }
         );
+    }
+
+    #[test]
+    fn an_icon_with_guid_follows_its_new_window() {
+        let mut icons = Vec::new();
+        let image = |_| None;
+        let (_, first) = parse(&message(NIM_ADD, 1, 1, NIF_GUID | NIF_MESSAGE, "", 0xAB)).unwrap();
+        apply(&mut icons, NIM_ADD, &first, image, |_| "C:\\a.exe".into());
+        // El programa se reinició sin borrarlo: mismo GUID, otra ventana.
+        let (_, again) = parse(&message(NIM_ADD, 9, 2, NIF_GUID | NIF_MESSAGE, "", 0xAB)).unwrap();
+        apply(&mut icons, NIM_ADD, &again, image, |_| "C:\\b.exe".into());
+        assert_eq!(icons.len(), 1);
+        assert_eq!((icons[0].owner, icons[0].id), (9, 2));
+        assert_eq!(icons[0].exe_name(), "b.exe");
+        // Un cambio desde la misma ventana no vuelve a leer el ejecutable.
+        let (_, same) = parse(&message(NIM_MODIFY, 9, 2, NIF_GUID | NIF_TIP, "x", 0xAB)).unwrap();
+        apply(&mut icons, NIM_MODIFY, &same, image, |_| unreachable!());
+    }
+
+    #[test]
+    fn changing_an_unknown_icon_fails_like_in_explorer() {
+        assert!(reply(NIM_ADD, false));
+        assert!(reply(NIM_MODIFY, true));
+        assert!(!reply(NIM_MODIFY, false));
+        assert!(reply(NIM_DELETE, false));
+        assert!(reply(NIM_SETVERSION, false));
+    }
+
+    #[test]
+    fn old_programs_send_a_shorter_tip() {
+        // NOTIFYICONDATAW de la primera versión: 152 bytes, `szTip` de 64 caracteres.
+        let mut bytes = message(NIM_ADD, 1, 1, NIF_TIP, "Antiguo", 0);
+        bytes.truncate(8 + 152);
+        bytes[8..12].copy_from_slice(&152u32.to_le_bytes());
+        let (_, notify) = parse(&bytes).unwrap();
+        assert_eq!(notify.tip, "Antiguo");
+        assert_eq!(notify.version, 0);
+    }
+
+    #[test]
+    fn saved_icons_come_back_the_same() {
+        let icon = Saved {
+            owner: 0x10_0042,
+            id: 3,
+            guid: Some(format!("{:032x}", 0xABCD_u128)),
+            callback: 0x8001,
+            version: 4,
+            hidden: false,
+            exe: "C:\\app.exe".into(),
+            handle: 0x1234,
+        }
+        .icon();
+        assert_eq!(icon.guid, Some(0xABCD));
+        let saved = Saved::of(&icon);
+        let json = serde_json::to_vec(&saved).unwrap();
+        assert_eq!(serde_json::from_slice::<Saved>(&json).unwrap(), saved);
+        assert_eq!(icon.key(), saved.icon().key());
     }
 
     #[test]
@@ -1076,6 +1383,15 @@ mod tests {
         assert_eq!(
             click_messages(Click::Right, 0),
             [WM_RBUTTONDOWN, WM_RBUTTONUP]
+        );
+        // La versión 3 también recibe el menú contextual, con los parámetros antiguos.
+        assert_eq!(
+            click_messages(Click::Right, 3),
+            [WM_RBUTTONDOWN, WM_RBUTTONUP, WM_CONTEXTMENU]
+        );
+        assert_eq!(
+            callback_params(3, 7, WM_CONTEXTMENU, POINT::default()),
+            (7, WM_CONTEXTMENU as isize)
         );
         // Versión 4: posición en wparam; evento e icono en lparam.
         let at = POINT { x: 1200, y: 1040 };
