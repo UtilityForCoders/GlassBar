@@ -4605,6 +4605,9 @@ struct TrayWindow {
     /// antes de cerrarse: si llega el segundo clic, se le manda al programa como
     /// doble clic (algunos solo abren su ventana así).
     close_after: Option<Instant>,
+    /// Icono al que se avisó de que el cursor se quedó encima (`NIN_POPUPOPEN`):
+    /// hay que avisarle también cuando se va.
+    popup: Option<systray::Key>,
 }
 impl TrayWindow {
     fn new(owner: HWND) -> Result<Self> {
@@ -4636,7 +4639,14 @@ impl TrayWindow {
             anchor: (0, Edge::default(), (0, 0)),
             menu: None,
             close_after: None,
+            popup: None,
         })
+    }
+    /// Avisa al icono con el cursor encima de que se fue (si se le avisó al llegar).
+    fn end_popup(&mut self) {
+        if let Some(key) = self.popup.take() {
+            systray::popup_close(key, cursor_pos());
+        }
     }
     fn show(&mut self, anchor_x: i32, edge: Edge, bounds: (i32, i32)) {
         self.anchor = (anchor_x, edge, bounds);
@@ -4730,6 +4740,7 @@ impl TrayWindow {
         self.visible = false;
         self.menu = None;
         self.close_after = None;
+        self.end_popup();
         self.model.hovered = None;
         self.model.drag = None;
         self.transition.close(Instant::now());
@@ -5315,10 +5326,32 @@ impl Drop for TrayWindow {
 
 /// Muestra el nombre del icono del panel de la bandeja bajo el cursor, encima de él
 /// como en Windows.
+/// Punto de la pantalla donde está el cursor.
+fn cursor_pos() -> POINT {
+    let mut at = POINT::default();
+    unsafe {
+        let _ = GetCursorPos(&mut at);
+    }
+    at
+}
+
 fn show_tray_tip(app: &mut App) {
-    let Some(panel) = app.tray_panel.as_ref().filter(|p| p.visible) else {
+    let Some(panel) = app.tray_panel.as_mut().filter(|p| p.visible) else {
         return;
     };
+    // Como en la bandeja de Windows, el cursor quieto sobre un icono también avisa
+    // a su programa, que puede abrir su propia ventanita.
+    let hovered = panel
+        .model
+        .hovered
+        .map(|index| panel.model.icons[index].key);
+    if panel.popup != hovered {
+        panel.end_popup();
+        if let Some(key) = hovered {
+            systray::popup_open(key, cursor_pos());
+            panel.popup = Some(key);
+        }
+    }
     let scale = panel.scale;
     let label = panel.model.hovered.map(|index| {
         let (cx, cy) = panel.model.cell(index);
@@ -5473,6 +5506,7 @@ unsafe extern "system" fn tray_wndproc(
                 if hit == panel.model.hovered {
                     return;
                 }
+                panel.end_popup();
                 panel.model.hovered = hit;
                 panel.render();
                 if let Some(index) = hit {
@@ -5504,6 +5538,7 @@ unsafe extern "system" fn tray_wndproc(
                     tip.hide();
                 }
                 if let Some(panel) = app.tray_panel.as_mut().filter(|p| p.visible) {
+                    panel.end_popup();
                     if panel.model.hovered.take().is_some() {
                         panel.render();
                     }
