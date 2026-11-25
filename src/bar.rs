@@ -41,6 +41,8 @@ const LANGUAGE_W: f32 = 44.0;
 const STATUS_PAD: f32 = 10.0;
 const STATUS_STEP: f32 = 24.0;
 const STATUS_ICON: f32 = 16.0;
+/// Tamaño del porcentaje de la batería, como el texto del idioma.
+const STATUS_TEXT: f32 = 11.0;
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum HoverTarget {
@@ -220,7 +222,11 @@ impl BarState {
         (SHADOW_PAD_X + self.language_left() + LANGUAGE_W / 2.0) * scale
     }
     fn status_width(&self) -> f32 {
-        STATUS_PAD * 2.0 + self.status.items().len() as f32 * STATUS_STEP
+        STATUS_PAD * 2.0
+            + self.status.items().len() as f32 * STATUS_STEP
+            + self
+                .status
+                .battery_extra(STATUS_STEP, STATUS_ICON, STATUS_TEXT)
     }
     /// Borde izquierdo del grupo de estado, en unidades del dock.
     fn status_left(&self) -> f32 {
@@ -637,6 +643,14 @@ impl BarState {
                     STATUS_ICON * scale,
                     0.95,
                 );
+                self.status.draw_battery_text(
+                    pixmap,
+                    self.status_center(index, scale),
+                    cy,
+                    STATUS_ICON,
+                    STATUS_TEXT * scale,
+                    scale,
+                );
                 continue;
             }
             let (glyph, opacity) = self.status.glyph(item);
@@ -868,6 +882,8 @@ mod tests {
             charging: false,
             remaining: None,
         });
+        // Y con el porcentaje de Windows, el grupo se alarga sin tapar la hora.
+        bar.status.battery_percent = true;
         for count in [0, 1, 5, 24] {
             bar.primary_apps = (0..count)
                 .map(|_| {

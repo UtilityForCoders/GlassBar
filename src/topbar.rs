@@ -79,7 +79,9 @@ impl TopBar {
         push(HoverTarget::Clock, clock, &mut right);
         // Centro de control: el idioma y los iconos de estado son un solo botón, que
         // abre el panel rápido (y desde él, el de idioma).
-        let status = self.language_width() + self.status.items().len() as f32 * STATUS_STEP;
+        let status = self.language_width()
+            + self.status.items().len() as f32 * STATUS_STEP
+            + self.status.battery_extra(STATUS_STEP, STATUS_ICON, TEXT);
         push(HoverTarget::Status(0), status, &mut right);
         push(HoverTarget::Overflow, OVERFLOW_W, &mut right);
         tail.reverse();
@@ -176,6 +178,14 @@ impl TopBar {
                                 cy,
                                 s(STATUS_ICON),
                                 0.95,
+                            );
+                            self.status.draw_battery_text(
+                                pixmap,
+                                icon_x,
+                                cy,
+                                STATUS_ICON,
+                                size,
+                                scale,
                             );
                             continue;
                         }
