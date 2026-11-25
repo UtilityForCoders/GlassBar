@@ -38,6 +38,7 @@ mod pins;
 mod preview;
 mod priority;
 mod quick;
+mod senders;
 mod settings;
 mod shell;
 mod spring;

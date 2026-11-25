@@ -54,6 +54,60 @@ pub fn load_resource(path: &str, index: i32) -> Option<Pixmap> {
     }
 }
 
+/// Una imagen (PNG, por ejemplo) tal cual, con su transparencia, decodificada con
+/// WIC. El Shell solo daría el icono de su tipo de archivo.
+pub fn load_picture(path: &str) -> Option<Pixmap> {
+    use windows::Win32::System::Com::{CoInitializeEx, CoUninitialize, COINIT_APARTMENTTHREADED};
+    unsafe {
+        let initialized = CoInitializeEx(None, COINIT_APARTMENTTHREADED).is_ok();
+        let result = decode_picture(path);
+        if initialized {
+            CoUninitialize();
+        }
+        result
+    }
+}
+
+unsafe fn decode_picture(path: &str) -> Option<Pixmap> {
+    use windows::core::HSTRING;
+    use windows::Win32::Foundation::GENERIC_READ;
+    use windows::Win32::Graphics::Imaging::{
+        CLSID_WICImagingFactory, GUID_WICPixelFormat32bppPBGRA, IWICImagingFactory,
+        WICConvertBitmapSource, WICDecodeMetadataCacheOnDemand,
+    };
+    use windows::Win32::System::Com::{CoCreateInstance, CLSCTX_INPROC_SERVER};
+    let factory: IWICImagingFactory =
+        CoCreateInstance(&CLSID_WICImagingFactory, None, CLSCTX_INPROC_SERVER).ok()?;
+    let decoder = factory
+        .CreateDecoderFromFilename(
+            &HSTRING::from(path),
+            None,
+            GENERIC_READ,
+            WICDecodeMetadataCacheOnDemand,
+        )
+        .ok()?;
+    let frame = decoder.GetFrame(0).ok()?;
+    let bitmap = WICConvertBitmapSource(&GUID_WICPixelFormat32bppPBGRA, &frame).ok()?;
+    let (mut width, mut height) = (0, 0);
+    bitmap.GetSize(&mut width, &mut height).ok()?;
+    if width == 0 || height == 0 || width > 1024 || height > 1024 {
+        return None;
+    }
+    let mut bytes = vec![0u8; (width * height * 4) as usize];
+    bitmap
+        .CopyPixels(std::ptr::null(), width * 4, &mut bytes)
+        .ok()?;
+    let mut image = Pixmap::new(width, height)?;
+    // Ya viene premultiplicada, como la quiere tiny-skia; solo cambia el orden.
+    for (src, dst) in bytes
+        .chunks_exact(4)
+        .zip(image.data_mut().chunks_exact_mut(4))
+    {
+        dst.copy_from_slice(&[src[2], src[1], src[0], src[3]]);
+    }
+    Some(image)
+}
+
 /// Nombre que el Shell muestra para una ruta o elemento (`shell:AppsFolder\...`).
 pub fn display_name(path: &str) -> Option<String> {
     use windows::Win32::System::Com::{

@@ -852,8 +852,11 @@ pub fn find_icon(sender: &str) -> Option<Pixmap> {
     if sender == PHONE_LINK {
         return crate::icons::load(PHONE_LINK_APP);
     }
-    let entry = catalog_entry(&crate::catalog::search_key(sender), true)?;
-    crate::icons::load(&entry.command)
+    match catalog_entry(&crate::catalog::search_key(sender), true) {
+        Some(entry) => crate::icons::load(&entry.command),
+        // No es una app de Inicio: puede ser un remitente del sistema.
+        None => crate::senders::icon(sender),
+    }
 }
 
 // --- Tarjetas -----------------------------------------------------------------
