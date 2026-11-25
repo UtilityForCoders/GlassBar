@@ -2331,6 +2331,16 @@ impl IconLoader {
             notified,
         }
     }
+    /// Pide el icono de `command`; llega con `drain` tras el aviso a la ventana.
+    pub fn request(&self, command: &str) {
+        let _ = self.requests.send(command.to_string());
+    }
+    /// Los iconos que ya llegaron; el siguiente que llegue vuelve a avisar.
+    pub fn drain(&self) -> Vec<(String, Option<Pixmap>)> {
+        self.notified
+            .store(false, std::sync::atomic::Ordering::Relaxed);
+        self.loaded.try_iter().collect()
+    }
 }
 
 /// Uso que registra Windows de una app del catálogo, si lo hay.
@@ -2555,7 +2565,7 @@ fn stroke(image: &mut Pixmap, path: tiny_skia::Path, scale: f32) {
 }
 
 /// Lupa: círculo con mango hacia abajo a la derecha.
-fn draw_magnifier(image: &mut Pixmap, cx: f32, cy: f32, scale: f32) {
+pub fn draw_magnifier(image: &mut Pixmap, cx: f32, cy: f32, scale: f32) {
     let r = 5.5 * scale;
     let (ox, oy) = (cx - 1.5 * scale, cy - 1.5 * scale);
     let mut pb = tiny_skia::PathBuilder::new();
