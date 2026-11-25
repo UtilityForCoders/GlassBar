@@ -38,6 +38,7 @@ mod pins;
 mod preview;
 mod priority;
 mod quick;
+mod senders;
 mod settings;
 mod shell;
 mod spring;
@@ -3948,7 +3949,9 @@ unsafe extern "system" fn wndproc(hwnd: HWND, msg: u32, wparam: WPARAM, lparam: 
                     if app.visibility.expanded {
                         app.update_style();
                     }
-                    let resized = status.items().len() != app.bar.status.items().len();
+                    // El porcentaje de la batería también cambia el ancho.
+                    let resized = status.items().len() != app.bar.status.items().len()
+                        || status.battery_text() != app.bar.status.battery_text();
                     let status_changed = status != app.bar.status;
                     app.bar.status = status;
                     // El volumen puede cambiar con las teclas o desde otra app.

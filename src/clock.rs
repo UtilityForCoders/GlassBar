@@ -366,8 +366,13 @@ fn rasterize_line(font: &Font, text: &str, size: f32) -> (Pixmap, i32) {
                 let px = pen.round() as i32 + metrics.xmin + x as i32;
                 let py = top - metrics.ymin - metrics.height as i32 + y as i32;
                 if px >= 0 && py >= 0 && px < image.width() as i32 && py < image.height() as i32 {
-                    let alpha = (coverage[y * metrics.width + x] as u16 * 235 / 255) as u8;
+                    let alpha = coverage[y * metrics.width + x] as u16 * 235 / 255;
                     let i = ((py as u32 * image.width() + px as u32) * 4) as usize;
+                    // El cuadro de una letra puede pisar a la anterior (el gancho de
+                    // la "j" se mete bajo la "e"): se suma encima, sin borrar lo que
+                    // ya había.
+                    let below = image.data()[i] as u16;
+                    let alpha = (alpha + below * (255 - alpha) / 255) as u8;
                     image.data_mut()[i..i + 4].copy_from_slice(&[alpha, alpha, alpha, alpha]);
                 }
             }
@@ -556,6 +561,24 @@ pub fn fit_text(text: &str, size: f32, width: f32) -> String {
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn a_letter_does_not_erase_the_one_before() {
+        // El gancho de la "j" empieza antes de su avance y caía sobre la "e".
+        let font = super::system_font();
+        for size in [11.0, 12.5, 13.0, 15.0] {
+            let (alone, alone_top) = super::rasterize_line(font, "e", size);
+            let (pair, pair_top) = super::rasterize_line(font, "ej", size);
+            let dy = (pair_top - alone_top) as u32;
+            for y in 0..alone.height() {
+                for x in 0..alone.width() {
+                    let a = alone.pixel(x, y).unwrap().alpha();
+                    let b = pair.pixel(x, y + dy).unwrap().alpha();
+                    assert!(b >= a, "{size}px: la \"e\" pierde tinta en ({x}, {y})");
+                }
+            }
+        }
+    }
+
     #[test]
     fn ink_bounds_ignore_the_empty_margin() {
         let mut image = tiny_skia::Pixmap::new(6, 5).unwrap();

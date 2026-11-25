@@ -54,7 +54,13 @@ pub struct Status {
     pub volume: Option<Volume>,
     /// `None` en equipos sin batería.
     pub battery: Option<Battery>,
+    /// Windows enseña el porcentaje junto a la batería (Configuración > Energía y
+    /// batería > Porcentaje de batería).
+    pub battery_percent: bool,
 }
+
+/// Separación entre el icono de la batería y su porcentaje, en unidades del dock.
+const PERCENT_GAP: f32 = 4.0;
 
 /// Icono del grupo, en el orden en que se muestran.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -72,11 +78,59 @@ impl Default for Status {
             wifi_bars: None,
             volume: None,
             battery: None,
+            battery_percent: false,
         }
     }
 }
 
 impl Status {
+    /// El porcentaje que se escribe junto a la batería, si Windows lo enseña.
+    pub fn battery_text(&self) -> Option<String> {
+        self.battery
+            .filter(|_| self.battery_percent)
+            .map(|b| format!("{}%", b.percent.min(100)))
+    }
+
+    /// Lo que el porcentaje alarga el hueco de la batería, que va el último: el
+    /// texto empieza a `PERCENT_GAP` del borde derecho del icono (de lado `icon`)
+    /// y lo que no quepa en la mitad del hueco (`step`) se añade al grupo.
+    pub fn battery_extra(&self, step: f32, icon: f32, size: f32) -> f32 {
+        self.battery_text().map_or(0.0, |text| {
+            (Self::percent_offset(icon) + crate::clock::text_width(&text, size) - step / 2.0)
+                .max(0.0)
+        })
+    }
+
+    /// Distancia del centro del icono de la batería al principio del porcentaje.
+    pub fn percent_offset(icon: f32) -> f32 {
+        icon / 2.0 + PERCENT_GAP
+    }
+
+    /// Escribe el porcentaje a la derecha del icono de la batería centrado en
+    /// (`cx`, `cy`), en píxeles.
+    pub fn draw_battery_text(
+        &self,
+        pixmap: &mut tiny_skia::Pixmap,
+        cx: f32,
+        cy: f32,
+        icon: f32,
+        size: f32,
+        scale: f32,
+    ) {
+        let Some(text) = self.battery_text() else {
+            return;
+        };
+        let (ascent, descent) = crate::clock::line_metrics(size);
+        crate::clock::draw_text_on_baseline(
+            pixmap,
+            &text,
+            cx + Self::percent_offset(icon) * scale,
+            cy + (ascent - descent) / 2.0,
+            size,
+            0.95,
+        );
+    }
+
     pub fn items(&self) -> Vec<Item> {
         let mut items = vec![Item::Network, Item::Volume];
         if self.battery.is_some() {
@@ -525,12 +579,15 @@ impl Reader {
             self.last_signal = None;
             None
         };
+        let battery = unsafe { battery() };
         Status {
             link,
             internet,
             wifi_bars,
             volume: self.volume(),
-            battery: unsafe { battery() },
+            battery,
+            // Solo se mira con batería: sin ella no hay nada que enseñar.
+            battery_percent: battery.is_some() && battery_percent_enabled(),
         }
     }
 
@@ -810,6 +867,29 @@ unsafe fn link() -> Link {
     }
 }
 
+/// El interruptor "Porcentaje de batería" de Configuración > Energía y batería
+/// (Windows 11 24H2 y posteriores). Leerlo cuesta microsegundos: se mira en cada
+/// lectura y así se nota al momento, sin esperar aviso de Windows.
+fn battery_percent_enabled() -> bool {
+    use windows::core::HSTRING;
+    use windows::Win32::System::Registry::{RegGetValueW, HKEY_CURRENT_USER, RRF_RT_REG_DWORD};
+    let mut value: u32 = 0;
+    let mut size = std::mem::size_of::<u32>() as u32;
+    unsafe {
+        RegGetValueW(
+            HKEY_CURRENT_USER,
+            &HSTRING::from(r"Software\Microsoft\Windows\CurrentVersion\Explorer\Advanced"),
+            &HSTRING::from("IsBatteryPercentageEnabled"),
+            RRF_RT_REG_DWORD,
+            None,
+            Some((&mut value as *mut u32).cast()),
+            Some(&mut size),
+        )
+        .is_ok()
+            && value != 0
+    }
+}
+
 unsafe fn battery() -> Option<Battery> {
     use windows::Win32::System::Power::{GetSystemPowerStatus, SYSTEM_POWER_STATUS};
     let mut power = SYSTEM_POWER_STATUS::default();
@@ -913,5 +993,31 @@ mod tests {
         );
         status.link = Link::None;
         assert_eq!(status.label(Item::Network), "Sin conexión a Internet");
+    }
+
+    #[test]
+    fn battery_percent_follows_the_windows_setting() {
+        let mut status = Status {
+            battery: Some(Battery {
+                percent: 47,
+                plugged: false,
+                charging: false,
+                remaining: None,
+            }),
+            ..Status::default()
+        };
+        // Apagado en Windows: ni texto ni ancho de más.
+        assert_eq!(status.battery_text(), None);
+        assert_eq!(status.battery_extra(24.0, 16.0, 11.0), 0.0);
+        status.battery_percent = true;
+        assert_eq!(status.battery_text().as_deref(), Some("47%"));
+        let short = status.battery_extra(24.0, 16.0, 11.0);
+        assert!(short > 0.0);
+        // Con más cifras, más ancho.
+        status.battery.as_mut().unwrap().percent = 100;
+        assert!(status.battery_extra(24.0, 16.0, 11.0) > short);
+        // Sin batería no hay nada que escribir aunque el ajuste esté encendido.
+        status.battery = None;
+        assert_eq!(status.battery_text(), None);
     }
 }
