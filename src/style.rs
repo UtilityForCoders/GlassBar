@@ -704,6 +704,16 @@ impl Backdrop {
                     if before.as_ref() != Some(&applied) {
                         let _ = composition.set(shapes, acrylic, opacity);
                     }
+                    // HTTRANSPARENT solo deja pasar los clics a las ventanas de este
+                    // hilo: sin región, la ventana entera taparía los clics a los
+                    // demás programas aunque no se vea nada en ella (los avisos
+                    // ocupan el alto de la pila llena). Rectángulos sin redondear,
+                    // para que la región no recorte el borde suavizado del desenfoque.
+                    if before.as_ref().map(|a| (a.width, a.height, &a.shapes))
+                        != Some((width, height, &applied.shapes))
+                    {
+                        let _ = SetWindowRgn(self.hwnd, Some(region(shapes, false)), true);
+                    }
                 }
                 // Sin composición no se puede desvanecer: se ve mientras se ve el panel.
                 None => {
@@ -715,7 +725,7 @@ impl Backdrop {
                         != Some((width, height, &applied.shapes))
                     {
                         // Windows se queda con la región.
-                        let _ = SetWindowRgn(self.hwnd, Some(region(shapes)), true);
+                        let _ = SetWindowRgn(self.hwnd, Some(region(shapes, true)), true);
                     }
                 }
             }
@@ -735,11 +745,17 @@ impl Backdrop {
     }
 }
 
-/// Unión de los rectángulos redondeados, para el desenfoque clásico.
-unsafe fn region(shapes: &[Shape]) -> windows::Win32::Graphics::Gdi::HRGN {
+/// Unión de los rectángulos de `shapes`, con las esquinas redondeadas si `rounded`
+/// (el desenfoque clásico se recorta con ella; con composición solo marca dónde
+/// recibe el ratón).
+unsafe fn region(shapes: &[Shape], rounded: bool) -> windows::Win32::Graphics::Gdi::HRGN {
     use windows::Win32::Graphics::Gdi::{CombineRgn, DeleteObject, RGN_OR};
     let round = |s: &Shape| {
-        let d = (s.radius * 2.0).round() as i32;
+        let d = if rounded {
+            (s.radius * 2.0).round() as i32
+        } else {
+            0
+        };
         CreateRoundRectRgn(
             s.x.round() as i32,
             s.y.round() as i32,
