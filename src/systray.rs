@@ -327,13 +327,26 @@ fn log(line: impl FnOnce() -> String) {
 }
 
 /// Ruta del ejecutable dueño de una ventana; vacía si no se puede leer.
+///
+/// Windows no deja abrir algunos procesos del sistema ni con el permiso mínimo
+/// (el icono de NVIDIA es de `NVDisplay.Container.exe`, que corre como SYSTEM): de
+/// esos queda su nombre, que da la lista de procesos sin abrirlos. Sin él, su icono
+/// no se recuperaría al volver a abrir GlassBar, y esos programas no lo mandan otra vez.
 fn exe_of(window: HWND) -> String {
     let mut pid = 0;
     unsafe {
         GetWindowThreadProcessId(window, Some(&mut pid));
     }
+    exe_of_process(pid)
+}
+
+fn exe_of_process(pid: u32) -> String {
+    if pid == 0 {
+        return String::new();
+    }
     crate::apps::process_info(pid)
         .map(|(exe, _)| exe)
+        .or_else(|| crate::audio::processes().remove(&pid).map(|(_, name)| name))
         .unwrap_or_default()
 }
 
@@ -1348,6 +1361,14 @@ mod tests {
         let (_, notify) = parse(&bytes).unwrap();
         assert_eq!(notify.tip, "Antiguo");
         assert_eq!(notify.version, 0);
+    }
+
+    #[test]
+    fn processes_that_cannot_be_opened_still_give_their_name() {
+        // "System" (pid 4) no tiene ruta que leer, como NVDisplay.Container.exe.
+        assert!(crate::apps::process_info(4).is_none());
+        assert!(exe_of_process(4).eq_ignore_ascii_case("System"));
+        assert_eq!(exe_of_process(0), "");
     }
 
     #[test]
