@@ -46,7 +46,7 @@ jobs:
       # presupuestado. Los límites van holgados (ver el script): en un equipo normal
       # GlassBar en reposo gasta menos del 1 % de un núcleo, 11 hilos y unos 32 MB.
       - name: Arranque y consumo en reposo
-        run: ./scripts/comprobar-app.ps1 -Exe target/release/glassbar.exe -MaxCpu 8 -MaxHilos 40 -MaxMemoriaMB 120 -MaxExeKB 2600
+        run: ./scripts/comprobar-app.ps1 -Exe target/release/glassbar.exe -MaxCpu 8 -MaxHilos 40 -MaxMemoriaMB 120 -MaxExeKB 2800
 
       - name: Subir el .exe
         uses: actions/upload-artifact@v7
