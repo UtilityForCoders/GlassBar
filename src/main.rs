@@ -41,6 +41,7 @@ mod quick;
 mod senders;
 mod settings;
 mod shell;
+mod spotlight;
 mod spring;
 mod status;
 mod style;
@@ -123,6 +124,10 @@ const WM_TOP_APPBAR: u32 = windows::Win32::UI::WindowsAndMessaging::WM_APP + 11;
 /// El hilo de iconos del lanzador cargó alguno nuevo.
 const WM_LAUNCHER_ICONS: u32 = windows::Win32::UI::WindowsAndMessaging::WM_APP + 5;
 /// El hilo de los avisos de Windows tiene algo nuevo (ver `notifications`).
+/// Llegaron iconos al buscador rápido.
+const WM_SPOTLIGHT_ICONS: u32 = windows::Win32::UI::WindowsAndMessaging::WM_APP + 14;
+/// Identificador del atajo global Alt+Espacio (`RegisterHotKey`).
+const HOTKEY_SPOTLIGHT: i32 = 1;
 const WM_NOTIFICATIONS: u32 = windows::Win32::UI::WindowsAndMessaging::WM_APP + 13;
 
 const TIMER_ANIM: usize = 1;
@@ -1787,6 +1792,323 @@ unsafe extern "system" fn launcher_wndproc(
     LRESULT(0)
 }
 
+/// Buscador rápido (Alt+Espacio), centrado en la parte alta del monitor del ratón.
+struct SpotlightWindow {
+    hwnd: HWND,
+    backdrop: Option<style::Backdrop>,
+    surface: Surface,
+    /// Esquina del panel y su escala en el monitor donde se abrió.
+    pos: POINT,
+    scale: f32,
+    model: spotlight::SpotlightState,
+    visible: bool,
+    transition: launcher::Transition,
+    /// Última posición del ratón vista: al crecer la lista bajo un ratón quieto,
+    /// Windows avisa de un movimiento que no ha habido y no debe cambiar lo elegido.
+    cursor: POINT,
+}
+impl SpotlightWindow {
+    fn new(owner: HWND, model: spotlight::SpotlightState) -> Result<Self> {
+        let hwnd = unsafe {
+            CreateWindowExW(
+                WS_EX_LAYERED | WS_EX_TOPMOST | WS_EX_TOOLWINDOW,
+                w!("GlassBarSpotlight"),
+                w!("GlassBar — Buscar"),
+                WS_POPUP,
+                0,
+                0,
+                1,
+                1,
+                Some(owner),
+                None,
+                Some(GetModuleHandleW(None)?.into()),
+                None,
+            )?
+        };
+        Ok(Self {
+            hwnd,
+            backdrop: style::Backdrop::new(),
+            surface: Surface::new(1, 1)?,
+            pos: POINT::default(),
+            scale: 0.0,
+            model,
+            visible: false,
+            transition: launcher::Transition::hidden(),
+            cursor: POINT::default(),
+        })
+    }
+    /// Lo coloca en el monitor del ratón, a un quinto de su alto, como Spotlight.
+    fn place(&mut self) {
+        let mut cursor = POINT::default();
+        unsafe {
+            let _ = GetCursorPos(&mut cursor);
+        }
+        self.cursor = cursor;
+        let (screen, dpi) = monitors::get_info(monitors::at(cursor));
+        let scale = dpi
+            .min((screen.right - screen.left - 24) as f32 / spotlight::WIDTH)
+            .max(0.3);
+        if scale != self.scale {
+            self.scale = scale;
+            self.model.load_icons_with(launcher::IconLoader::start(
+                scale,
+                self.hwnd.0 as isize,
+                WM_SPOTLIGHT_ICONS,
+            ));
+        }
+        let width = (spotlight::WIDTH * scale).ceil() as i32;
+        self.pos = POINT {
+            x: screen.left + (screen.right - screen.left - width) / 2,
+            y: screen.top + (screen.bottom - screen.top) / 5,
+        };
+    }
+    /// Dibuja el panel; la ventana crece o encoge con la lista de resultados.
+    fn render(&mut self) {
+        let width = (spotlight::WIDTH * self.scale).ceil() as u32;
+        let height = (self.model.height() * self.scale).ceil() as u32;
+        if (width, height) != (self.surface.width, self.surface.height) {
+            self.surface.release();
+            self.surface.width = width;
+            self.surface.height = height;
+        }
+        if let Some(pixmap) = self.surface.pixmap() {
+            self.model.draw(pixmap, self.scale);
+        }
+        self.surface.copy_to_dib();
+        self.present();
+    }
+    fn present(&mut self) {
+        let shapes = [panel_shape(&self.surface, self.scale, 14.0)];
+        present_popup(
+            self.hwnd,
+            &mut self.surface,
+            self.pos,
+            self.scale,
+            &self.transition,
+            self.visible,
+            false,
+            self.backdrop.as_ref(),
+            &shapes,
+        );
+    }
+    fn show(&mut self) {
+        self.place();
+        self.visible = true;
+        self.transition.open(Instant::now());
+        self.render();
+        take_focus(self.hwnd);
+        restart_caret(self.hwnd);
+    }
+    fn hide(&mut self) {
+        if !self.visible {
+            return;
+        }
+        unsafe {
+            let _ = KillTimer(Some(self.hwnd), TIMER_CARET);
+        }
+        self.visible = false;
+        self.transition.close(Instant::now());
+        self.present();
+    }
+}
+impl Drop for SpotlightWindow {
+    fn drop(&mut self) {
+        unsafe {
+            let _ = windows::Win32::UI::WindowsAndMessaging::DestroyWindow(self.hwnd);
+        }
+    }
+}
+
+unsafe extern "system" fn spotlight_wndproc(
+    hwnd: HWND,
+    msg: u32,
+    wparam: WPARAM,
+    lparam: LPARAM,
+) -> LRESULT {
+    use windows::Win32::UI::Input::KeyboardAndMouse::GetKeyState;
+    use windows::Win32::UI::WindowsAndMessaging::{
+        WA_INACTIVE, WM_ACTIVATE, WM_CHAR, WM_CLOSE, WM_KEYDOWN, WM_SETCURSOR,
+    };
+    let mut action = None;
+    if matches!(msg, WM_CHAR | WM_KEYDOWN) {
+        restart_caret(hwnd);
+    }
+    match msg {
+        WM_TIMER if wparam.0 == TIMER_CARET => {
+            with_app(|app| {
+                if let Some(panel) = app.spotlight.as_mut().filter(|p| p.visible) {
+                    if panel.model.blink() {
+                        panel.render();
+                    }
+                }
+            });
+        }
+        WM_TIMER if wparam.0 == TIMER_ANIM => {
+            with_app(|app| {
+                if let Some(panel) = &mut app.spotlight {
+                    panel.present();
+                }
+            });
+        }
+        WM_SPOTLIGHT_ICONS => {
+            with_app(|app| {
+                if let Some(panel) = app.spotlight.as_mut().filter(|p| p.visible) {
+                    panel.render();
+                }
+            });
+        }
+        WM_SETCURSOR if (lparam.0 & 0xffff) as u32 == 1 => {
+            use windows::Win32::Graphics::Gdi::ScreenToClient;
+            use windows::Win32::UI::WindowsAndMessaging::{SetCursor, IDC_IBEAM};
+            let over = with_app(|app| {
+                let panel = app.spotlight.as_ref().filter(|p| p.visible)?;
+                let mut point = POINT::default();
+                let _ = GetCursorPos(&mut point);
+                let _ = ScreenToClient(hwnd, &mut point);
+                Some(
+                    panel
+                        .model
+                        .over_text(point.x as f32 / panel.scale, point.y as f32 / panel.scale),
+                )
+            })
+            .flatten()
+            .unwrap_or(false);
+            if let Ok(cursor) = LoadCursorW(None, if over { IDC_IBEAM } else { IDC_ARROW }) {
+                SetCursor(Some(cursor));
+            }
+            return LRESULT(1);
+        }
+        // Se cierra al pasar a otra ventana, como Spotlight.
+        WM_ACTIVATE if (wparam.0 & 0xffff) as u32 == WA_INACTIVE => {
+            with_app(|app| {
+                if let Some(panel) = &mut app.spotlight {
+                    panel.hide();
+                }
+            });
+        }
+        WM_CLOSE => {
+            with_app(|app| {
+                if let Some(panel) = &mut app.spotlight {
+                    panel.hide();
+                }
+            });
+        }
+        // Pasar el ratón elige el resultado; el clic lo abre (con Ctrl, su carpeta).
+        WM_MOUSEMOVE | WM_LBUTTONUP => {
+            with_app(|app| {
+                if let Some(panel) = app.spotlight.as_mut().filter(|p| p.visible) {
+                    let x = (lparam.0 & 0xffff) as i16 as f32 / panel.scale;
+                    let y = ((lparam.0 >> 16) & 0xffff) as i16 as f32 / panel.scale;
+                    let Some(index) = panel.model.hit_test(x, y) else {
+                        return;
+                    };
+                    if msg == WM_LBUTTONUP {
+                        action = panel.model.activate(index, GetKeyState(0x11) < 0);
+                        return;
+                    }
+                    let mut cursor = POINT::default();
+                    let _ = GetCursorPos(&mut cursor);
+                    if (cursor.x, cursor.y) == (panel.cursor.x, panel.cursor.y) {
+                        return;
+                    }
+                    panel.cursor = cursor;
+                    if panel.model.select(index) {
+                        panel.render();
+                    }
+                }
+            });
+        }
+        WM_CHAR => {
+            with_app(|app| {
+                if let Some(panel) = app.spotlight.as_mut().filter(|p| p.visible) {
+                    // Retroceso (y Ctrl+Retroceso, que llega como 0x7F) se atiende en WM_KEYDOWN.
+                    if let Some(ch) = char::from_u32(wparam.0 as u32).filter(|c| !c.is_control()) {
+                        panel.model.insert_text(&ch.to_string());
+                        panel.render();
+                    }
+                }
+            });
+        }
+        WM_KEYDOWN => {
+            with_app(|app| {
+                let Some(panel) = app.spotlight.as_mut().filter(|p| p.visible) else {
+                    return;
+                };
+                let ctrl = GetKeyState(0x11) < 0;
+                let shift = GetKeyState(0x10) < 0;
+                match wparam.0 {
+                    // Esc borra lo escrito y, con el campo vacío, cierra.
+                    0x1B => {
+                        if panel.model.query.is_empty() {
+                            panel.hide();
+                            return;
+                        }
+                        panel.model.edit(|field| field.clear());
+                    }
+                    // Enter abre el resultado elegido; Ctrl+Enter lo muestra en su carpeta.
+                    0x0D => {
+                        action = panel.model.activate(panel.model.selected(), ctrl);
+                        return;
+                    }
+                    0x28 => panel.model.move_selection(1),
+                    0x26 => panel.model.move_selection(-1),
+                    0x41 if ctrl => panel.model.edit(|field| field.select_all()),
+                    0x43 if ctrl => {
+                        if let Some(text) = panel.model.query.selected_text() {
+                            set_clipboard_text(hwnd, &text);
+                        }
+                        return;
+                    }
+                    0x58 if ctrl => {
+                        if let Some(text) = panel.model.edit(|field| field.cut()) {
+                            set_clipboard_text(hwnd, &text);
+                        }
+                    }
+                    0x56 if ctrl => {
+                        if let Some(text) = clipboard_text(hwnd) {
+                            panel
+                                .model
+                                .insert_text(text.lines().next().unwrap_or_default());
+                        }
+                    }
+                    0x08 => panel.model.edit(|field| field.backspace(ctrl)),
+                    0x2E => panel.model.edit(|field| field.delete(ctrl)),
+                    0x25 => panel.model.edit(|field| field.left(ctrl, shift)),
+                    0x27 => panel.model.edit(|field| field.right(ctrl, shift)),
+                    0x24 => panel.model.edit(|field| field.home(shift)),
+                    0x23 => panel.model.edit(|field| field.end(shift)),
+                    _ => return,
+                }
+                panel.render();
+            });
+        }
+        _ => return DefWindowProcW(hwnd, msg, wparam, lparam),
+    }
+    // Fuera del préstamo de APP: abrir algo puede reenviar mensajes a GlassBar.
+    if let Some(action) = action {
+        with_app(|app| {
+            if let Some(panel) = &mut app.spotlight {
+                panel.hide();
+            }
+        });
+        match action {
+            spotlight::Action::Launch(entry) => {
+                if apps::launch_entry(&entry) {
+                    let _ = catalog::record(&entry);
+                }
+            }
+            spotlight::Action::Open(entry) => {
+                apps::launch_entry(&entry);
+            }
+            spotlight::Action::Copy(text) => set_clipboard_text(hwnd, &text),
+            spotlight::Action::Reveal(entry) => {
+                apps::open_entry_location(&entry);
+            }
+        }
+    }
+    LRESULT(0)
+}
+
 struct App {
     hwnd: HWND,
     surface: Surface,
@@ -1815,6 +2137,8 @@ struct App {
     /// programa abre la ventana o el menú.
     tray_clicked: Option<Instant>,
     launcher: Option<LauncherWindow>,
+    /// Buscador rápido (Alt+Espacio); se crea la primera vez que se abre.
+    spotlight: Option<SpotlightWindow>,
     /// Panel rápido; se crea la primera vez que se abre.
     quick: Option<QuickWindow>,
     /// Panel de idioma del teclado; también se crea al abrirlo.
@@ -1977,6 +2301,7 @@ impl App {
             app_menu: None,
             tray_clicked: None,
             launcher: None,
+            spotlight: None,
             quick: None,
             language: None,
             calendar: None,
@@ -2022,6 +2347,9 @@ impl App {
         if let Some(menu) = &mut self.launcher {
             menu.hide();
         }
+        if let Some(panel) = &mut self.spotlight {
+            panel.hide();
+        }
         if let Some(panel) = &mut self.quick {
             panel.hide();
         }
@@ -2057,6 +2385,10 @@ impl App {
         }
         let popups = [
             self.launcher.as_ref().filter(|p| p.visible).map(|p| p.hwnd),
+            self.spotlight
+                .as_ref()
+                .filter(|p| p.visible)
+                .map(|p| p.hwnd),
             self.quick.as_ref().filter(|p| p.visible).map(|p| p.hwnd),
             self.language.as_ref().filter(|p| p.visible).map(|p| p.hwnd),
             self.calendar.as_ref().filter(|p| p.visible).map(|p| p.hwnd),
@@ -2314,6 +2646,34 @@ impl App {
             panel.show();
         }
         self.opened_from(edge);
+    }
+
+    /// Alt+Espacio: abre el buscador rápido o, si ya está abierto, lo cierra.
+    fn toggle_spotlight(&mut self) {
+        if self.spotlight.as_ref().is_some_and(|p| p.visible) {
+            if let Some(panel) = &mut self.spotlight {
+                panel.hide();
+            }
+            return;
+        }
+        self.close_popups();
+        let pinned: Vec<_> = self
+            .bar
+            .primary_apps
+            .iter()
+            .map(|a| a.entry.clone())
+            .collect();
+        if self.spotlight.is_none() {
+            let model = spotlight::SpotlightState::new(&pinned);
+            match SpotlightWindow::new(self.hwnd, model) {
+                Ok(panel) => self.spotlight = Some(panel),
+                Err(_) => return,
+            }
+        }
+        if let Some(panel) = &mut self.spotlight {
+            panel.model.refresh(&pinned);
+            panel.show();
+        }
     }
 
     fn toggle_launcher(&mut self) {
@@ -3571,6 +3931,12 @@ unsafe extern "system" fn wndproc(hwnd: HWND, msg: u32, wparam: WPARAM, lparam: 
         }
         WM_TRAY_MENU => {
             with_app(|app| app.open_tray_menu());
+            LRESULT(0)
+        }
+        windows::Win32::UI::WindowsAndMessaging::WM_HOTKEY
+            if wparam.0 == HOTKEY_SPOTLIGHT as usize =>
+        {
+            with_app(|app| app.toggle_spotlight());
             LRESULT(0)
         }
         WM_SHORTCUT => {
@@ -7588,6 +7954,18 @@ fn main() -> Result<()> {
             return Err(windows::core::Error::from_thread());
         }
 
+        let spotlight_class = WNDCLASSEXW {
+            cbSize: std::mem::size_of::<WNDCLASSEXW>() as u32,
+            lpfnWndProc: Some(spotlight_wndproc),
+            hInstance: instance.into(),
+            hCursor: LoadCursorW(None, IDC_ARROW)?,
+            lpszClassName: w!("GlassBarSpotlight"),
+            ..Default::default()
+        };
+        if RegisterClassExW(&spotlight_class) == 0 {
+            return Err(windows::core::Error::from_thread());
+        }
+
         let quick_class = WNDCLASSEXW {
             cbSize: std::mem::size_of::<WNDCLASSEXW>() as u32,
             lpfnWndProc: Some(quick_wndproc),
@@ -7759,6 +8137,19 @@ fn main() -> Result<()> {
         // La tecla Windows abre el lanzador propio; se quita al salir del bucle.
         let _winkey = winkey::WinKey::install(hwnd, WM_SHOW_LAUNCHER, WM_SHORTCUT);
         let _foreground = priority::ForegroundWatch::install(hwnd, WM_FOREGROUND);
+        // Alt+Espacio abre el buscador rápido. Si otro programa ya tiene el atajo
+        // (p. ej. PowerToys Run), Windows lo niega y se queda con ese programa.
+        {
+            use windows::Win32::UI::Input::KeyboardAndMouse::{
+                RegisterHotKey, MOD_ALT, MOD_NOREPEAT, VK_SPACE,
+            };
+            let _ = RegisterHotKey(
+                Some(hwnd),
+                HOTKEY_SPOTLIGHT,
+                MOD_ALT | MOD_NOREPEAT,
+                VK_SPACE.0 as u32,
+            );
+        }
 
         let mut msg = MSG::default();
         while GetMessageW(&mut msg, None, 0, 0).as_bool() {
