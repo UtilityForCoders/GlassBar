@@ -12,7 +12,7 @@ use std::sync::atomic::{AtomicU32, Ordering};
 pub type Stops = [(f32, [u8; 4]); 2];
 
 /// El degradado del logo de siempre.
-const BLUE: Stops = [(0.0, [112, 224, 255, 255]), (1.0, [0, 120, 240, 255])];
+const BLUE: Stops = [(0.0, [124, 224, 255, 255]), (1.0, [16, 148, 244, 255])];
 
 /// De dónde sale el color del logo.
 #[derive(Clone, Copy, Debug, PartialEq)]

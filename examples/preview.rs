@@ -175,6 +175,22 @@ fn main() {
         println!("Menú de {id}: target/appmenu-preview.bmp");
         return;
     }
+    // El logo de Inicio a los tamaños de la barra superior y del dock, a escala 1,
+    // 1,5 y 2, en target/logo-preview.bmp.
+    if arguments_of("--logo").is_some() {
+        let mut image = Pixmap::new(280, 80).unwrap();
+        image.fill(tiny_skia::Color::from_rgba8(28, 28, 30, 255));
+        let mut x = 14.0;
+        for size in [14.0, 24.0] {
+            for scale in [1.0, 1.5, 2.0] {
+                apps::draw_windows_start_icon(&mut image, x, 40.0, size, scale);
+                x += size * scale + 10.0;
+            }
+        }
+        std::fs::write("target/logo-preview.bmp", bmp_entry(&image)).unwrap();
+        println!("Logo: target/logo-preview.bmp");
+        return;
+    }
     // Ventana de configuración en target/settings-preview.bmp.
     if arguments_of("--settings").is_some() {
         let styles = style::Styles::load();

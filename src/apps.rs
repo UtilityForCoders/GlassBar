@@ -866,19 +866,23 @@ pub fn draw_start_icon_with(
     scale: f32,
     stops: &crate::logo::Stops,
 ) {
-    let s = size * scale;
-    let gap = 2.4 * scale;
-    let tile_w = (s - gap) / 2.0;
-    let r = 2.0 * scale;
+    // Proporciones del logo de Windows 11: separación de un píxel (un 4,5 % del
+    // lado) y esquinas casi rectas. Todo se ajusta a píxeles enteros para que los
+    // bordes y la separación salgan nítidos, como en la barra de Windows.
+    let s = (size * scale).round().max(4.0);
+    let gap = (s * 0.045).round().max(1.0);
+    let tile_w = ((s - gap) / 2.0).floor();
+    let r = 0.6 * scale;
+    let total = tile_w * 2.0 + gap;
 
-    let x0 = cx - s / 2.0;
-    let y0 = cy - s / 2.0;
+    let x0 = (cx - total / 2.0).round();
+    let y0 = (cy - total / 2.0).round();
     let x1 = x0 + tile_w + gap;
     let y1 = y0 + tile_w + gap;
 
-    // Un solo degradado de un tono claro (arriba a la izquierda) a uno intenso
-    // (abajo a la derecha) que atraviesa los cuatro cuadros.
-    let (from, to) = ((x0, y0), (x0 + s, y0 + s));
+    // Un solo degradado que atraviesa los cuatro cuadros en diagonal: claro
+    // arriba a la izquierda e intenso abajo a la derecha, como el de Windows.
+    let (from, to) = ((x0, y0), (x0 + total, y0 + total));
     for (tx, ty) in [(x0, y0), (x1, y0), (x0, y1), (x1, y1)] {
         fill_rounded_gradient(pixmap, stops, from, to, tx, ty, tile_w, tile_w, r);
     }
