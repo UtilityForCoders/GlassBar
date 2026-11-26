@@ -19,6 +19,7 @@ mod calendar;
 mod catalog;
 mod categories;
 mod clock;
+mod colorpick;
 mod diag;
 mod extras;
 mod font;
@@ -7517,6 +7518,8 @@ impl SettingsWindow {
         self.visible = false;
         self.model.hovered = None;
         self.model.dragging = false;
+        // Cerrar la configuración cancela el color sin aplicar.
+        self.model.picker = None;
         self.grab = None;
         self.transition.close(Instant::now());
         self.present();
@@ -7615,6 +7618,13 @@ unsafe extern "system" fn settings_wndproc(
                     return;
                 }
                 let (x, y) = point(panel.scale);
+                if let Some(picker) = panel.model.picker.as_mut() {
+                    if let Some(part) = picker.dragging {
+                        picker.drag_to(part, x, y);
+                        panel.render();
+                        return;
+                    }
+                }
                 if panel.model.dragging {
                     set_settings_opacity(app, x);
                     return;
@@ -7648,6 +7658,18 @@ unsafe extern "system" fn settings_wndproc(
                     return;
                 };
                 let (x, y) = point(panel.scale);
+                // Con el selector de color abierto, solo responde él: se arrastra en
+                // la rueda o en la barra del brillo.
+                if let Some(picker) = panel.model.picker.as_mut() {
+                    use colorpick::Part;
+                    if let Some(part @ (Part::Wheel | Part::Brightness)) = picker.hit(x, y) {
+                        picker.dragging = Some(part);
+                        picker.drag_to(part, x, y);
+                        let _ = SetCapture(hwnd);
+                        panel.render();
+                    }
+                    return;
+                }
                 if settings::SettingsState::in_title(x, y) {
                     let mut cursor = POINT::default();
                     let _ = GetCursorPos(&mut cursor);
@@ -7667,7 +7689,6 @@ unsafe extern "system" fn settings_wndproc(
         }
         WM_LBUTTONUP => {
             let mut backup = None;
-            let mut pick_color = None;
             with_app(|app| {
                 let Some(panel) = app.settings.as_mut().filter(|p| p.visible) else {
                     return;
@@ -7684,6 +7705,27 @@ unsafe extern "system" fn settings_wndproc(
                     return;
                 }
                 let (x, y) = point(panel.scale);
+                if let Some(picker) = panel.model.picker.as_mut() {
+                    if picker.dragging.take().is_some() {
+                        let _ = ReleaseCapture();
+                        return;
+                    }
+                    match picker.hit(x, y) {
+                        Some(colorpick::Part::Cancel) => {
+                            panel.model.picker = None;
+                            panel.render();
+                        }
+                        Some(colorpick::Part::Apply) => {
+                            let chosen = picker.rgb();
+                            panel.model.picker = None;
+                            app.styles.set_start_custom(chosen);
+                            let _ = app.styles.save();
+                            app.apply_logo_color();
+                        }
+                        _ => {}
+                    }
+                    return;
+                }
                 let Some(hit) = panel.model.hit_test(x, y) else {
                     return;
                 };
@@ -7703,7 +7745,11 @@ unsafe extern "system" fn settings_wndproc(
                     return;
                 }
                 if hit == settings::Hit::PickColor {
-                    pick_color = Some(app.styles.start_custom());
+                    let size = (settings::WIDTH, settings::height());
+                    let picker = colorpick::ColorPicker::new(app.styles.start_custom(), size);
+                    panel.model.picker = Some(picker);
+                    panel.model.hovered = None;
+                    panel.render();
                     return;
                 }
                 if let Some(command) = panel.model.command(hit) {
@@ -7720,17 +7766,20 @@ unsafe extern "system" fn settings_wndproc(
             if let Some((owner, export)) = backup {
                 copy_settings(owner, export);
             }
-            // Igual con el selector de color del logo, sobre la configuración.
-            if let Some(chosen) = pick_color.and_then(|initial| logo::choose(hwnd, initial)) {
-                with_app(|app| {
-                    app.styles.set_start_custom(chosen);
-                    let _ = app.styles.save();
-                    app.apply_logo_color();
-                });
-            }
         }
+        // Escape cierra el selector de color si está abierto; si no, la ventana.
         WM_KEYDOWN if wparam.0 == 0x1B => {
-            with_app(|app| app.settings.as_mut().map(SettingsWindow::hide));
+            with_app(|app| {
+                let Some(panel) = app.settings.as_mut() else {
+                    return;
+                };
+                if panel.model.picker.take().is_some() {
+                    let _ = ReleaseCapture();
+                    panel.render();
+                } else {
+                    panel.hide();
+                }
+            });
         }
         _ => return DefWindowProcW(hwnd, msg, wparam, lparam),
     }

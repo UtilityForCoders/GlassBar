@@ -105,6 +105,8 @@ pub enum Hit {
     StartColor(bool),
     /// Elegir el color personalizado del logo con el selector de Windows.
     PickColor,
+    /// Una parte del selector de color abierto.
+    Picker(crate::colorpick::Part),
     Opacity,
     /// Reactivar las apps silenciadas desde las notificaciones.
     Unmute,
@@ -133,6 +135,8 @@ pub struct SettingsState {
     pub hovered: Option<Hit>,
     /// Arrastrando la barra de la opacidad.
     pub dragging: bool,
+    /// Selector del color personalizado del logo, abierto sobre la página.
+    pub picker: Option<crate::colorpick::ColorPicker>,
 }
 
 /// Filas, de arriba abajo: título de sección o fila con su contenido.
@@ -243,6 +247,7 @@ impl SettingsState {
             page: Page::default(),
             hovered: None,
             dragging: false,
+            picker: None,
         }
     }
 
@@ -257,6 +262,10 @@ impl SettingsState {
     }
 
     pub fn hit_test(&self, x: f32, y: f32) -> Option<Hit> {
+        // Con el selector de color abierto, solo cuenta él.
+        if let Some(picker) = &self.picker {
+            return picker.hit(x, y).map(Hit::Picker);
+        }
         if (BUTTONS_TOP..BUTTONS_TOP + CLOSE).contains(&y) {
             if (CLOSE_LEFT..CLOSE_LEFT + CLOSE).contains(&x) {
                 return Some(Hit::Close);
@@ -371,7 +380,7 @@ impl SettingsState {
             Hit::StartColor(true) => crate::appmenu::CMD_START_COLOR_NEXT,
             Hit::StartColor(false) => crate::appmenu::CMD_START_COLOR_PREV,
             // El selector de color lo abre la ventana: espera a que se cierre.
-            Hit::PickColor => return None,
+            Hit::PickColor | Hit::Picker(_) => return None,
             Hit::Update if self.updates.available.is_some() => CMD_UPDATE,
             Hit::Update => crate::appmenu::CMD_UPDATE_CHECK,
             Hit::Unmute => CMD_UNMUTE_APPS,
@@ -689,6 +698,13 @@ impl SettingsState {
                     );
                 }
             }
+        }
+        if let Some(picker) = &self.picker {
+            let hovered = match self.hovered {
+                Some(Hit::Picker(part)) => Some(part),
+                _ => None,
+            };
+            picker.draw(image, scale, (WIDTH, height()), hovered);
         }
     }
 

@@ -852,8 +852,20 @@ pub fn process_info(pid: u32) -> Option<(String, Option<String>)> {
 // DIBUJO DE ICONOS VECTORIALES FLUENT (IDÉNTICOS A LA REFERENCIA)
 // ---------------------------------------------------------------------------
 
-/// Botón Inicio estilo Windows 11 Fluent (4 cuadros blancos redondeados)
+/// Botón Inicio estilo Windows 11 Fluent (4 cuadros redondeados), del color elegido.
 pub fn draw_windows_start_icon(pixmap: &mut Pixmap, cx: f32, cy: f32, size: f32, scale: f32) {
+    draw_start_icon_with(pixmap, cx, cy, size, scale, &crate::logo::stops());
+}
+
+/// El logo de Inicio con el degradado `stops` (la vista previa del selector de color).
+pub fn draw_start_icon_with(
+    pixmap: &mut Pixmap,
+    cx: f32,
+    cy: f32,
+    size: f32,
+    scale: f32,
+    stops: &crate::logo::Stops,
+) {
     let s = size * scale;
     let gap = 2.4 * scale;
     let tile_w = (s - gap) / 2.0;
@@ -865,11 +877,10 @@ pub fn draw_windows_start_icon(pixmap: &mut Pixmap, cx: f32, cy: f32, size: f32,
     let y1 = y0 + tile_w + gap;
 
     // Un solo degradado de un tono claro (arriba a la izquierda) a uno intenso
-    // (abajo a la derecha) que atraviesa los cuatro cuadros, del color elegido.
-    let stops = crate::logo::stops();
+    // (abajo a la derecha) que atraviesa los cuatro cuadros.
     let (from, to) = ((x0, y0), (x0 + s, y0 + s));
     for (tx, ty) in [(x0, y0), (x1, y0), (x0, y1), (x1, y1)] {
-        fill_rounded_gradient(pixmap, &stops, from, to, tx, ty, tile_w, tile_w, r);
+        fill_rounded_gradient(pixmap, stops, from, to, tx, ty, tile_w, tile_w, r);
     }
 }
 

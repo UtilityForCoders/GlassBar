@@ -1,6 +1,6 @@
 //! Color del logo de Inicio: el azul de Windows 11, el color de énfasis de Windows,
-//! uno sacado del fondo de pantalla o uno elegido con el selector de color de
-//! Windows. Siempre es un degradado de un tono claro (arriba a la izquierda) a uno
+//! uno sacado del fondo de pantalla o uno elegido con el selector de color
+//! (`colorpick`). Siempre es un degradado de un tono claro (arriba a la izquierda) a uno
 //! más intenso (abajo a la derecha), como el logo original.
 //!
 //! El del fondo se calcula en otro hilo (hay que abrir la imagen) y se vuelve a
@@ -81,10 +81,7 @@ pub fn stops() -> Stops {
     match COLORS[MODE.with(Cell::get)].1 {
         Source::Blue => BLUE,
         // Termina justo en el color elegido; empieza en su tono claro.
-        Source::Custom => {
-            let [r, g, b] = CUSTOM_COLOR.with(Cell::get);
-            [gradient([r, g, b])[0], (1.0, [r, g, b, 255])]
-        }
+        Source::Custom => custom_stops(CUSTOM_COLOR.with(Cell::get)),
         Source::Accent => accent(),
         Source::Wallpaper => match WALLPAPER.load(Ordering::Relaxed) {
             0 => accent(),
@@ -115,35 +112,14 @@ pub fn refresh_wallpaper(hwnd: isize, message: u32) {
         });
 }
 
-/// Abre el selector de color de Windows, con `initial` elegido, sobre la ventana
-/// `owner`. Devuelve el color si se aceptó. Espera a que se cierre.
-pub fn choose(owner: windows::Win32::Foundation::HWND, initial: [u8; 3]) -> Option<[u8; 3]> {
-    use windows::Win32::Foundation::COLORREF;
-    use windows::Win32::UI::Controls::Dialogs::{
-        ChooseColorW, CC_FULLOPEN, CC_RGBINIT, CHOOSECOLORW,
-    };
-    thread_local! {
-        /// Los 16 colores propios del diálogo, que se recuerdan entre aperturas.
-        static SAVED: Cell<[COLORREF; 16]> = const { Cell::new([COLORREF(0xffffff); 16]) };
-    }
-    let [r, g, b] = initial;
-    let mut saved = SAVED.with(Cell::get);
-    let mut dialog = CHOOSECOLORW {
-        lStructSize: std::mem::size_of::<CHOOSECOLORW>() as u32,
-        hwndOwner: owner,
-        rgbResult: COLORREF(r as u32 | (g as u32) << 8 | (b as u32) << 16),
-        lpCustColors: saved.as_mut_ptr(),
-        Flags: CC_RGBINIT | CC_FULLOPEN,
-        ..Default::default()
-    };
-    let accepted = unsafe { ChooseColorW(&mut dialog) }.as_bool();
-    SAVED.with(|cell| cell.set(saved));
-    let color = dialog.rgbResult.0;
-    accepted.then_some([color as u8, (color >> 8) as u8, (color >> 16) as u8])
+/// Degradado de un color personalizado: termina justo en él y empieza en su tono
+/// claro.
+pub fn custom_stops([r, g, b]: [u8; 3]) -> Stops {
+    [gradient([r, g, b])[0], (1.0, [r, g, b, 255])]
 }
 
 /// Tono (0 a 360), saturación y brillo (0 a 1).
-fn to_hsv([r, g, b]: [u8; 3]) -> (f32, f32, f32) {
+pub fn to_hsv([r, g, b]: [u8; 3]) -> (f32, f32, f32) {
     let [r, g, b] = [r, g, b].map(|c| c as f32 / 255.0);
     let max = r.max(g).max(b);
     let delta = max - r.min(g).min(b);
@@ -160,7 +136,7 @@ fn to_hsv([r, g, b]: [u8; 3]) -> (f32, f32, f32) {
     (hue, saturation, max)
 }
 
-fn from_hsv(hue: f32, saturation: f32, value: f32) -> [u8; 4] {
+pub fn from_hsv(hue: f32, saturation: f32, value: f32) -> [u8; 4] {
     let hue = hue.rem_euclid(360.0) / 60.0;
     let chroma = value * saturation;
     let x = chroma * (1.0 - (hue % 2.0 - 1.0).abs());

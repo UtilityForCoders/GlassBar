@@ -24,6 +24,8 @@ mod catalog;
 mod categories;
 #[path = "../src/clock.rs"]
 mod clock;
+#[path = "../src/colorpick.rs"]
+mod colorpick;
 #[path = "../src/diag.rs"]
 mod diag;
 #[path = "../src/extras.rs"]
@@ -180,7 +182,14 @@ fn main() {
             available: Some("9.9.9".into()),
             ..Default::default()
         };
-        let model = settings::SettingsState::new(styles, autostart::is_enabled(), updates);
+        let custom = styles.start_custom();
+        let mut model = settings::SettingsState::new(styles, autostart::is_enabled(), updates);
+        // Con `--color`, la página de apariencia con el selector de color abierto.
+        if arguments_of("--color").is_some() {
+            model.page = settings::Page::Appearance;
+            let size = (settings::WIDTH, settings::height());
+            model.picker = Some(colorpick::ColorPicker::new(custom, size));
+        }
         let mut image = Pixmap::new(
             (settings::WIDTH * scale).ceil() as u32,
             (settings::height() * scale).ceil() as u32,
