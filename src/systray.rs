@@ -1035,6 +1035,36 @@ pub fn menu_of(
         })
 }
 
+/// Si la ventana activa es del programa `app` (o de un proceso suyo) y no es una
+/// ventana normal: oculta (la que abre un menú de Windows con `TrackPopupMenu`) o
+/// flotante (un menú propio). Entonces su menú puede seguir abierto aunque no se
+/// haya reconocido, y quitarle el foco lo cerraría.
+pub fn menu_has_focus(app: u32, known: &mut std::collections::HashMap<u32, bool>) -> bool {
+    if app == 0 || app == std::process::id() {
+        return false;
+    }
+    unsafe {
+        let front = GetForegroundWindow();
+        if front.0.is_null() {
+            return false;
+        }
+        let mut pid = 0;
+        GetWindowThreadProcessId(front, Some(&mut pid));
+        if pid == 0 {
+            return false;
+        }
+        let ex = GetWindowLongPtrW(front, GWL_EXSTYLE) as u32;
+        let floating = ex & (WS_EX_TOPMOST.0 | WS_EX_TOOLWINDOW.0) != 0;
+        if IsWindowVisible(front).as_bool() && !floating {
+            return false;
+        }
+        *known.entry(pid).or_insert_with(|| {
+            let processes = crate::audio::processes();
+            related(pid, app, |p| processes.get(&p).map(|(up, _)| *up))
+        })
+    }
+}
+
 /// Manda `event` al programa del icono `key`, sin esperar, si tiene a quién avisar y
 /// usa al menos la versión `min_version`.
 fn post(key: Key, event: u32, at: POINT, min_version: u32) {

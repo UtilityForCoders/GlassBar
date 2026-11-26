@@ -24,6 +24,8 @@ mod catalog;
 mod categories;
 #[path = "../src/clock.rs"]
 mod clock;
+#[path = "../src/colorpick.rs"]
+mod colorpick;
 #[path = "../src/diag.rs"]
 mod diag;
 #[path = "../src/extras.rs"]
@@ -40,6 +42,8 @@ mod jumplist;
 mod keyboard;
 #[path = "../src/launcher.rs"]
 mod launcher;
+#[path = "../src/logo.rs"]
+mod logo;
 #[path = "../src/pins.rs"]
 mod pins;
 #[path = "../src/settings.rs"]
@@ -171,6 +175,22 @@ fn main() {
         println!("Menú de {id}: target/appmenu-preview.bmp");
         return;
     }
+    // El logo de Inicio a los tamaños de la barra superior y del dock, a escala 1,
+    // 1,5 y 2, en target/logo-preview.bmp.
+    if arguments_of("--logo").is_some() {
+        let mut image = Pixmap::new(280, 80).unwrap();
+        image.fill(tiny_skia::Color::from_rgba8(28, 28, 30, 255));
+        let mut x = 14.0;
+        for size in [14.0, 24.0] {
+            for scale in [1.0, 1.5, 2.0] {
+                apps::draw_windows_start_icon(&mut image, x, 40.0, size, scale);
+                x += size * scale + 10.0;
+            }
+        }
+        std::fs::write("target/logo-preview.bmp", bmp_entry(&image)).unwrap();
+        println!("Logo: target/logo-preview.bmp");
+        return;
+    }
     // Ventana de configuración en target/settings-preview.bmp.
     if arguments_of("--settings").is_some() {
         let styles = style::Styles::load();
@@ -178,7 +198,14 @@ fn main() {
             available: Some("9.9.9".into()),
             ..Default::default()
         };
-        let model = settings::SettingsState::new(styles, autostart::is_enabled(), updates);
+        let custom = styles.start_custom();
+        let mut model = settings::SettingsState::new(styles, autostart::is_enabled(), updates);
+        // Con `--color`, la página de apariencia con el selector de color abierto.
+        if arguments_of("--color").is_some() {
+            model.page = settings::Page::Appearance;
+            let size = (settings::WIDTH, settings::height());
+            model.picker = Some(colorpick::ColorPicker::new(custom, size));
+        }
         let mut image = Pixmap::new(
             (settings::WIDTH * scale).ceil() as u32,
             (settings::height() * scale).ceil() as u32,
