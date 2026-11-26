@@ -1447,6 +1447,12 @@ fn run_power(option: launcher::Power) -> bool {
 
 /// (Re)empieza el parpadeo del cursor del buscador con el ritmo que tenga Windows,
 /// para que no se apague justo al escribir. Sin parpadeo en Windows, queda fijo.
+/// Tiempo máximo entre dos clics para que Windows los cuente como doble clic.
+fn double_click_time() -> Duration {
+    let ms = unsafe { windows::Win32::UI::Input::KeyboardAndMouse::GetDoubleClickTime() };
+    Duration::from_millis(ms as u64)
+}
+
 fn restart_caret(hwnd: HWND) {
     use windows::Win32::UI::WindowsAndMessaging::{GetCaretBlinkTime, KillTimer, SetTimer};
     unsafe {
@@ -1485,8 +1491,8 @@ unsafe extern "system" fn launcher_wndproc(
     lparam: LPARAM,
 ) -> LRESULT {
     use windows::Win32::UI::WindowsAndMessaging::{
-        WA_INACTIVE, WM_ACTIVATE, WM_CHAR, WM_CLOSE, WM_KEYDOWN, WM_LBUTTONDOWN, WM_MOUSEWHEEL,
-        WM_RBUTTONUP, WM_SETCURSOR, WM_SYSKEYDOWN,
+        WA_INACTIVE, WM_ACTIVATE, WM_CAPTURECHANGED, WM_CHAR, WM_CLOSE, WM_KEYDOWN, WM_LBUTTONDOWN,
+        WM_MOUSEWHEEL, WM_RBUTTONUP, WM_SETCURSOR, WM_SYSKEYDOWN,
     };
     let mut action = None;
     // Al escribir o pulsar, el cursor del texto se ve fijo y el parpadeo empieza de nuevo.
@@ -1553,28 +1559,60 @@ unsafe extern "system" fn launcher_wndproc(
                 }
             });
         }
+        // Pulsar en el buscador pone el cursor (o selecciona con doble y triple clic)
+        // y, mientras el botón sigue pulsado, arrastrar amplía la selección.
+        WM_LBUTTONDOWN => {
+            with_app(|app| {
+                if let Some(menu) = app.launcher.as_mut().filter(|menu| menu.visible) {
+                    let x = (lparam.0 & 0xffff) as i16 as f32 / menu.scale;
+                    let y = ((lparam.0 >> 16) & 0xffff) as i16 as f32 / menu.scale;
+                    if menu.model.over_text(x, y) {
+                        let shift =
+                            windows::Win32::UI::Input::KeyboardAndMouse::GetKeyState(0x10) < 0;
+                        if menu
+                            .model
+                            .press_search(x, shift, Instant::now(), double_click_time())
+                        {
+                            windows::Win32::UI::Input::KeyboardAndMouse::SetCapture(hwnd);
+                        }
+                        menu.model.selection = None;
+                        menu.render();
+                    }
+                }
+            });
+        }
+        WM_CAPTURECHANGED => {
+            with_app(|app| {
+                if let Some(menu) = &mut app.launcher {
+                    menu.model.query.release();
+                }
+            });
+        }
         // Mientras se cierra, el panel ya no responde al ratón ni al teclado.
         WM_MOUSEMOVE | WM_LBUTTONUP => {
             with_app(|app| {
                 if let Some(menu) = app.launcher.as_mut().filter(|menu| menu.visible) {
                     let x = (lparam.0 & 0xffff) as i16 as f32 / menu.scale;
                     let y = ((lparam.0 >> 16) & 0xffff) as i16 as f32 / menu.scale;
+                    // Arrastre de una selección en el buscador: ni resalta ni abre nada.
+                    if menu.model.query.dragging() {
+                        if msg == WM_MOUSEMOVE {
+                            menu.model.drag_search(x);
+                            menu.render();
+                        } else {
+                            // Antes de soltar la captura: WM_CAPTURECHANGED llega
+                            // mientras APP sigue prestada y no podría hacerlo.
+                            menu.model.query.release();
+                            let _ = ReleaseCapture();
+                        }
+                        return;
+                    }
                     let hit = menu.model.hit_test(x, y);
                     // Mover el ratón dentro del mismo elemento no cambia nada visible.
                     if msg == WM_MOUSEMOVE && hit == menu.model.hovered {
                         return;
                     }
                     if msg == WM_LBUTTONUP {
-                        if menu.model.in_search(x, y) {
-                            let shift =
-                                windows::Win32::UI::Input::KeyboardAndMouse::GetKeyState(0x10) < 0;
-                            let double = Duration::from_millis(
-                                windows::Win32::UI::Input::KeyboardAndMouse::GetDoubleClickTime()
-                                    as u64,
-                            );
-                            menu.model.press_search(x, shift, Instant::now(), double);
-                            menu.model.selection = None;
-                        }
                         if let Some(hit) = hit {
                             action = menu.model.activate(hit);
                         }
@@ -1683,6 +1721,33 @@ unsafe extern "system" fn launcher_wndproc(
                                 menu.model.insert_text(&text);
                                 menu.render();
                             }
+                        }
+                        // Ctrl+Insert copia, Mayús+Insert pega y Mayús+Supr corta.
+                        0x2D if ctrl && !menu_open => {
+                            if let Some(text) = menu.model.query.selected_text() {
+                                set_clipboard_text(hwnd, &text);
+                            }
+                        }
+                        0x2D if shift && !menu_open => {
+                            if let Some(text) = clipboard_text(hwnd) {
+                                menu.model.insert_text(&text);
+                                menu.render();
+                            }
+                        }
+                        0x2E if shift && !ctrl && !menu_open => {
+                            if let Some(Some(text)) = menu.model.edit(|field| field.cut()) {
+                                set_clipboard_text(hwnd, &text);
+                                menu.render();
+                            }
+                        }
+                        // Ctrl+Z deshace; Ctrl+Y o Ctrl+Mayús+Z rehacen.
+                        0x5A if ctrl && !shift && !menu_open => {
+                            menu.model.edit(|field| field.undo());
+                            menu.render();
+                        }
+                        0x59 | 0x5A if ctrl && !menu_open => {
+                            menu.model.edit(|field| field.redo());
+                            menu.render();
                         }
                         // Retroceso y Supr; con Ctrl, palabra a palabra.
                         0x08 if !menu_open => {
@@ -1931,10 +1996,10 @@ unsafe extern "system" fn spotlight_wndproc(
 ) -> LRESULT {
     use windows::Win32::UI::Input::KeyboardAndMouse::GetKeyState;
     use windows::Win32::UI::WindowsAndMessaging::{
-        WA_INACTIVE, WM_ACTIVATE, WM_CHAR, WM_CLOSE, WM_KEYDOWN, WM_SETCURSOR,
+        WA_INACTIVE, WM_ACTIVATE, WM_CAPTURECHANGED, WM_CHAR, WM_CLOSE, WM_KEYDOWN, WM_SETCURSOR,
     };
     let mut action = None;
-    if matches!(msg, WM_CHAR | WM_KEYDOWN) {
+    if matches!(msg, WM_CHAR | WM_KEYDOWN | WM_LBUTTONDOWN) {
         restart_caret(hwnd);
     }
     match msg {
@@ -1997,12 +2062,52 @@ unsafe extern "system" fn spotlight_wndproc(
                 }
             });
         }
+        // Pulsar en el campo pone el cursor (o selecciona con doble y triple clic) y,
+        // mientras el botón sigue pulsado, arrastrar amplía la selección.
+        WM_LBUTTONDOWN => {
+            with_app(|app| {
+                if let Some(panel) = app.spotlight.as_mut().filter(|p| p.visible) {
+                    let x = (lparam.0 & 0xffff) as i16 as f32 / panel.scale;
+                    let y = ((lparam.0 >> 16) & 0xffff) as i16 as f32 / panel.scale;
+                    if panel.model.over_text(x, y) {
+                        let shift = GetKeyState(0x10) < 0;
+                        if panel
+                            .model
+                            .press_text(x, shift, Instant::now(), double_click_time())
+                        {
+                            windows::Win32::UI::Input::KeyboardAndMouse::SetCapture(hwnd);
+                        }
+                        panel.render();
+                    }
+                }
+            });
+        }
+        WM_CAPTURECHANGED => {
+            with_app(|app| {
+                if let Some(panel) = &mut app.spotlight {
+                    panel.model.query.release();
+                }
+            });
+        }
         // Pasar el ratón elige el resultado; el clic lo abre (con Ctrl, su carpeta).
         WM_MOUSEMOVE | WM_LBUTTONUP => {
             with_app(|app| {
                 if let Some(panel) = app.spotlight.as_mut().filter(|p| p.visible) {
                     let x = (lparam.0 & 0xffff) as i16 as f32 / panel.scale;
                     let y = ((lparam.0 >> 16) & 0xffff) as i16 as f32 / panel.scale;
+                    // Arrastre de una selección en el campo: ni elige ni abre nada.
+                    if panel.model.query.dragging() {
+                        if msg == WM_MOUSEMOVE {
+                            panel.model.drag_text(x);
+                            panel.render();
+                        } else {
+                            // Antes de soltar la captura: WM_CAPTURECHANGED llega
+                            // mientras APP sigue prestada y no podría hacerlo.
+                            panel.model.query.release();
+                            let _ = ReleaseCapture();
+                        }
+                        return;
+                    }
                     let Some(index) = panel.model.hit_test(x, y) else {
                         return;
                     };
@@ -2056,8 +2161,11 @@ unsafe extern "system" fn spotlight_wndproc(
                     }
                     0x28 => panel.model.move_selection(1),
                     0x26 => panel.model.move_selection(-1),
+                    // Los atajos de cualquier cuadro de texto de Windows: Ctrl+A,
+                    // Ctrl+C/Ctrl+Insert, Ctrl+X/Mayús+Supr, Ctrl+V/Mayús+Insert, y
+                    // Ctrl+Z/Ctrl+Y (o Ctrl+Mayús+Z) para deshacer y rehacer.
                     0x41 if ctrl => panel.model.edit(|field| field.select_all()),
-                    0x43 if ctrl => {
+                    0x43 | 0x2D if ctrl => {
                         if let Some(text) = panel.model.query.selected_text() {
                             set_clipboard_text(hwnd, &text);
                         }
@@ -2068,12 +2176,30 @@ unsafe extern "system" fn spotlight_wndproc(
                             set_clipboard_text(hwnd, &text);
                         }
                     }
+                    0x2E if shift && !ctrl => {
+                        if let Some(text) = panel.model.edit(|field| field.cut()) {
+                            set_clipboard_text(hwnd, &text);
+                        }
+                    }
                     0x56 if ctrl => {
                         if let Some(text) = clipboard_text(hwnd) {
                             panel
                                 .model
                                 .insert_text(text.lines().next().unwrap_or_default());
                         }
+                    }
+                    0x2D if shift => {
+                        if let Some(text) = clipboard_text(hwnd) {
+                            panel
+                                .model
+                                .insert_text(text.lines().next().unwrap_or_default());
+                        }
+                    }
+                    0x5A if ctrl && !shift => {
+                        panel.model.edit(|field| field.undo());
+                    }
+                    0x59 | 0x5A if ctrl => {
+                        panel.model.edit(|field| field.redo());
                     }
                     0x08 => panel.model.edit(|field| field.backspace(ctrl)),
                     0x2E => panel.model.edit(|field| field.delete(ctrl)),

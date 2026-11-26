@@ -352,9 +352,6 @@ pub struct LauncherState {
     search_offset: f32,
     /// El cursor del texto se ve en esta fase del parpadeo.
     caret_on: bool,
-    /// Última pulsación en el buscador (momento, x y cuántas seguidas), para el
-    /// doble y el triple clic.
-    last_press: Option<(Instant, f32, u8)>,
     user: String,
     icons: HashMap<String, Option<Pixmap>>,
     /// Con ventana, los iconos que faltan se cargan en otro hilo (ver `IconLoader`);
@@ -396,7 +393,6 @@ impl LauncherState {
             selection: None,
             search_offset: 0.0,
             caret_on: true,
-            last_press: None,
             user: user_display_name(),
             icons: HashMap::new(),
             loader: None,
@@ -818,37 +814,19 @@ impl LauncherState {
         self.hovered = None;
         self.selection = None;
     }
-    /// Clic en el campo de búsqueda: pone el cursor en la letra más cercana; con
-    /// Mayús amplía la selección hasta ahí.
-    pub fn click_search(&mut self, x: f32, extend: bool) {
+    /// Pulsación en el buscador en el momento `now`: un clic pone el cursor (con
+    /// Mayús amplía la selección), dos seguidos en el mismo sitio (dentro de
+    /// `double`, como pide Windows) seleccionan la palabra, y tres todo el texto.
+    /// Devuelve si empieza un arrastre, que sigue con `drag_search`.
+    pub fn press_search(&mut self, x: f32, extend: bool, now: Instant, double: Duration) -> bool {
         let index = self.char_at(x);
-        self.edit(|field| field.move_to(index, extend));
+        self.edit(|field| field.press(index, x, extend, now, double));
+        self.query.dragging()
     }
-    /// Pulsación en el buscador en el momento `now`: un clic pone el cursor, dos
-    /// seguidos en el mismo sitio (dentro de `double` del anterior, como pide
-    /// Windows) seleccionan la palabra, y tres todo el texto.
-    pub fn press_search(&mut self, x: f32, extend: bool, now: Instant, double: Duration) {
-        let count = match self.last_press {
-            Some((at, px, count))
-                if !extend
-                    && now.saturating_duration_since(at) <= double
-                    && (x - px).abs() <= 4.0 =>
-            {
-                count % 3 + 1
-            }
-            _ => 1,
-        };
-        self.last_press = Some((now, x, count));
-        match count {
-            2 => {
-                let index = self.char_at(x);
-                self.edit(|field| field.select_word(index));
-            }
-            3 => {
-                self.edit(|field| field.select_all());
-            }
-            _ => self.click_search(x, extend),
-        }
+    /// Con el botón pulsado desde el buscador, el ratón en `x` amplía la selección.
+    pub fn drag_search(&mut self, x: f32) {
+        let index = self.char_at(x);
+        self.edit(|field| field.drag(index));
     }
     /// Carácter del buscador más cercano a `x` (antes del que queda a la derecha).
     fn char_at(&self, x: f32) -> usize {
@@ -2728,7 +2706,6 @@ mod tests {
             selection: None,
             search_offset: 0.0,
             caret_on: true,
-            last_press: None,
             user: "Usuario de prueba".into(),
             icons: HashMap::new(),
             loader: None,
@@ -3086,13 +3063,21 @@ mod tests {
         menu.insert_text("spotify");
         let y = SEARCH_Y + SEARCH_H / 2.0;
         assert!(menu.in_search(SEARCH_TEXT_X, y));
-        menu.click_search(SEARCH_TEXT_X, false);
+        let double = Duration::from_millis(500);
+        let start = Instant::now();
+        assert!(menu.press_search(SEARCH_TEXT_X, false, start, double));
         assert_eq!(menu.query.caret(), 0);
         let after_spot = SEARCH_TEXT_X + 1.0 + text_width("spot", SEARCH_FONT);
-        menu.click_search(after_spot, false);
+        menu.press_search(after_spot, false, start + Duration::from_secs(1), double);
         assert_eq!(menu.query.caret(), 4);
-        menu.click_search(SEARCH_TEXT_X + SEARCH_TEXT_W, true);
+        let end = SEARCH_TEXT_X + SEARCH_TEXT_W;
+        menu.press_search(end, true, start + Duration::from_secs(2), double);
         assert_eq!(menu.query.selected_text().as_deref(), Some("ify"));
+        // Arrastrar desde el principio selecciona hasta donde está el ratón.
+        menu.press_search(SEARCH_TEXT_X, false, start + Duration::from_secs(3), double);
+        menu.drag_search(after_spot);
+        assert_eq!(menu.query.selected_text().as_deref(), Some("spot"));
+        menu.query.release();
     }
 
     #[test]
