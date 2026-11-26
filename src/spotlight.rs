@@ -286,6 +286,34 @@ impl SpotlightState {
     pub fn over_text(&self, x: f32, y: f32) -> bool {
         (TEXT_X..TEXT_X + TEXT_W).contains(&x) && (0.0..FIELD_H).contains(&y)
     }
+    /// Pulsación del ratón en el campo (en `x`, momento `now`): clic, doble o
+    /// triple clic, como en `TextField::press`. Devuelve si empieza un arrastre,
+    /// que sigue con `drag_text`.
+    pub fn press_text(&mut self, x: f32, extend: bool, now: Instant, double: Duration) -> bool {
+        let index = self.char_at(x);
+        self.edit(|field| field.press(index, x, extend, now, double));
+        self.query.dragging()
+    }
+    /// Con el botón pulsado desde el campo, el ratón en `x` amplía la selección.
+    pub fn drag_text(&mut self, x: f32) {
+        let index = self.char_at(x);
+        self.edit(|field| field.drag(index));
+    }
+    /// Carácter del campo más cercano a `x` (antes del que queda a la derecha).
+    fn char_at(&self, x: f32) -> usize {
+        let target = x - TEXT_X - 1.0 + self.offset;
+        let mut left = 0.0;
+        let mut index = 0;
+        for c in self.query.text().chars() {
+            let width = text_width(&c.to_string(), FONT);
+            if left + width / 2.0 > target {
+                break;
+            }
+            left += width;
+            index += 1;
+        }
+        index
+    }
 
     pub fn draw(&mut self, image: &mut Pixmap, scale: f32) {
         if let Some(loader) = &self.loader {
@@ -590,6 +618,31 @@ mod tests {
             state.activate(state.selected(), true),
             Some(Action::Reveal(app("Safari")))
         );
+    }
+
+    #[test]
+    fn mouse_selects_text_in_the_field() {
+        let mut state = SpotlightState::with_apps(vec![app("Safari")]);
+        state.insert_text("visual studio");
+        let double = Duration::from_millis(500);
+        let start = Instant::now();
+        let at = |prefix: &str| TEXT_X + 1.0 + text_width(prefix, FONT);
+        assert!(state.over_text(at("vis"), FIELD_H / 2.0));
+        // Clic y arrastre.
+        assert!(state.press_text(at("vi"), false, start, double));
+        state.drag_text(at("visual st"));
+        assert_eq!(state.query.selected_text().as_deref(), Some("sual st"));
+        state.query.release();
+        // Doble clic: la palabra.
+        let later = start + Duration::from_secs(2);
+        state.press_text(at("visual stu"), false, later, double);
+        state.press_text(
+            at("visual stu"),
+            false,
+            later + Duration::from_millis(100),
+            double,
+        );
+        assert_eq!(state.query.selected_text().as_deref(), Some("studio"));
     }
 
     #[test]
