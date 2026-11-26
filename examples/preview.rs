@@ -40,6 +40,8 @@ mod jumplist;
 mod keyboard;
 #[path = "../src/launcher.rs"]
 mod launcher;
+#[path = "../src/logo.rs"]
+mod logo;
 #[path = "../src/pins.rs"]
 mod pins;
 #[path = "../src/settings.rs"]

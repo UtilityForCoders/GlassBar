@@ -477,6 +477,9 @@ pub const CMD_DOCK_BIGGER: u32 = 14;
 pub const CMD_NOTIFICATIONS: u32 = 15;
 /// Volver a mostrar los avisos de las apps silenciadas.
 pub const CMD_UNMUTE_APPS: u32 = 16;
+/// Color del logo de Inicio: el anterior o el siguiente.
+pub const CMD_START_COLOR_PREV: u32 = 17;
+pub const CMD_START_COLOR_NEXT: u32 = 18;
 
 /// Menú del icono de GlassBar en la bandeja (clic derecho): configuración y salir.
 pub fn tray() -> AppMenu {

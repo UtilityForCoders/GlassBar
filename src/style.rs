@@ -146,6 +146,12 @@ pub struct Styles {
     /// notificaciones.
     #[serde(default)]
     do_not_disturb: bool,
+    /// Color del logo de Inicio, su posición en la lista de `logo`.
+    #[serde(default)]
+    start_color: u8,
+    /// Color elegido con el selector para el logo ("Personalizado"), en RGB.
+    #[serde(default)]
+    start_custom: Option<[u8; 3]>,
 }
 
 /// App silenciada desde la campana de una tarjeta.
@@ -190,6 +196,8 @@ impl Default for Styles {
             dock_size: default_dock_size(),
             muted_apps: Vec::new(),
             do_not_disturb: false,
+            start_color: 0,
+            start_custom: None,
         }
     }
 }
@@ -288,6 +296,38 @@ impl Styles {
             index.saturating_sub(1)
         };
         self.dock_size = DOCK_SIZES[index].0;
+    }
+    /// Color del logo de Inicio (ver `logo`); uno desconocido cuenta como el azul.
+    pub fn start_color(&self) -> usize {
+        let index = self.start_color as usize;
+        if index < crate::logo::COUNT {
+            index
+        } else {
+            0
+        }
+    }
+    pub fn start_color_name(&self) -> &'static str {
+        crate::logo::name(self.start_color())
+    }
+    /// Pasa al color siguiente (`next`) o al anterior, dando la vuelta.
+    pub fn step_start_color(&mut self, next: bool) {
+        let count = crate::logo::COUNT;
+        let index = self.start_color();
+        let index = if next {
+            (index + 1) % count
+        } else {
+            (index + count - 1) % count
+        };
+        self.start_color = index as u8;
+    }
+    /// Color personalizado del logo (uno por defecto si aún no se eligió).
+    pub fn start_custom(&self) -> [u8; 3] {
+        self.start_custom.unwrap_or(crate::logo::DEFAULT_CUSTOM)
+    }
+    /// Guarda el color elegido con el selector y pasa a usarlo.
+    pub fn set_start_custom(&mut self, rgb: [u8; 3]) {
+        self.start_custom = Some(rgb);
+        self.start_color = crate::logo::CUSTOM as u8;
     }
     pub fn look(&self, state: State) -> Look {
         let index = state as usize;

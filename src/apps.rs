@@ -864,9 +864,9 @@ pub fn draw_windows_start_icon(pixmap: &mut Pixmap, cx: f32, cy: f32, size: f32,
     let x1 = x0 + tile_w + gap;
     let y1 = y0 + tile_w + gap;
 
-    // El logo de Windows 11 en azul: un solo degradado de cian claro (arriba a la
-    // izquierda) a azul (abajo a la derecha) que atraviesa los cuatro cuadros.
-    let stops = [(0.0, [112, 224, 255, 255]), (1.0, [0, 120, 240, 255])];
+    // Un solo degradado de un tono claro (arriba a la izquierda) a uno intenso
+    // (abajo a la derecha) que atraviesa los cuatro cuadros, del color elegido.
+    let stops = crate::logo::stops();
     let (from, to) = ((x0, y0), (x0 + s, y0 + s));
     for (tx, ty) in [(x0, y0), (x1, y0), (x0, y1), (x1, y1)] {
         fill_rounded_gradient(pixmap, &stops, from, to, tx, ty, tile_w, tile_w, r);

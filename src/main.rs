@@ -31,6 +31,7 @@ mod jumplist;
 mod keyboard;
 mod language;
 mod launcher;
+mod logo;
 mod monitors;
 mod notifcenter;
 mod notifications;
@@ -129,6 +130,8 @@ const WM_SPOTLIGHT_ICONS: u32 = windows::Win32::UI::WindowsAndMessaging::WM_APP 
 /// Identificador del atajo global Alt+Espacio (`RegisterHotKey`).
 const HOTKEY_SPOTLIGHT: i32 = 1;
 const WM_NOTIFICATIONS: u32 = windows::Win32::UI::WindowsAndMessaging::WM_APP + 13;
+/// El hilo del fondo de pantalla calculó otro color para el logo de Inicio.
+const WM_LOGO_COLOR: u32 = windows::Win32::UI::WindowsAndMessaging::WM_APP + 15;
 
 const TIMER_ANIM: usize = 1;
 const TIMER_TICK: usize = 2;
@@ -2251,6 +2254,10 @@ impl App {
         bar.appearance = styles.look(style::State::Desktop).appearance;
         glass::set_menu_opacity(styles.menu_opacity());
         clock::set_seconds(styles.clock_seconds());
+        logo::set_mode(styles.start_color(), styles.start_custom());
+        if logo::follows_wallpaper() {
+            logo::refresh_wallpaper(hwnd.0 as isize, WM_LOGO_COLOR);
+        }
         let (update_sender, update_events) = std::sync::mpsc::channel();
         let scale = (scale * styles.dock_factor())
             .min((rc.right - rc.left) as f32 / (bar.dock_width() + 40.0));
@@ -3534,6 +3541,26 @@ impl App {
     }
 
     /// Vuelve a leer los ajustes en la configuración abierta, tras cambiar alguno.
+    /// Cambió el color del logo de Inicio: se redibujan el dock, la barra superior
+    /// y la configuración, que lo muestran.
+    fn redraw_logo(&mut self) {
+        self.render();
+        if let Some(top) = self.top.as_mut() {
+            top.drawn = None;
+            top.render();
+        }
+        self.refresh_settings();
+    }
+
+    /// Aplica el color del logo elegido en la configuración.
+    fn apply_logo_color(&mut self) {
+        logo::set_mode(self.styles.start_color(), self.styles.start_custom());
+        if logo::follows_wallpaper() {
+            logo::refresh_wallpaper(self.hwnd.0 as isize, WM_LOGO_COLOR);
+        }
+        self.redraw_logo();
+    }
+
     fn refresh_settings(&mut self) {
         let updates = self.settings_updates();
         let styles = self.styles.clone();
@@ -3916,9 +3943,21 @@ unsafe extern "system" fn wndproc(hwnd: HWND, msg: u32, wparam: WPARAM, lparam: 
                     LPARAM(0),
                 );
             }
+            // Cambió el fondo de pantalla: si el logo lo sigue, se vuelve a calcular.
+            const SPI_SETDESKWALLPAPER: usize = 0x14;
+            if msg == windows::Win32::UI::WindowsAndMessaging::WM_SETTINGCHANGE
+                && wparam.0 == SPI_SETDESKWALLPAPER
+                && logo::follows_wallpaper()
+            {
+                logo::refresh_wallpaper(hwnd.0 as isize, WM_LOGO_COLOR);
+            }
             with_app(|app| {
                 if accent::refresh() {
-                    app.render();
+                    if logo::follows_accent() || logo::follows_wallpaper() {
+                        app.redraw_logo();
+                    } else {
+                        app.render();
+                    }
                     if let Some(panel) = app.quick.as_mut().filter(|p| p.visible) {
                         panel.render();
                     }
@@ -3966,6 +4005,10 @@ unsafe extern "system" fn wndproc(hwnd: HWND, msg: u32, wparam: WPARAM, lparam: 
         }
         WM_UPDATE => {
             with_app(|app| app.handle_update_events());
+            LRESULT(0)
+        }
+        WM_LOGO_COLOR => {
+            with_app(|app| app.redraw_logo());
             LRESULT(0)
         }
         WM_NOTIFICATIONS => {
@@ -7624,6 +7667,7 @@ unsafe extern "system" fn settings_wndproc(
         }
         WM_LBUTTONUP => {
             let mut backup = None;
+            let mut pick_color = None;
             with_app(|app| {
                 let Some(panel) = app.settings.as_mut().filter(|p| p.visible) else {
                     return;
@@ -7658,6 +7702,10 @@ unsafe extern "system" fn settings_wndproc(
                     }
                     return;
                 }
+                if hit == settings::Hit::PickColor {
+                    pick_color = Some(app.styles.start_custom());
+                    return;
+                }
                 if let Some(command) = panel.model.command(hit) {
                     if matches!(command, appmenu::CMD_EXPORT | appmenu::CMD_IMPORT) {
                         backup = Some((app.hwnd, command == appmenu::CMD_EXPORT));
@@ -7671,6 +7719,14 @@ unsafe extern "system" fn settings_wndproc(
             // la app ya libre, para que el dock siga respondiendo.
             if let Some((owner, export)) = backup {
                 copy_settings(owner, export);
+            }
+            // Igual con el selector de color del logo, sobre la configuración.
+            if let Some(chosen) = pick_color.and_then(|initial| logo::choose(hwnd, initial)) {
+                with_app(|app| {
+                    app.styles.set_start_custom(chosen);
+                    let _ = app.styles.save();
+                    app.apply_logo_color();
+                });
             }
         }
         WM_KEYDOWN if wparam.0 == 0x1B => {
@@ -7730,6 +7786,12 @@ fn handle_menu_command(app: &mut App, cmd: u32) {
             app.expand();
         }
         CMD_SETTINGS => app.open_settings(),
+        appmenu::CMD_START_COLOR_PREV | appmenu::CMD_START_COLOR_NEXT => {
+            app.styles
+                .step_start_color(cmd == appmenu::CMD_START_COLOR_NEXT);
+            let _ = app.styles.save();
+            app.apply_logo_color();
+        }
         appmenu::CMD_DOCK_SMALLER | appmenu::CMD_DOCK_BIGGER => {
             app.styles.step_dock_size(cmd == appmenu::CMD_DOCK_BIGGER);
             let _ = app.styles.save();

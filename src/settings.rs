@@ -30,6 +30,8 @@ const PICKER_W: f32 = 140.0;
 const PICKER_H: f32 = 28.0;
 /// Barra de la opacidad de los menús.
 const SLIDER_W: f32 = 150.0;
+/// Muestra del color personalizado del logo, que abre el selector de color.
+const SWATCH: f32 = 28.0;
 /// Botón de las actualizaciones.
 const BUTTON_W: f32 = 150.0;
 /// Botones de la copia de la configuración, uno junto al otro.
@@ -99,6 +101,10 @@ pub enum Hit {
     Appearance(State, bool),
     /// Tamaño del dock: el anterior (`false`) o el siguiente.
     DockSize(bool),
+    /// Color del logo de Inicio: el anterior (`false`) o el siguiente.
+    StartColor(bool),
+    /// Elegir el color personalizado del logo con el selector de Windows.
+    PickColor,
     Opacity,
     /// Reactivar las apps silenciadas desde las notificaciones.
     Unmute,
@@ -135,6 +141,8 @@ enum Line {
     Section(&'static str),
     Switch(Switch),
     DockSize,
+    /// Color del logo de Inicio.
+    StartColor,
     Look(State),
     Opacity,
     /// Apps silenciadas desde las notificaciones y el botón para reactivarlas.
@@ -159,6 +167,7 @@ fn lines(page: Page) -> Vec<Line> {
             let mut lines = vec![Line::Section("Según lo que hay en pantalla")];
             lines.extend(State::ALL.iter().map(|&state| Line::Look(state)));
             lines.push(Line::Opacity);
+            lines.push(Line::StartColor);
             lines
         }
         Page::Notifications => vec![Line::Switch(Switch::Notifications), Line::Muted],
@@ -209,6 +218,11 @@ fn switch_label(switch: Switch) -> &'static str {
 /// Borde izquierdo de los controles alineados a la derecha.
 fn right_edge() -> f32 {
     WIDTH - PAD
+}
+
+/// Borde izquierdo de la muestra del color personalizado, a la izquierda del selector.
+fn swatch_left() -> f32 {
+    right_edge() - PICKER_W - 8.0 - SWATCH
 }
 
 /// Borde izquierdo de "Exportar" y de "Importar".
@@ -282,6 +296,15 @@ impl SettingsState {
                     .contains(&x)
                     .then_some(Hit::DockSize(x >= picker + PICKER_W / 2.0))
             }
+            Line::StartColor => {
+                let picker = right - PICKER_W;
+                if (swatch_left()..swatch_left() + SWATCH).contains(&x) {
+                    return Some(Hit::PickColor);
+                }
+                (picker..right)
+                    .contains(&x)
+                    .then_some(Hit::StartColor(x >= picker + PICKER_W / 2.0))
+            }
             Line::Opacity => {
                 let left = right - SLIDER_W - 44.0;
                 ((left - 6.0..right).contains(&x)).then_some(Hit::Opacity)
@@ -345,6 +368,10 @@ impl SettingsState {
             }
             Hit::DockSize(true) => crate::appmenu::CMD_DOCK_BIGGER,
             Hit::DockSize(false) => crate::appmenu::CMD_DOCK_SMALLER,
+            Hit::StartColor(true) => crate::appmenu::CMD_START_COLOR_NEXT,
+            Hit::StartColor(false) => crate::appmenu::CMD_START_COLOR_PREV,
+            // El selector de color lo abre la ventana: espera a que se cierre.
+            Hit::PickColor => return None,
             Hit::Update if self.updates.available.is_some() => CMD_UPDATE,
             Hit::Update => crate::appmenu::CMD_UPDATE_CHECK,
             Hit::Unmute => CMD_UNMUTE_APPS,
@@ -483,6 +510,50 @@ impl SettingsState {
                     draw_picker(
                         image,
                         self.styles.dock_size_name(),
+                        hovered,
+                        true,
+                        right - PICKER_W,
+                        cy,
+                        scale,
+                    );
+                }
+                Line::StartColor => {
+                    // El logo con el color elegido, como muestra.
+                    crate::apps::draw_windows_start_icon(image, s(PAD + 10.0), s(cy), 14.0, scale);
+                    draw_text_on_baseline(
+                        image,
+                        "Color del logo de Inicio",
+                        s(PAD + 28.0),
+                        baseline,
+                        size,
+                        0.95,
+                    );
+                    // Muestra del color personalizado: al pulsarla se elige otro.
+                    let [r, g, b] = self.styles.start_custom();
+                    let swatch = swatch_left();
+                    let hover = self.hovered == Some(Hit::PickColor);
+                    fill_rounded(
+                        image,
+                        [255, 255, 255, if hover { 30 } else { 16 }],
+                        s(swatch),
+                        s(cy - PICKER_H / 2.0),
+                        s(SWATCH),
+                        s(PICKER_H),
+                        s(6.0),
+                    );
+                    fill_rounded(
+                        image,
+                        [r, g, b, 255],
+                        s(swatch + 5.0),
+                        s(cy - PICKER_H / 2.0 + 5.0),
+                        s(SWATCH - 10.0),
+                        s(PICKER_H - 10.0),
+                        s(4.0),
+                    );
+                    let hovered = matches!(self.hovered, Some(Hit::StartColor(_)));
+                    draw_picker(
+                        image,
+                        self.styles.start_color_name(),
                         hovered,
                         true,
                         right - PICKER_W,
@@ -910,6 +981,28 @@ mod tests {
             settings.hit_test(switch_x, y),
             Some(Hit::Enabled(State::Maximized))
         );
+    }
+
+    #[test]
+    fn the_start_color_picker_steps_both_ways() {
+        use crate::appmenu::{CMD_START_COLOR_NEXT, CMD_START_COLOR_PREV};
+        let settings = on(Line::StartColor);
+        let y = row_center(Line::StartColor);
+        let right = right_edge();
+        let next = settings.hit_test(right - 10.0, y);
+        let previous = settings.hit_test(right - PICKER_W + 10.0, y);
+        assert_eq!(
+            next.and_then(|h| settings.command(h)),
+            Some(CMD_START_COLOR_NEXT)
+        );
+        assert_eq!(
+            previous.and_then(|h| settings.command(h)),
+            Some(CMD_START_COLOR_PREV)
+        );
+        assert_eq!(settings.hit_test(60.0, y), None);
+        let swatch = settings.hit_test(swatch_left() + SWATCH / 2.0, y);
+        assert_eq!(swatch, Some(Hit::PickColor));
+        assert_eq!(settings.command(Hit::PickColor), None);
     }
 
     #[test]
