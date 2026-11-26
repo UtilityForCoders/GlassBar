@@ -852,24 +852,39 @@ pub fn process_info(pid: u32) -> Option<(String, Option<String>)> {
 // DIBUJO DE ICONOS VECTORIALES FLUENT (IDÉNTICOS A LA REFERENCIA)
 // ---------------------------------------------------------------------------
 
-/// Botón Inicio estilo Windows 11 Fluent (4 cuadros blancos redondeados)
+/// Botón Inicio estilo Windows 11 Fluent (4 cuadros redondeados), del color elegido.
 pub fn draw_windows_start_icon(pixmap: &mut Pixmap, cx: f32, cy: f32, size: f32, scale: f32) {
-    let s = size * scale;
-    let gap = 2.4 * scale;
-    let tile_w = (s - gap) / 2.0;
-    let r = 2.0 * scale;
+    draw_start_icon_with(pixmap, cx, cy, size, scale, &crate::logo::stops());
+}
 
-    let x0 = cx - s / 2.0;
-    let y0 = cy - s / 2.0;
+/// El logo de Inicio con el degradado `stops` (la vista previa del selector de color).
+pub fn draw_start_icon_with(
+    pixmap: &mut Pixmap,
+    cx: f32,
+    cy: f32,
+    size: f32,
+    scale: f32,
+    stops: &crate::logo::Stops,
+) {
+    // Proporciones del logo de Windows 11: separación de un píxel (un 4,5 % del
+    // lado) y esquinas casi rectas. Todo se ajusta a píxeles enteros para que los
+    // bordes y la separación salgan nítidos, como en la barra de Windows.
+    let s = (size * scale).round().max(4.0);
+    let gap = (s * 0.045).round().max(1.0);
+    let tile_w = ((s - gap) / 2.0).floor();
+    let r = 0.6 * scale;
+    let total = tile_w * 2.0 + gap;
+
+    let x0 = (cx - total / 2.0).round();
+    let y0 = (cy - total / 2.0).round();
     let x1 = x0 + tile_w + gap;
     let y1 = y0 + tile_w + gap;
 
-    // El logo de Windows 11 en azul: un solo degradado de cian claro (arriba a la
-    // izquierda) a azul (abajo a la derecha) que atraviesa los cuatro cuadros.
-    let stops = [(0.0, [112, 224, 255, 255]), (1.0, [0, 120, 240, 255])];
-    let (from, to) = ((x0, y0), (x0 + s, y0 + s));
+    // Un solo degradado que atraviesa los cuatro cuadros en diagonal: claro
+    // arriba a la izquierda e intenso abajo a la derecha, como el de Windows.
+    let (from, to) = ((x0, y0), (x0 + total, y0 + total));
     for (tx, ty) in [(x0, y0), (x1, y0), (x0, y1), (x1, y1)] {
-        fill_rounded_gradient(pixmap, &stops, from, to, tx, ty, tile_w, tile_w, r);
+        fill_rounded_gradient(pixmap, stops, from, to, tx, ty, tile_w, tile_w, r);
     }
 }
 

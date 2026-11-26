@@ -19,6 +19,7 @@ mod calendar;
 mod catalog;
 mod categories;
 mod clock;
+mod colorpick;
 mod diag;
 mod extras;
 mod font;
@@ -31,6 +32,7 @@ mod jumplist;
 mod keyboard;
 mod language;
 mod launcher;
+mod logo;
 mod monitors;
 mod notifcenter;
 mod notifications;
@@ -129,6 +131,8 @@ const WM_SPOTLIGHT_ICONS: u32 = windows::Win32::UI::WindowsAndMessaging::WM_APP 
 /// Identificador del atajo global Alt+Espacio (`RegisterHotKey`).
 const HOTKEY_SPOTLIGHT: i32 = 1;
 const WM_NOTIFICATIONS: u32 = windows::Win32::UI::WindowsAndMessaging::WM_APP + 13;
+/// El hilo del fondo de pantalla calculó otro color para el logo de Inicio.
+const WM_LOGO_COLOR: u32 = windows::Win32::UI::WindowsAndMessaging::WM_APP + 15;
 
 const TIMER_ANIM: usize = 1;
 const TIMER_TICK: usize = 2;
@@ -2251,6 +2255,10 @@ impl App {
         bar.appearance = styles.look(style::State::Desktop).appearance;
         glass::set_menu_opacity(styles.menu_opacity());
         clock::set_seconds(styles.clock_seconds());
+        logo::set_mode(styles.start_color(), styles.start_custom());
+        if logo::follows_wallpaper() {
+            logo::refresh_wallpaper(hwnd.0 as isize, WM_LOGO_COLOR);
+        }
         let (update_sender, update_events) = std::sync::mpsc::channel();
         let scale = (scale * styles.dock_factor())
             .min((rc.right - rc.left) as f32 / (bar.dock_width() + 40.0));
@@ -3534,6 +3542,26 @@ impl App {
     }
 
     /// Vuelve a leer los ajustes en la configuración abierta, tras cambiar alguno.
+    /// Cambió el color del logo de Inicio: se redibujan el dock, la barra superior
+    /// y la configuración, que lo muestran.
+    fn redraw_logo(&mut self) {
+        self.render();
+        if let Some(top) = self.top.as_mut() {
+            top.drawn = None;
+            top.render();
+        }
+        self.refresh_settings();
+    }
+
+    /// Aplica el color del logo elegido en la configuración.
+    fn apply_logo_color(&mut self) {
+        logo::set_mode(self.styles.start_color(), self.styles.start_custom());
+        if logo::follows_wallpaper() {
+            logo::refresh_wallpaper(self.hwnd.0 as isize, WM_LOGO_COLOR);
+        }
+        self.redraw_logo();
+    }
+
     fn refresh_settings(&mut self) {
         let updates = self.settings_updates();
         let styles = self.styles.clone();
@@ -3916,9 +3944,21 @@ unsafe extern "system" fn wndproc(hwnd: HWND, msg: u32, wparam: WPARAM, lparam: 
                     LPARAM(0),
                 );
             }
+            // Cambió el fondo de pantalla: si el logo lo sigue, se vuelve a calcular.
+            const SPI_SETDESKWALLPAPER: usize = 0x14;
+            if msg == windows::Win32::UI::WindowsAndMessaging::WM_SETTINGCHANGE
+                && wparam.0 == SPI_SETDESKWALLPAPER
+                && logo::follows_wallpaper()
+            {
+                logo::refresh_wallpaper(hwnd.0 as isize, WM_LOGO_COLOR);
+            }
             with_app(|app| {
                 if accent::refresh() {
-                    app.render();
+                    if logo::follows_accent() || logo::follows_wallpaper() {
+                        app.redraw_logo();
+                    } else {
+                        app.render();
+                    }
                     if let Some(panel) = app.quick.as_mut().filter(|p| p.visible) {
                         panel.render();
                     }
@@ -3966,6 +4006,10 @@ unsafe extern "system" fn wndproc(hwnd: HWND, msg: u32, wparam: WPARAM, lparam: 
         }
         WM_UPDATE => {
             with_app(|app| app.handle_update_events());
+            LRESULT(0)
+        }
+        WM_LOGO_COLOR => {
+            with_app(|app| app.redraw_logo());
             LRESULT(0)
         }
         WM_NOTIFICATIONS => {
@@ -7474,6 +7518,8 @@ impl SettingsWindow {
         self.visible = false;
         self.model.hovered = None;
         self.model.dragging = false;
+        // Cerrar la configuración cancela el color sin aplicar.
+        self.model.picker = None;
         self.grab = None;
         self.transition.close(Instant::now());
         self.present();
@@ -7572,6 +7618,13 @@ unsafe extern "system" fn settings_wndproc(
                     return;
                 }
                 let (x, y) = point(panel.scale);
+                if let Some(picker) = panel.model.picker.as_mut() {
+                    if let Some(part) = picker.dragging {
+                        picker.drag_to(part, x, y);
+                        panel.render();
+                        return;
+                    }
+                }
                 if panel.model.dragging {
                     set_settings_opacity(app, x);
                     return;
@@ -7605,6 +7658,18 @@ unsafe extern "system" fn settings_wndproc(
                     return;
                 };
                 let (x, y) = point(panel.scale);
+                // Con el selector de color abierto, solo responde él: se arrastra en
+                // la rueda o en la barra del brillo.
+                if let Some(picker) = panel.model.picker.as_mut() {
+                    use colorpick::Part;
+                    if let Some(part @ (Part::Wheel | Part::Brightness)) = picker.hit(x, y) {
+                        picker.dragging = Some(part);
+                        picker.drag_to(part, x, y);
+                        let _ = SetCapture(hwnd);
+                        panel.render();
+                    }
+                    return;
+                }
                 if settings::SettingsState::in_title(x, y) {
                     let mut cursor = POINT::default();
                     let _ = GetCursorPos(&mut cursor);
@@ -7640,6 +7705,27 @@ unsafe extern "system" fn settings_wndproc(
                     return;
                 }
                 let (x, y) = point(panel.scale);
+                if let Some(picker) = panel.model.picker.as_mut() {
+                    if picker.dragging.take().is_some() {
+                        let _ = ReleaseCapture();
+                        return;
+                    }
+                    match picker.hit(x, y) {
+                        Some(colorpick::Part::Cancel) => {
+                            panel.model.picker = None;
+                            panel.render();
+                        }
+                        Some(colorpick::Part::Apply) => {
+                            let chosen = picker.rgb();
+                            panel.model.picker = None;
+                            app.styles.set_start_custom(chosen);
+                            let _ = app.styles.save();
+                            app.apply_logo_color();
+                        }
+                        _ => {}
+                    }
+                    return;
+                }
                 let Some(hit) = panel.model.hit_test(x, y) else {
                     return;
                 };
@@ -7658,6 +7744,14 @@ unsafe extern "system" fn settings_wndproc(
                     }
                     return;
                 }
+                if hit == settings::Hit::PickColor {
+                    let size = (settings::WIDTH, settings::height());
+                    let picker = colorpick::ColorPicker::new(app.styles.start_custom(), size);
+                    panel.model.picker = Some(picker);
+                    panel.model.hovered = None;
+                    panel.render();
+                    return;
+                }
                 if let Some(command) = panel.model.command(hit) {
                     if matches!(command, appmenu::CMD_EXPORT | appmenu::CMD_IMPORT) {
                         backup = Some((app.hwnd, command == appmenu::CMD_EXPORT));
@@ -7673,8 +7767,19 @@ unsafe extern "system" fn settings_wndproc(
                 copy_settings(owner, export);
             }
         }
+        // Escape cierra el selector de color si está abierto; si no, la ventana.
         WM_KEYDOWN if wparam.0 == 0x1B => {
-            with_app(|app| app.settings.as_mut().map(SettingsWindow::hide));
+            with_app(|app| {
+                let Some(panel) = app.settings.as_mut() else {
+                    return;
+                };
+                if panel.model.picker.take().is_some() {
+                    let _ = ReleaseCapture();
+                    panel.render();
+                } else {
+                    panel.hide();
+                }
+            });
         }
         _ => return DefWindowProcW(hwnd, msg, wparam, lparam),
     }
@@ -7730,6 +7835,12 @@ fn handle_menu_command(app: &mut App, cmd: u32) {
             app.expand();
         }
         CMD_SETTINGS => app.open_settings(),
+        appmenu::CMD_START_COLOR_PREV | appmenu::CMD_START_COLOR_NEXT => {
+            app.styles
+                .step_start_color(cmd == appmenu::CMD_START_COLOR_NEXT);
+            let _ = app.styles.save();
+            app.apply_logo_color();
+        }
         appmenu::CMD_DOCK_SMALLER | appmenu::CMD_DOCK_BIGGER => {
             app.styles.step_dock_size(cmd == appmenu::CMD_DOCK_BIGGER);
             let _ = app.styles.save();
