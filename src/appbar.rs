@@ -68,6 +68,95 @@ impl AppBar {
             SHAppBarMessage(ABM_SETPOS, &mut data);
         }
         ensure_work_area(monitor, data.rc, top);
+        refit_maximized(monitor);
+    }
+}
+
+/// Dónde debería estar una ventana maximizada en el área de trabajo `work`, si está
+/// en otro sitio. Windows la maximiza un poco más grande que el área, por el grosor
+/// de su borde, que se mide en el lado izquierdo (las barras solo cambian el de
+/// arriba o el de abajo). Solo se mueve si ocupa el ancho del área (está
+/// maximizada en este monitor) y no coincide arriba o abajo.
+pub fn maximized_rect(window: RECT, work: RECT) -> Option<RECT> {
+    let border = work.left - window.left;
+    if !(0..=32).contains(&border) {
+        return None;
+    }
+    let expected = RECT {
+        left: work.left - border,
+        top: work.top - border,
+        right: work.right + border,
+        bottom: work.bottom + border,
+    };
+    let near = |a: i32, b: i32| (a - b).abs() <= 1;
+    if !near(window.right, expected.right) {
+        return None;
+    }
+    let fits = near(window.top, expected.top) && near(window.bottom, expected.bottom);
+    (!fits).then_some(expected)
+}
+
+/// Windows no siempre recoloca las ventanas que ya estaban maximizadas cuando una
+/// barra reserva su franja (pasa al abrir GlassBar con ventanas abiertas): se
+/// quedarían debajo de la barra hasta volver a pulsarlas. Se ajustan a mano al área
+/// de trabajo del monitor de `monitor`.
+fn refit_maximized(monitor: RECT) {
+    use windows::core::BOOL;
+    use windows::Win32::Graphics::Gdi::{
+        GetMonitorInfoW, MonitorFromRect, MonitorFromWindow, HMONITOR, MONITORINFO,
+        MONITOR_DEFAULTTONEAREST,
+    };
+    use windows::Win32::UI::WindowsAndMessaging::{
+        EnumWindows, GetWindowRect, GetWindowThreadProcessId, IsWindowVisible, IsZoomed,
+        SetWindowPos, SWP_NOACTIVATE, SWP_NOOWNERZORDER, SWP_NOZORDER,
+    };
+    struct Target {
+        monitor: HMONITOR,
+        work: RECT,
+    }
+    unsafe extern "system" fn visit(hwnd: HWND, lparam: LPARAM) -> BOOL {
+        let target = &*(lparam.0 as *const Target);
+        if !IsWindowVisible(hwnd).as_bool() || !IsZoomed(hwnd).as_bool() {
+            return true.into();
+        }
+        let mut pid = 0;
+        GetWindowThreadProcessId(hwnd, Some(&mut pid));
+        if pid == std::process::id()
+            || MonitorFromWindow(hwnd, MONITOR_DEFAULTTONEAREST) != target.monitor
+        {
+            return true.into();
+        }
+        let mut rect = RECT::default();
+        if GetWindowRect(hwnd, &mut rect).is_err() {
+            return true.into();
+        }
+        if let Some(fit) = maximized_rect(rect, target.work) {
+            let _ = SetWindowPos(
+                hwnd,
+                None,
+                fit.left,
+                fit.top,
+                fit.right - fit.left,
+                fit.bottom - fit.top,
+                SWP_NOZORDER | SWP_NOACTIVATE | SWP_NOOWNERZORDER,
+            );
+        }
+        true.into()
+    }
+    unsafe {
+        let handle = MonitorFromRect(&monitor, MONITOR_DEFAULTTONEAREST);
+        let mut info = MONITORINFO {
+            cbSize: std::mem::size_of::<MONITORINFO>() as u32,
+            ..Default::default()
+        };
+        if !GetMonitorInfoW(handle, &mut info).as_bool() {
+            return;
+        }
+        let target = Target {
+            monitor: handle,
+            work: info.rcWork,
+        };
+        let _ = EnumWindows(Some(visit), LPARAM(&target as *const Target as isize));
     }
 }
 
@@ -131,6 +220,15 @@ impl Drop for AppBar {
 mod tests {
     use super::*;
 
+    fn rect(left: i32, top: i32, right: i32, bottom: i32) -> RECT {
+        RECT {
+            left,
+            top,
+            right,
+            bottom,
+        }
+    }
+
     #[test]
     fn the_strip_is_the_bottom_of_the_monitor() {
         let monitor = RECT {
@@ -164,5 +262,25 @@ mod tests {
         let bottom = strip(monitor, 70, false);
         let fixed = missing_reservation(rect(0, 28, 1920, 1080), bottom, false).unwrap();
         assert_eq!((fixed.top, fixed.bottom), (28, 1010));
+    }
+
+    #[test]
+    fn maximized_windows_under_the_bar_move_into_the_work_area() {
+        // Barra superior de 28 px: el área de trabajo empieza en 28.
+        let work = rect(0, 28, 1920, 1080);
+        // Maximizada antes de la barra, con su borde de 8 px.
+        let under = rect(-8, -8, 1928, 1088);
+        assert_eq!(maximized_rect(under, work), Some(rect(-8, 20, 1928, 1088)));
+        // Ya en su sitio, o sin borde y en su sitio: nada que hacer.
+        assert_eq!(maximized_rect(rect(-8, 20, 1928, 1088), work), None);
+        assert_eq!(maximized_rect(rect(0, 28, 1920, 1080), work), None);
+        // Sin la barra (el área vuelve a ser toda la pantalla), crece de nuevo.
+        let full = rect(0, 0, 1920, 1080);
+        assert_eq!(
+            maximized_rect(rect(-8, 20, 1928, 1088), full),
+            Some(rect(-8, -8, 1928, 1088))
+        );
+        // No ocupa el ancho del área: no se toca.
+        assert_eq!(maximized_rect(rect(-8, -8, 1000, 1088), work), None);
     }
 }
