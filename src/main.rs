@@ -4440,15 +4440,19 @@ unsafe extern "system" fn wndproc(hwnd: HWND, msg: u32, wparam: WPARAM, lparam: 
                                     || app.language.as_ref().is_some_and(|l| l.visible)
                                     || app.calendar.as_ref().is_some_and(|c| c.visible)
                                     || app.tray_panel.as_ref().is_some_and(|p| p.visible)
-                                    || app.tray_panel.as_ref().is_some_and(|p| p.menu.is_some())))
-                            || app.app_menu.as_ref().is_some_and(|m| m.visible)
-                            || app.preview.as_ref().is_some_and(|p| p.visible)
-                            // El menú de un icono de la bandeja abierto, o un icono recién
-                            // pulsado, que puede tardar en abrir el suyo. Los menús de
-                            // otros programas no cuentan.
-                            || app
-                                .tray_clicked
-                                .is_some_and(|at| at.elapsed() < Duration::from_millis(1500)),
+                                    || app.tray_panel.as_ref().is_some_and(|p| p.menu.is_some())
+                                    // Un icono de la bandeja recién pulsado, que puede
+                                    // tardar en abrir su menú. Los menús de otros
+                                    // programas no cuentan.
+                                    || app
+                                        .tray_clicked
+                                        .is_some_and(|at| at.elapsed() < Duration::from_millis(1500))))
+                            // El menú de GlassBar, salvo el de su icono en el panel de
+                            // la barra superior.
+                            || (app.app_menu.as_ref().is_some_and(|m| m.visible)
+                                && !(app.panels_from_top
+                                    && app.tray_panel.as_ref().is_some_and(|p| p.menu.is_some())))
+                            || app.preview.as_ref().is_some_and(|p| p.visible),
                         Instant::now(),
                     );
                     // Empieza a mostrarse: la apariencia, al día desde el primer fotograma.
