@@ -5609,12 +5609,22 @@ fn taskbar_created() -> u32 {
 /// y el menú que abre su programa.
 const MENU_REACH: f32 = 48.0;
 
+/// Hay un menú de Windows (#32768) a la vista. Windows guarda también ventanas de
+/// menú ocultas: se miran todas, no solo la primera que aparece.
 fn menu_open() -> bool {
-    unsafe {
-        windows::Win32::UI::WindowsAndMessaging::FindWindowW(w!("#32768"), None).is_ok_and(|menu| {
-            windows::Win32::UI::WindowsAndMessaging::IsWindowVisible(menu).as_bool()
-        })
+    use windows::Win32::UI::WindowsAndMessaging::{FindWindowExW, IsWindowVisible};
+    let mut after = None;
+    // Pocas: una por menú o submenú abierto, más las que Windows tiene guardadas.
+    for _ in 0..32 {
+        let Ok(menu) = (unsafe { FindWindowExW(None, after, w!("#32768"), None) }) else {
+            return false;
+        };
+        if unsafe { IsWindowVisible(menu) }.as_bool() {
+            return true;
+        }
+        after = Some(menu);
     }
+    false
 }
 
 /// El menú de un icono del panel, abierto con clic derecho.
@@ -5810,12 +5820,15 @@ impl TrayWindow {
         };
         // El menú de Windows (#32768), el de GlassBar (no se le puede quitar el foco:
         // se cerraría a medias), o uno propio del programa (Qt, Java, Steam, XAML...),
-        // que no es de esa clase.
+        // que no es de esa clase. Si no se reconoce pero el programa sigue con el
+        // foco en una ventana oculta o flotante (la de su menú), también cuenta:
+        // quitárselo cerraría el menú.
         let open = own_menu
             || menu_open()
-            || menu
-                .pid
-                .is_some_and(|pid| systray::menu_of(pid, menu.at, reach, &mut menu.known));
+            || menu.pid.is_some_and(|pid| {
+                systray::menu_of(pid, menu.at, reach, &mut menu.known)
+                    || systray::menu_has_focus(pid, &mut menu.known)
+            });
         if open {
             menu.seen = true;
             return;
