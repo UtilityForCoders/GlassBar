@@ -4452,8 +4452,9 @@ unsafe extern "system" fn wndproc(hwnd: HWND, msg: u32, wparam: WPARAM, lparam: 
                     {
                         app.update_style();
                     }
+                    let own_menu = app.app_menu.as_ref().is_some_and(|m| m.visible);
                     if let Some(panel) = app.tray_panel.as_mut().filter(|p| p.visible) {
-                        panel.watch_menu();
+                        panel.watch_menu(own_menu, app.hwnd);
                     }
                     // Que los iconos de los demás programas sigan llegando a la bandeja propia.
                     // Cinco veces por segundo basta: mirarlo cada 40 ms era la mitad del
@@ -4483,15 +4484,19 @@ unsafe extern "system" fn wndproc(hwnd: HWND, msg: u32, wparam: WPARAM, lparam: 
                                     || app.language.as_ref().is_some_and(|l| l.visible)
                                     || app.calendar.as_ref().is_some_and(|c| c.visible)
                                     || app.tray_panel.as_ref().is_some_and(|p| p.visible)
-                                    || app.tray_panel.as_ref().is_some_and(|p| p.menu.is_some())))
-                            || app.app_menu.as_ref().is_some_and(|m| m.visible)
-                            || app.preview.as_ref().is_some_and(|p| p.visible)
-                            // El menú de un icono de la bandeja abierto, o un icono recién
-                            // pulsado, que puede tardar en abrir el suyo. Los menús de
-                            // otros programas no cuentan.
-                            || app
-                                .tray_clicked
-                                .is_some_and(|at| at.elapsed() < Duration::from_millis(1500)),
+                                    || app.tray_panel.as_ref().is_some_and(|p| p.menu.is_some())
+                                    // Un icono de la bandeja recién pulsado, que puede
+                                    // tardar en abrir su menú. Los menús de otros
+                                    // programas no cuentan.
+                                    || app
+                                        .tray_clicked
+                                        .is_some_and(|at| at.elapsed() < Duration::from_millis(1500))))
+                            // El menú de GlassBar, salvo el de su icono en el panel de
+                            // la barra superior.
+                            || (app.app_menu.as_ref().is_some_and(|m| m.visible)
+                                && !(app.panels_from_top
+                                    && app.tray_panel.as_ref().is_some_and(|p| p.menu.is_some())))
+                            || app.preview.as_ref().is_some_and(|p| p.visible),
                         Instant::now(),
                     );
                     // Empieza a mostrarse: la apariencia, al día desde el primer fotograma.
@@ -5652,12 +5657,22 @@ fn taskbar_created() -> u32 {
 /// y el menú que abre su programa.
 const MENU_REACH: f32 = 48.0;
 
+/// Hay un menú de Windows (#32768) a la vista. Windows guarda también ventanas de
+/// menú ocultas: se miran todas, no solo la primera que aparece.
 fn menu_open() -> bool {
-    unsafe {
-        windows::Win32::UI::WindowsAndMessaging::FindWindowW(w!("#32768"), None).is_ok_and(|menu| {
-            windows::Win32::UI::WindowsAndMessaging::IsWindowVisible(menu).as_bool()
-        })
+    use windows::Win32::UI::WindowsAndMessaging::{FindWindowExW, IsWindowVisible};
+    let mut after = None;
+    // Pocas: una por menú o submenú abierto, más las que Windows tiene guardadas.
+    for _ in 0..32 {
+        let Ok(menu) = (unsafe { FindWindowExW(None, after, w!("#32768"), None) }) else {
+            return false;
+        };
+        if unsafe { IsWindowVisible(menu) }.as_bool() {
+            return true;
+        }
+        after = Some(menu);
     }
+    false
 }
 
 /// El menú de un icono del panel, abierto con clic derecho.
@@ -5839,7 +5854,10 @@ impl TrayWindow {
     /// derecho: al cerrarse, si el programa abrió una ventana o se pulsó fuera, el
     /// panel se cierra; si no (Escape, o de vuelta al panel), recupera el foco para
     /// cerrarse como siempre.
-    fn watch_menu(&mut self) {
+    ///
+    /// `own_menu` si está abierto el menú propio de GlassBar: es el de su icono, que
+    /// también está en el panel. `dock` es la ventana del dock.
+    fn watch_menu(&mut self, own_menu: bool, dock: HWND) {
         if self.close_after.is_some_and(|at| Instant::now() >= at) {
             self.hide();
             return;
@@ -5848,12 +5866,17 @@ impl TrayWindow {
         let Some(menu) = self.menu.as_mut() else {
             return;
         };
-        // El menú de Windows (#32768), o uno propio del programa (Qt, Java, Steam,
-        // XAML...), que no es de esa clase.
-        let open = menu_open()
-            || menu
-                .pid
-                .is_some_and(|pid| systray::menu_of(pid, menu.at, reach, &mut menu.known));
+        // El menú de Windows (#32768), el de GlassBar (no se le puede quitar el foco:
+        // se cerraría a medias), o uno propio del programa (Qt, Java, Steam, XAML...),
+        // que no es de esa clase. Si no se reconoce pero el programa sigue con el
+        // foco en una ventana oculta o flotante (la de su menú), también cuenta:
+        // quitárselo cerraría el menú.
+        let open = own_menu
+            || menu_open()
+            || menu.pid.is_some_and(|pid| {
+                systray::menu_of(pid, menu.at, reach, &mut menu.known)
+                    || systray::menu_has_focus(pid, &mut menu.known)
+            });
         if open {
             menu.seen = true;
             return;
@@ -5863,14 +5886,12 @@ impl TrayWindow {
             return;
         }
         self.menu = None;
+        // Otra ventana delante, también una de GlassBar que abrió su menú (la
+        // configuración): no se le quita el foco.
         let elsewhere = unsafe {
-            use windows::Win32::UI::WindowsAndMessaging::{
-                GetForegroundWindow, GetWindowThreadProcessId, IsWindowVisible,
-            };
+            use windows::Win32::UI::WindowsAndMessaging::{GetForegroundWindow, IsWindowVisible};
             let front = GetForegroundWindow();
-            let mut pid = 0;
-            GetWindowThreadProcessId(front, Some(&mut pid));
-            pid != std::process::id() && IsWindowVisible(front).as_bool()
+            front != self.hwnd && front != dock && IsWindowVisible(front).as_bool()
         };
         if elsewhere {
             self.hide();
