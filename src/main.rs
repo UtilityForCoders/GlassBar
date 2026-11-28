@@ -2685,11 +2685,14 @@ impl App {
                 UpdateEvent::Downloaded(Err(error)) => self.update_failed(&error),
             }
         }
+        // La configuración, si está abierta, deja de mostrar "Buscando…" o
+        // "Descargando…" y enseña lo que salió.
+        self.refresh_settings();
     }
 
     fn update_failed(&mut self, error: &str) {
-        self.refresh_settings();
         self.updating = false;
+        self.refresh_settings();
         self.tray.notify(
             "No se pudo actualizar GlassBar",
             &format!("Motivo: {error}."),

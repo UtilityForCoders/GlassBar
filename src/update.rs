@@ -8,14 +8,18 @@ use windows::core::{w, HSTRING, PCWSTR};
 use windows::Win32::Networking::WinHttp::{
     WinHttpAddRequestHeaders, WinHttpCloseHandle, WinHttpConnect, WinHttpOpen, WinHttpOpenRequest,
     WinHttpQueryHeaders, WinHttpReadData, WinHttpReceiveResponse, WinHttpSendRequest,
-    INTERNET_DEFAULT_HTTPS_PORT, WINHTTP_ACCESS_TYPE_AUTOMATIC_PROXY, WINHTTP_ADDREQ_FLAG_ADD,
-    WINHTTP_FLAG_SECURE, WINHTTP_QUERY_FLAG_NUMBER, WINHTTP_QUERY_STATUS_CODE,
+    WinHttpSetTimeouts, INTERNET_DEFAULT_HTTPS_PORT, WINHTTP_ACCESS_TYPE_AUTOMATIC_PROXY,
+    WINHTTP_ADDREQ_FLAG_ADD, WINHTTP_FLAG_SECURE, WINHTTP_QUERY_FLAG_NUMBER,
+    WINHTTP_QUERY_STATUS_CODE,
 };
 
 /// Repositorio donde se publican las versiones.
 const REPOSITORY: &str = "UtilityForCoders/GlassBar";
 /// Cada cuánto se vuelve a mirar, además de al arrancar.
 pub const CHECK_EVERY_MS: u32 = 6 * 60 * 60 * 1000;
+/// Cuánto se espera, como mucho, a cada paso de una descarga (resolver, conectar,
+/// enviar y cada trozo de la respuesta).
+const TIMEOUT_MS: i32 = 20_000;
 
 /// Versión X.Y.Z; el sufijo de las preliminares (`-beta.1`) no cuenta.
 #[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord)]
@@ -184,6 +188,9 @@ fn get(url: &str) -> Result<Vec<u8>, String> {
         if session.0.is_null() {
             return Err("no se pudo abrir la conexión".into());
         }
+        // Sin límite, resolver el nombre puede esperar para siempre (red que no
+        // responde, portal cautivo) y el botón se quedaría en "Buscando…".
+        let _ = WinHttpSetTimeouts(session.0, TIMEOUT_MS, TIMEOUT_MS, TIMEOUT_MS, TIMEOUT_MS);
         let connection = Handle(WinHttpConnect(
             session.0,
             &HSTRING::from(host),
