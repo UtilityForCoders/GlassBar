@@ -193,9 +193,33 @@ fn free_work_area() {
         .parent()
         .is_some_and(|dir| std::fs::create_dir_all(dir).is_ok())
         && std::fs::write(&path, "1").is_ok();
-    if written {
+    if written && retry_allowed(&LAST_AUTOHIDE, std::time::Instant::now()) {
         set_native_state(state | ABS_AUTOHIDE);
     }
+}
+
+/// Cuándo se pidió por última vez el ocultar automático (ver `free_work_area`).
+static LAST_AUTOHIDE: std::sync::Mutex<Option<std::time::Instant>> = std::sync::Mutex::new(None);
+
+/// Cada cuánto, como mucho, se vuelve a pedir el ocultar automático.
+const AUTOHIDE_RETRY: std::time::Duration = std::time::Duration::from_secs(3);
+
+/// Si ya pasó `AUTOHIDE_RETRY` desde la última vez (y la apunta). Pedirlo hace que
+/// Explorer avise del cambio (`WM_SETTINGCHANGE`, `ABN_POSCHANGED`) y esos avisos
+/// vuelven a llamar a `free_work_area`: si Explorer no lo acepta (pasa mientras
+/// arranca o se reinicia), se pediría sin fin.
+fn retry_allowed(
+    last: &std::sync::Mutex<Option<std::time::Instant>>,
+    now: std::time::Instant,
+) -> bool {
+    let Ok(mut last) = last.lock() else {
+        return true;
+    };
+    if last.is_some_and(|at| now.duration_since(at) < AUTOHIDE_RETRY) {
+        return false;
+    }
+    *last = Some(now);
+    true
 }
 
 /// Desactiva el ocultar automático si lo activó GlassBar. Sin el archivo no hace
@@ -281,4 +305,19 @@ pub fn toggle_desktop() {
             CoUninitialize();
         }
     });
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::time::{Duration, Instant};
+
+    #[test]
+    fn autohide_is_not_asked_for_again_right_away() {
+        let last = std::sync::Mutex::new(None);
+        let start = Instant::now();
+        assert!(retry_allowed(&last, start));
+        assert!(!retry_allowed(&last, start + Duration::from_millis(500)));
+        assert!(retry_allowed(&last, start + AUTOHIDE_RETRY));
+    }
 }

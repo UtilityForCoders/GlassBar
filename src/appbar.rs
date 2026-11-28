@@ -1,6 +1,7 @@
 //! Barras de aplicación: Windows reserva su franja y las ventanas maximizadas no
 //! la tapan. Las usan el dock en el modo "siempre visible" (abajo) y la barra
 //! superior (arriba).
+use std::cell::Cell;
 use windows::Win32::Foundation::{HWND, LPARAM, RECT};
 use windows::Win32::UI::Shell::{
     SHAppBarMessage, ABE_BOTTOM, ABE_TOP, ABM_NEW, ABM_QUERYPOS, ABM_REMOVE, ABM_SETPOS, APPBARDATA,
@@ -15,6 +16,8 @@ pub const ABN_FULLSCREENAPP: usize = 2;
 
 pub struct AppBar {
     hwnd: HWND,
+    /// La última franja que se pidió con `ABM_SETPOS`.
+    placed: Cell<Option<RECT>>,
 }
 
 fn data(hwnd: HWND) -> APPBARDATA {
@@ -47,7 +50,10 @@ impl AppBar {
         let mut data = data(hwnd);
         data.uCallbackMessage = callback;
         let registered = unsafe { SHAppBarMessage(ABM_NEW, &mut data) } != 0;
-        registered.then_some(Self { hwnd })
+        registered.then_some(Self {
+            hwnd,
+            placed: Cell::new(None),
+        })
     }
 
     /// Reserva `height` píxeles en el borde inferior de `monitor`, o en el
@@ -64,12 +70,27 @@ impl AppBar {
             } else {
                 data.rc.top = data.rc.bottom - height;
             }
+            // Cada `ABM_SETPOS` hace que Windows avise con `ABN_POSCHANGED` a las demás
+            // barras, y al recibirlo se vuelve a llamar aquí. Si la franja no cambió no
+            // se vuelve a pedir: con el dock y la barra superior a la vez, o con la
+            // barra nativa cambiando de estado al arrancar, los avisos se rebotaban
+            // sin fin y las barras se recolocaban (parpadeaban) una y otra vez.
+            if !needs_setpos(self.placed.get(), data.rc) {
+                ensure_work_area(monitor, data.rc, top);
+                return;
+            }
             data.lParam = LPARAM(0);
             SHAppBarMessage(ABM_SETPOS, &mut data);
         }
+        self.placed.set(Some(data.rc));
         ensure_work_area(monitor, data.rc, top);
         refit_maximized(monitor);
     }
+}
+
+/// Si hay que volver a pedir la franja `wanted`: solo si es otra que la última pedida.
+fn needs_setpos(placed: Option<RECT>, wanted: RECT) -> bool {
+    placed != Some(wanted)
 }
 
 /// Dónde debería estar una ventana maximizada en el área de trabajo `work`, si está
@@ -227,6 +248,14 @@ mod tests {
             right,
             bottom,
         }
+    }
+
+    #[test]
+    fn the_same_strip_is_not_asked_for_twice() {
+        let strip = rect(0, 1010, 1920, 1080);
+        assert!(needs_setpos(None, strip));
+        assert!(!needs_setpos(Some(strip), strip));
+        assert!(needs_setpos(Some(rect(0, 1020, 1920, 1080)), strip));
     }
 
     #[test]
