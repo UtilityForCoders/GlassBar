@@ -33,10 +33,38 @@ pub fn run(args: &[String]) -> bool {
             let _ = CloseHandle(process);
         }
     }
+    // Si ya arrancó otro GlassBar (al actualizar o al reiniciarse para leer una
+    // copia), la barra nativa la oculta él: mostrarla ahora la haría aparecer y
+    // desaparecer mientras se coloca.
+    if successor_running() {
+        return true;
+    }
     // Tras un cierre normal ya está visible y esto no cambia nada.
     crate::shell::restore_native();
     crate::notifications::restore_native();
     true
+}
+
+/// Si otro GlassBar tiene la instancia (ver `main`), esperando un poco a que arranque.
+fn successor_running() -> bool {
+    use windows::core::w;
+    use windows::Win32::System::Threading::{OpenMutexW, SYNCHRONIZATION_SYNCHRONIZE};
+    for _ in 0..20 {
+        if let Ok(mutex) = unsafe {
+            OpenMutexW(
+                SYNCHRONIZATION_SYNCHRONIZE,
+                false,
+                w!("Local\\GlassBar.Instance"),
+            )
+        } {
+            unsafe {
+                let _ = CloseHandle(mutex);
+            }
+            return true;
+        }
+        std::thread::sleep(std::time::Duration::from_millis(100));
+    }
+    false
 }
 
 fn watched_pid(args: &[String]) -> Option<u32> {
